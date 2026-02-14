@@ -102,6 +102,13 @@ class D3D12Presenter final : public Presenter {
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
+#ifdef XENIA_LIBRETRO
+  // GPU blit capture: R10G10B10A2 readback with persistent resources.
+  // Returns pointer to converted 8bpc buffer (valid until next call).
+  bool CaptureGuestOutputGPUBlit(const void*& data_out, uint32_t& width_out,
+                                 uint32_t& height_out);
+#endif
+
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_->AwaitSubmissionAndUpdateCompleted(
         submission_index);
@@ -311,6 +318,25 @@ class D3D12Presenter final : public Presenter {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,
              size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_final_pipelines_;
+
+#ifdef XENIA_LIBRETRO
+  struct GPUBlitResources {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> command_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    UINT64 fence_value = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer;
+    UINT64 readback_size = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT readback_layout = {};
+    std::vector<uint8_t> converted_pixels;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  GPUBlitResources gpu_blit_;
+  void DestroyGPUBlitResources();
+  bool CreateGPUBlitResources(uint32_t w, uint32_t h,
+                              const D3D12_RESOURCE_DESC& texture_desc);
+#endif
 
   // The first is the refresher completion timeline submission index at which
   // the guest output texture was last refreshed, the second is the reference to

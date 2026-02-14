@@ -146,6 +146,10 @@ VulkanPresenter::~VulkanPresenter() {
   ui_completion_timeline_.AwaitAllSubmissions();
   guest_output_image_refresher_completion_timeline_.AwaitAllSubmissions();
 
+#ifdef XENIA_LIBRETRO
+  DestroyGPUBlitResources();
+#endif
+
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
@@ -226,6 +230,246 @@ Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
   return GetSurfaceTypesSupportedByInstance(
       vulkan_device_->vulkan_instance()->extensions());
 }
+
+#ifdef XENIA_LIBRETRO
+void VulkanPresenter::DestroyGPUBlitResources() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  if (gpu_blit_.fence != VK_NULL_HANDLE) {
+    dfn.vkWaitForFences(device, 1, &gpu_blit_.fence, VK_TRUE, UINT64_MAX);
+  }
+  if (gpu_blit_.readback_mapped && gpu_blit_.readback_memory) {
+    dfn.vkUnmapMemory(device, gpu_blit_.readback_memory);
+  }
+  if (gpu_blit_.readback_buffer) dfn.vkDestroyBuffer(device, gpu_blit_.readback_buffer, nullptr);
+  if (gpu_blit_.readback_memory) dfn.vkFreeMemory(device, gpu_blit_.readback_memory, nullptr);
+  if (gpu_blit_.blit_image) dfn.vkDestroyImage(device, gpu_blit_.blit_image, nullptr);
+  if (gpu_blit_.blit_memory) dfn.vkFreeMemory(device, gpu_blit_.blit_memory, nullptr);
+  if (gpu_blit_.fence) dfn.vkDestroyFence(device, gpu_blit_.fence, nullptr);
+  if (gpu_blit_.cmd_pool) dfn.vkDestroyCommandPool(device, gpu_blit_.cmd_pool, nullptr);
+  gpu_blit_ = {};
+}
+
+bool VulkanPresenter::CreateGPUBlitResources(uint32_t w, uint32_t h) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  uint32_t qf = vulkan_device_->queue_family_graphics_compute();
+
+  // Command pool
+  VkCommandPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  pool_info.queueFamilyIndex = qf;
+  if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &gpu_blit_.cmd_pool) != VK_SUCCESS) {
+    XELOGE("VulkanPresenter: Failed to create GPU blit command pool");
+    return false;
+  }
+
+  VkCommandBufferAllocateInfo alloc_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  alloc_info.commandPool = gpu_blit_.cmd_pool;
+  alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  alloc_info.commandBufferCount = 1;
+  if (dfn.vkAllocateCommandBuffers(device, &alloc_info, &gpu_blit_.cmd) != VK_SUCCESS) {
+    XELOGE("VulkanPresenter: Failed to allocate GPU blit command buffer");
+    return false;
+  }
+
+  // Fence
+  VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (dfn.vkCreateFence(device, &fence_info, nullptr, &gpu_blit_.fence) != VK_SUCCESS) {
+    XELOGE("VulkanPresenter: Failed to create GPU blit fence");
+    return false;
+  }
+
+  // Intermediate R8G8B8A8 blit image (device-local)
+  VkImageCreateInfo img_info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  img_info.imageType = VK_IMAGE_TYPE_2D;
+  img_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  img_info.extent = {w, h, 1};
+  img_info.mipLevels = 1;
+  img_info.arrayLayers = 1;
+  img_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  img_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  img_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!util::CreateDedicatedAllocationImage(
+          vulkan_device_, img_info, util::MemoryPurpose::kDeviceLocal,
+          gpu_blit_.blit_image, gpu_blit_.blit_memory)) {
+    XELOGE("VulkanPresenter: Failed to create GPU blit image");
+    return false;
+  }
+
+  // Readback buffer
+  VkDeviceSize buf_size = VkDeviceSize(w) * h * 4;
+  if (!util::CreateDedicatedAllocationBuffer(
+          vulkan_device_, buf_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          util::MemoryPurpose::kReadback, gpu_blit_.readback_buffer,
+          gpu_blit_.readback_memory)) {
+    XELOGE("VulkanPresenter: Failed to create GPU blit readback buffer");
+    return false;
+  }
+  if (dfn.vkMapMemory(device, gpu_blit_.readback_memory, 0, VK_WHOLE_SIZE, 0,
+                       &gpu_blit_.readback_mapped) != VK_SUCCESS) {
+    XELOGE("VulkanPresenter: Failed to map GPU blit readback buffer");
+    return false;
+  }
+
+  gpu_blit_.width = w;
+  gpu_blit_.height = h;
+  return true;
+}
+
+bool VulkanPresenter::CaptureGuestOutputGPUBlit(const void*& data_out,
+                                                 uint32_t& width_out,
+                                                 uint32_t& height_out) {
+  // Acquire the guest output image
+  std::shared_ptr<GuestOutputImage> guest_output_image;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(
+        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      assert_true(guest_output_images_[guest_output_mailbox_index]
+                      .ever_successfully_refreshed);
+      guest_output_image =
+          guest_output_images_[guest_output_mailbox_index].image;
+    }
+  }
+  if (!guest_output_image) {
+    return false;
+  }
+
+  VkExtent2D extent = guest_output_image->extent();
+  uint32_t w = extent.width;
+  uint32_t h = extent.height;
+  if (w == 0 || h == 0) return false;
+
+  // Ensure persistent resources match the current dimensions
+  if (gpu_blit_.width != w || gpu_blit_.height != h) {
+    DestroyGPUBlitResources();
+    if (!CreateGPUBlitResources(w, h)) {
+      DestroyGPUBlitResources();
+      return false;
+    }
+  }
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+
+  // Reset command pool (implicitly resets the command buffer)
+  dfn.vkResetCommandPool(device, gpu_blit_.cmd_pool, 0);
+
+  VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn.vkBeginCommandBuffer(gpu_blit_.cmd, &begin_info) != VK_SUCCESS) {
+    return false;
+  }
+
+  VkImageMemoryBarrier barriers[2] = {};
+
+  // Barrier: guest output SHADER_READ ??? TRANSFER_SRC
+  barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[0].srcAccessMask = kGuestOutputInternalAccessMask;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[0].oldLayout = kGuestOutputInternalLayout;
+  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].image = guest_output_image->image();
+  barriers[0].subresourceRange = util::InitializeSubresourceRange();
+
+  // Barrier: blit_image UNDEFINED ??? TRANSFER_DST
+  barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].image = gpu_blit_.blit_image;
+  barriers[1].subresourceRange = util::InitializeSubresourceRange();
+
+  dfn.vkCmdPipelineBarrier(gpu_blit_.cmd,
+      kGuestOutputInternalStageMask | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      0, 0, nullptr, 0, nullptr, 2, barriers);
+
+  // vkCmdBlitImage: A2B10G10R10 ??? R8G8B8A8 with GPU format conversion
+  VkImageBlit blit_region = {};
+  blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit_region.srcSubresource.layerCount = 1;
+  blit_region.srcOffsets[1] = {int32_t(w), int32_t(h), 1};
+  blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit_region.dstSubresource.layerCount = 1;
+  blit_region.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
+  dfn.vkCmdBlitImage(gpu_blit_.cmd,
+      guest_output_image->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      gpu_blit_.blit_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      1, &blit_region, VK_FILTER_NEAREST);
+
+  // Barrier: restore guest output, transition blit_image to TRANSFER_SRC
+  barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[0].dstAccessMask = kGuestOutputInternalAccessMask;
+  barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].newLayout = kGuestOutputInternalLayout;
+  barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+  dfn.vkCmdPipelineBarrier(gpu_blit_.cmd,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | kGuestOutputInternalStageMask,
+      0, 0, nullptr, 0, nullptr, 2, barriers);
+
+  // Copy blit_image ??? readback_buffer
+  VkBufferImageCopy copy_region = {};
+  copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region.imageSubresource.layerCount = 1;
+  copy_region.imageExtent = {w, h, 1};
+  dfn.vkCmdCopyImageToBuffer(gpu_blit_.cmd, gpu_blit_.blit_image,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      gpu_blit_.readback_buffer, 1, &copy_region);
+
+  // Host visibility barrier
+  VkBufferMemoryBarrier buf_barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  buf_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  buf_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  buf_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  buf_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  buf_barrier.buffer = gpu_blit_.readback_buffer;
+  buf_barrier.size = VK_WHOLE_SIZE;
+  dfn.vkCmdPipelineBarrier(gpu_blit_.cmd,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+      0, 0, nullptr, 1, &buf_barrier, 0, nullptr);
+
+  if (dfn.vkEndCommandBuffer(gpu_blit_.cmd) != VK_SUCCESS) {
+    return false;
+  }
+
+  // Submit and wait
+  {
+    VulkanGPUCompletionTimeline completion_timeline(vulkan_device_);
+    VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &gpu_blit_.cmd;
+    const VkResult submit_result = completion_timeline.AcquireFenceAndSubmit(
+        vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
+    if (submit_result != VK_SUCCESS) {
+      XELOGE("VulkanPresenter: Failed to submit GPU blit command buffer: {}",
+             vk::to_string(vk::Result(submit_result)));
+      return false;
+    }
+    // Destroying the completion timeline causes the submission to be awaited.
+  }
+
+  // Return mapped readback pointer
+  data_out = gpu_blit_.readback_mapped;
+  width_out = w;
+  height_out = h;
+  return true;
+}
+#endif  // XENIA_LIBRETRO
 
 bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   std::shared_ptr<GuestOutputImage> guest_output_image;

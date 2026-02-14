@@ -362,7 +362,7 @@ filter("platforms:Windows")
     })
   end
 
-filter({"platforms:Windows", "configurations:Release"})
+filter({"platforms:Windows", "configurations:Release", "kind:ConsoleApp or WindowedApp"})
   if qt_dir then
     links({
       "Qt6Core",
@@ -371,7 +371,7 @@ filter({"platforms:Windows", "configurations:Release"})
     })
   end
 
-filter({"platforms:Windows", "configurations:Debug or Checked"})
+filter({"platforms:Windows", "configurations:Debug or Checked", "kind:ConsoleApp or WindowedApp"})
   if qt_dir then
     links({
       "Qt6Cored",
@@ -556,3 +556,6 @@ workspace("xenia")
     include("src/xenia/hid/xinput")
     include("src/xenia/ui/d3d12")
   end
+
+  -- Libretro core (shared library)
+  include("libretro")

@@ -144,6 +144,13 @@ class VulkanPresenter final : public Presenter {
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
+#ifdef XENIA_LIBRETRO
+  // GPU blit capture: A2B10G10R10 ??? R8G8B8A8 with persistent resources.
+  // Returns pointer to readback buffer (valid until next call).
+  bool CaptureGuestOutputGPUBlit(const void*& data_out, uint32_t& width_out,
+                                 uint32_t& height_out);
+#endif
+
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
   }
@@ -478,6 +485,24 @@ class VulkanPresenter final : public Presenter {
   // same due to different dependencies (this is shader read > color
   // attachment > shader read).
   VkRenderPass guest_output_intermediate_render_pass_ = VK_NULL_HANDLE;
+
+#ifdef XENIA_LIBRETRO
+  struct GPUBlitResources {
+    VkImage blit_image = VK_NULL_HANDLE;
+    VkDeviceMemory blit_memory = VK_NULL_HANDLE;
+    VkBuffer readback_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+    void* readback_mapped = nullptr;
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  GPUBlitResources gpu_blit_;
+  void DestroyGPUBlitResources();
+  bool CreateGPUBlitResources(uint32_t w, uint32_t h);
+#endif
 
   // Value monotonically increased every time a new guest output image is
   // initialized, for recreation of dependent objects such as framebuffers in
