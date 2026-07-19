@@ -544,16 +544,21 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_BOOT_SPLASH,
         "Boot Splash Video",
         "Boot Splash",
-        "Play an optional user-supplied boot animation before the game "
-        "becomes visible (the game keeps loading underneath). Xenia is a "
-        "high-level emulator and has no console boot flow of its own.\n"
+        "Play an optional user-supplied boot animation (press Start to "
+        "skip). Xenia is a high-level emulator with no console boot flow of "
+        "its own.\n"
+        "Before Boot: authentic sequence; the game starts loading after the "
+        "video ends.\n"
+        "During Load: the game boots underneath the video, masking load "
+        "time.\n"
         "Place an MPEG-1 file at <system>/xenia/bootanim.mpg. Convert any "
         "video with: ffmpeg -i in.mp4 -c:v mpeg1video -q:v 4 -c:a mp2 "
         "-ar 48000 bootanim.mpg",
         NULL,
         "Emulation",
         {
-            { "enabled",  "Enabled" },
+            { "enabled",  "Before Boot" },
+            { "loadmask", "During Load" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },

@@ -767,6 +767,11 @@ static int splash_w = 0, splash_h = 0;
 static bool splash_audio_ok = false;
 static std::chrono::steady_clock::time_point splash_next_frame;
 static bool splash_pacing_init = false;
+// "Before Boot" splash mode: the game launch is deferred until the video
+// ends (or is skipped), then performed from retro_run.
+static bool launch_pending = false;
+static retro_set_rumble_state_t pending_rumble_cb = nullptr;
+static bool xenia_setup_and_launch(const char *path);
 
 static void splash_stop(void) {
     if (splash_plm) {
@@ -829,6 +834,14 @@ static void splash_try_start(void) {
 // proceeds with normal video/audio).
 static bool splash_run_frame(void) {
     if (!splash_plm) return false;
+
+    // Start skips the splash.
+    if (core_state.input_state_cb &&
+        core_state.input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+                                  RETRO_DEVICE_ID_JOYPAD_START)) {
+        splash_stop();
+        return false;
+    }
 
     using clock = std::chrono::steady_clock;
     if (!splash_pacing_init) {
@@ -1587,20 +1600,31 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     // Acquire rumble interface from the frontend
     struct retro_rumble_interface rumble = {0};
     core_state.environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble);
+    pending_rumble_cb = rumble.set_rumble_state;
+
+    // "Before Boot" splash: play the video first and defer the launch to
+    // retro_run for the authentic power-on sequence. "During Load" keeps
+    // the old behavior (game boots underneath the video).
+    splash_try_start();
+    const char* sv = opt_get(XENIA_OPT_BOOT_SPLASH);
+    bool splash_before = !sv || strcmp(sv, "loadmask") != 0;
+    if (splash_plm && splash_before) {
+        launch_pending = true;
+        return true;
+    }
 
     bool ok = xenia_setup_and_launch(core_state.game_path);
 
     // Now that the HID driver exists, give it the rumble callback
-    if (ok && lr_input_driver && rumble.set_rumble_state)
-        lr_input_driver->SetRumbleCallback(rumble.set_rumble_state);
-
-    if (ok) splash_try_start();
+    if (ok && lr_input_driver && pending_rumble_cb)
+        lr_input_driver->SetRumbleCallback(pending_rumble_cb);
 
     return ok;
 }
 
 RETRO_API void retro_unload_game(void) {
     splash_stop();
+    launch_pending = false;
     xenia_shutdown();
 }
 
@@ -1653,6 +1677,21 @@ RETRO_API void retro_run(void) {
     if (splash_plm && hw_active) splash_stop();
 
     if (!splash_run_frame()) {
+        // Deferred "Before Boot" launch: the splash just ended (or was
+        // skipped/invalid); boot the game now. This retro_run blocks like a
+        // normal content load; the frontend keeps showing the last frame.
+        if (launch_pending) {
+            launch_pending = false;
+            if (!xenia_setup_and_launch(core_state.game_path)) {
+                xenia_log(RETRO_LOG_ERROR, "Deferred game launch failed\n");
+                core_state.environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+                return;
+            }
+            if (lr_input_driver && pending_rumble_cb)
+                lr_input_driver->SetRumbleCallback(pending_rumble_cb);
+            core_state.video_cb(NULL, 1280, 720, 1280 * 4);  // dupe frame
+            return;
+        }
         update_audio();
         if (vulkan_hw_render_active)
             update_video_vulkan();
