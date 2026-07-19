@@ -773,7 +773,18 @@ static void update_video(void) {
         if (lr_graphics->presenter()->CaptureGuestOutput(captured_frame)) {
             if (captured_frame.width > 0 && captured_frame.height > 0 &&
                 !captured_frame.data.empty()) {
-                // RawImage R8G8B8X8 = XRGB8888 matches pixel format
+                // RawImage is R8G8B8X8 byte order; RETRO_PIXEL_FORMAT_XRGB8888
+                // is little-endian 0x00RRGGBB (B first in memory) - swap R/B.
+                // The buffer is rewritten by every capture, so in-place is fine.
+                uint32_t* px = reinterpret_cast<uint32_t*>(
+                    captured_frame.data.data());
+                size_t count =
+                    (captured_frame.stride / 4) * captured_frame.height;
+                for (size_t i = 0; i < count; i++) {
+                    uint32_t v = px[i];
+                    px[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
+                            ((v & 0x000000FFu) << 16);
+                }
                 core_state.video_cb(captured_frame.data.data(),
                                     captured_frame.width,
                                     captured_frame.height,
@@ -1258,7 +1269,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info) {
     info->library_name     = "Xenia Edge";
     info->library_version  = "0.1.0";
     info->need_fullpath    = true;
-    info->valid_extensions = "iso|xex|zar|xcp";
+    info->valid_extensions = "iso|xex|zar|xcp|x360";
     info->block_extract    = false;
 }
 
@@ -1285,6 +1296,57 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     }
     snprintf(core_state.game_path, sizeof(core_state.game_path),
              "%s", info->path);
+
+    // .x360 pointer files: a one-line text file whose content is the path of
+    // the real game (absolute, or relative to the pointer file). Lets file
+    // browsers and frontend scanners see extension-less content like GOD/XBLA
+    // package headers without renaming the library.
+    {
+        size_t len = strlen(core_state.game_path);
+        const char* ext = len > 5 ? core_state.game_path + len - 5 : "";
+        bool is_ptr = false;
+        if (ext[0] == '.' &&
+            (ext[1] == 'x' || ext[1] == 'X') &&
+            ext[2] == '3' && ext[3] == '6' && ext[4] == '0') {
+            is_ptr = true;
+        }
+        if (is_ptr) {
+            FILE* pf = fopen(core_state.game_path, "rb");
+            if (!pf) {
+                xenia_log(RETRO_LOG_ERROR, "Cannot open pointer file %s\n",
+                          core_state.game_path);
+                return false;
+            }
+            char line[sizeof(core_state.game_path)] = {0};
+            if (!fgets(line, sizeof(line), pf)) line[0] = 0;
+            fclose(pf);
+            // Trim trailing whitespace/newline and optional quotes.
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                         line[n - 1] == ' ' || line[n - 1] == '\t'))
+                line[--n] = 0;
+            char* target = line;
+            if (n >= 2 && target[0] == '"' && target[n - 1] == '"') {
+                target[n - 1] = 0;
+                target++;
+            }
+            if (!target[0]) {
+                xenia_log(RETRO_LOG_ERROR, "Pointer file %s is empty\n",
+                          core_state.game_path);
+                return false;
+            }
+            std::error_code ptr_ec;
+            std::filesystem::path resolved(target);
+            if (resolved.is_relative()) {
+                resolved = std::filesystem::path(core_state.game_path)
+                               .parent_path() / resolved;
+            }
+            snprintf(core_state.game_path, sizeof(core_state.game_path), "%s",
+                     resolved.string().c_str());
+            xenia_log(RETRO_LOG_INFO, "Pointer file resolved to: %s\n",
+                      core_state.game_path);
+        }
+    }
 
     // Apply any options set before load
     apply_core_options();
@@ -1364,7 +1426,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     struct retro_rumble_interface rumble = {0};
     core_state.environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble);
 
-    bool ok = xenia_setup_and_launch(info->path);
+    bool ok = xenia_setup_and_launch(core_state.game_path);
 
     // Now that the HID driver exists, give it the rumble callback
     if (ok && lr_input_driver && rumble.set_rumble_state)
