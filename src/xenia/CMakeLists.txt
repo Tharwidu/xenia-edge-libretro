@@ -41,7 +41,10 @@ endif()
 add_subdirectory(vfs)
 add_subdirectory(debug/ui)
 add_subdirectory(app/discord)
-add_subdirectory(app)
+if(NOT XENIA_BUILD_LIBRETRO)
+  # The app executable needs the wx UI, which the libretro build excludes.
+  add_subdirectory(app)
+endif()
 
 if(WIN32)
   add_subdirectory(apu/xaudio2)

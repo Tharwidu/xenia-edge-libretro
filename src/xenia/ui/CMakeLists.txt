@@ -7,14 +7,22 @@ file(GLOB _ui_exclude
   "${CMAKE_CURRENT_SOURCE_DIR}/*_demo.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/windowed_app_main_*.cc"
 )
-if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR XENIA_BUILD_LIBRETRO)
   file(GLOB _wx_exclude
     "${CMAKE_CURRENT_SOURCE_DIR}/*_wx.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/*_wx.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wx_locale.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/wx_locale.h"
+    # icon_decode uses wxBitmapBundle; only the wx dialogs consume it.
+    "${CMAKE_CURRENT_SOURCE_DIR}/icon_decode.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/icon_decode.h"
   )
   list(APPEND _ui_exclude ${_wx_exclude})
+endif()
+if(XENIA_BUILD_LIBRETRO)
+  # Surface creation from native windows needs GDK; the libretro core is
+  # headless and never creates window surfaces.
+  list(APPEND _ui_exclude "${CMAKE_CURRENT_SOURCE_DIR}/surface_gnulinux.cc")
 endif()
 get_target_property(_ui_srcs xenia-ui SOURCES)
 if(_ui_exclude AND _ui_srcs)
@@ -22,7 +30,7 @@ if(_ui_exclude AND _ui_srcs)
   set_target_properties(xenia-ui PROPERTIES SOURCES "${_ui_srcs}")
 endif()
 target_link_libraries(xenia-ui PUBLIC xenia-base)
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT XENIA_BUILD_LIBRETRO)
   target_link_libraries(xenia-ui PUBLIC xe-wxWidgets)
 endif()
 if(WIN32)

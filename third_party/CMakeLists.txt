@@ -1159,7 +1159,7 @@ ffmpeg_common(libavformat)
 # ==============================================================================
 # wxWidgets
 # ==============================================================================
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT XENIA_BUILD_LIBRETRO)
     # Build from vendored source — matches what we ship on Windows/macOS, and
     # on Linux gives us a known-good 3.3 (system 3.2 has GTK3/Wayland issues).
     # Strip the directory-level /W0 (or -w) so wxWidgets's own /W3 doesn't

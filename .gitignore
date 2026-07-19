@@ -88,6 +88,8 @@ node_modules/
 /build-vs/
 /build-arm64/
 /build-x64/
+/build-cmake/
+/build-win/
 
 # Downloaded Slang shader compiler (xenia-build.py ensure_slangc)
 /.slang/

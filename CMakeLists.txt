@@ -82,6 +82,13 @@ option(XENIA_ENABLE_PROFILER "Enable profiler (UI is Debug-only)" OFF)
 option(XENIA_ENABLE_ITRACE "Enable JIT per-instruction tracing to the log (slow)" OFF)
 option(XENIA_ENABLE_DTRACE "Enable JIT per-operation data tracing to the log (very slow)" OFF)
 option(XENIA_ENABLE_FTRACE "Enable JIT per-function-call tracing to the log" OFF)
+option(XENIA_BUILD_LIBRETRO "Build the libretro core (headless: no app, no wx/GTK UI)" OFF)
+
+if(XENIA_BUILD_LIBRETRO)
+  add_compile_definitions(XENIA_LIBRETRO=1)
+  # The core is a shared library; every static lib it links must be PIC.
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 if(XENIA_ENABLE_PROFILER)
   # UI is Debug-only — shutdown dump spams the log otherwise.
@@ -350,11 +357,14 @@ else()
       pthread
     )
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(GTK3 REQUIRED gtk+-x11-3.0)
-    include_directories(${GTK3_INCLUDE_DIRS})
-    link_directories(${GTK3_LIBRARY_DIRS})
-    add_compile_options(${GTK3_CFLAGS_OTHER})
+    if(NOT XENIA_BUILD_LIBRETRO)
+      # GTK3 is only needed by the wx UI, which the libretro core excludes.
+      find_package(PkgConfig REQUIRED)
+      pkg_check_modules(GTK3 REQUIRED gtk+-x11-3.0)
+      include_directories(${GTK3_INCLUDE_DIRS})
+      link_directories(${GTK3_LIBRARY_DIRS})
+      add_compile_options(${GTK3_CFLAGS_OTHER})
+    endif()
 
     link_libraries(stdc++fs dl lz4 m pthread rt)
 
@@ -441,5 +451,9 @@ endif()
 add_subdirectory(third_party)
 
 add_subdirectory(src/xenia)
+
+if(XENIA_BUILD_LIBRETRO)
+  add_subdirectory(libretro)
+endif()
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT xenia-app)

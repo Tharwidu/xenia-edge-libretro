@@ -45,7 +45,7 @@ DECLARE_int32(log_level);
 // New cvars for expanded core options
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
-DECLARE_uint64(framerate_limit);
+DECLARE_uint32(framerate_limit);
 DECLARE_string(readback_resolve);
 DECLARE_bool(store_shaders);
 DECLARE_bool(half_pixel_offset);
@@ -60,8 +60,8 @@ DECLARE_bool(enable_xmp);
 DECLARE_int32(xmp_default_volume);
 DECLARE_bool(apply_patches);
 DECLARE_int32(license_mask);
-DECLARE_string(user_language);
-DECLARE_string(user_country);
+DECLARE_int32(user_language);
+DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(disable_context_promotion);
@@ -608,9 +608,9 @@ static void apply_core_options(void) {
     if ((v = opt_get(XENIA_OPT_AUDIO_ENABLED)))
         core_state.audio_enabled = (strcmp(v, "enabled") == 0);
 
-    // Mute
+    // Mute (session-only volume; upstream removed the mute cvar)
     if ((v = opt_get(XENIA_OPT_MUTE))) {
-        cvars::mute = (strcmp(v, "enabled") == 0);
+        xe::apu::SetVolume((strcmp(v, "enabled") == 0) ? 0 : 100);
     }
 
     // XMA decoder (restart required)
@@ -660,14 +660,29 @@ static void apply_core_options(void) {
         cvars::license_mask = atoi(v);
     }
 
-    // User language
+    // User language (upstream now uses numeric XConfig language IDs)
     if ((v = opt_get(XENIA_OPT_USER_LANGUAGE))) {
-        cvars::user_language = v;
+        struct { const char* name; int id; } langs[] = {
+            {"English", 1},  {"Japanese", 2},   {"German", 3},
+            {"French", 4},   {"Spanish", 5},    {"Italian", 6},
+            {"Korean", 7},   {"TChinese", 8},   {"Portuguese", 9},
+            {"Polish", 11},  {"Russian", 12},   {"SChinese", 17},
+        };
+        for (auto& l : langs) {
+            if (strcmp(v, l.name) == 0) { cvars::user_language = l.id; break; }
+        }
     }
 
-    // User country
+    // User country (upstream now uses numeric XConfig country IDs)
     if ((v = opt_get(XENIA_OPT_USER_COUNTRY))) {
-        cvars::user_country = v;
+        struct { const char* name; int id; } countries[] = {
+            {"United States", 103}, {"Great Britain", 35}, {"Japan", 53},
+            {"Germany", 24},        {"France", 34},        {"Spain", 31},
+            {"Italy", 50},          {"Australia", 6},      {"Canada", 16},
+        };
+        for (auto& c : countries) {
+            if (strcmp(v, c.name) == 0) { cvars::user_country = c.id; break; }
+        }
     }
 
     // =================================================================
@@ -1075,6 +1090,16 @@ static bool xenia_setup_and_launch(const char *path) {
         if (XFAILED(status)) {
             xenia_log(RETRO_LOG_ERROR,
                       "Emulator::Setup failed 0x%08X\n", status);
+            xenia_emulator.reset();
+            return false;
+        }
+
+        // Upstream split subsystem creation out of Setup so per-game cvar
+        // overrides can load first; without this graphics_system() is null.
+        status = xenia_emulator->SetupSubsystems();
+        if (XFAILED(status)) {
+            xenia_log(RETRO_LOG_ERROR,
+                      "Emulator::SetupSubsystems failed 0x%08X\n", status);
             xenia_emulator.reset();
             return false;
         }

@@ -22,14 +22,11 @@ std::unique_ptr<FilePicker> FilePicker::Create() { return nullptr; }
 }  // namespace ui
 }  // namespace xe
 
-// cvar from notification_widget_qt.cc (excluded).
-DEFINE_path(achievement_sound_path, "",
-            "Path to achievement unlock sound (unused in libretro).", "UI");
+// achievement_sound_path is now defined by ui/audio_helper.cc, which builds
+// headless since the wx migration; the Qt version tag stub is likewise gone.
 
-// Qt version tag stub: xam_ui.cc needs qt_version_tag_6_10 from Qt6Core.dll.
-#ifdef _WIN32
-extern "C" {
-  static const char qt_version_tag_6_10_stub_data = 0;
-  const char* __imp_qt_version_tag_6_10 = &qt_version_tag_6_10_stub_data;
-}
-#endif
+// mount_memory_unit is defined in app/xenia_main.cc (excluded here) but
+// referenced from emulator.cc; the other xenia_main cvars libretro needs are
+// already defined in libretro.cpp.
+DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
+            "Storage");
