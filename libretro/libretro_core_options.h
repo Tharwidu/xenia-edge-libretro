@@ -23,6 +23,7 @@ struct xenia_core_state;
 #define XENIA_OPT_READBACK_RESOLVE      "xenia_readback_resolve"
 #define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
 #define XENIA_OPT_AUTO_PROFILE          "xenia_auto_profile"
+#define XENIA_OPT_BOOT_SPLASH           "xenia_boot_splash"
 #define XENIA_OPT_STORE_SHADERS         "xenia_store_shaders"
 #define XENIA_OPT_HALF_PIXEL_OFFSET     "xenia_half_pixel_offset"
 #define XENIA_OPT_GPU_INVALID_FETCH     "xenia_gpu_allow_invalid_fetch_constants"
@@ -538,6 +539,25 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "0"
+    },
+    {
+        XENIA_OPT_BOOT_SPLASH,
+        "Boot Splash Video",
+        "Boot Splash",
+        "Play an optional user-supplied boot animation before the game "
+        "becomes visible (the game keeps loading underneath). Xenia is a "
+        "high-level emulator and has no console boot flow of its own.\n"
+        "Place an MPEG-1 file at <system>/xenia/bootanim.mpg. Convert any "
+        "video with: ffmpeg -i in.mp4 -c:v mpeg1video -q:v 4 -c:a mp2 "
+        "-ar 48000 bootanim.mpg",
+        NULL,
+        "Emulation",
+        {
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "enabled"
     },
     {
         XENIA_OPT_AUTO_PROFILE,

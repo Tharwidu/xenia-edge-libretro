@@ -79,6 +79,10 @@ DECLARE_bool(disable_context_promotion);
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/profile_manager.h"
+
+// Single-header MPEG-1 decoder for the optional boot splash video.
+#define PL_MPEG_IMPLEMENTATION
+#include "pl_mpeg.h"
 #include "libretro_audio_driver.h"
 #include "libretro_hid.h"
 
@@ -749,6 +753,135 @@ static void update_audio(void) {
         core_state.audio_batch_cb(core_state.audio_buffer, got / 2);
         total += got;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Optional boot splash: a user-supplied MPEG-1 file played through the
+// software frame path while the game keeps booting underneath. Xenia has no
+// console boot flow of its own (high-level emulation), so this is purely a
+// cosmetic simulation. File: <system>/xenia/bootanim.mpg
+// ---------------------------------------------------------------------------
+static plm_t* splash_plm = nullptr;
+static std::vector<uint8_t> splash_frame_buf;
+static int splash_w = 0, splash_h = 0;
+static bool splash_audio_ok = false;
+static std::chrono::steady_clock::time_point splash_next_frame;
+static bool splash_pacing_init = false;
+
+static void splash_stop(void) {
+    if (splash_plm) {
+        plm_destroy(splash_plm);
+        splash_plm = nullptr;
+    }
+    splash_frame_buf.clear();
+    splash_frame_buf.shrink_to_fit();
+}
+
+static void splash_try_start(void) {
+    const char* v = opt_get(XENIA_OPT_BOOT_SPLASH);
+    if (v && strcmp(v, "disabled") == 0) return;
+
+    std::filesystem::path p =
+        std::filesystem::path(core_state.system_dir) / "xenia" /
+        "bootanim.mpg";
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec)) return;
+
+    splash_plm = plm_create_with_filename(p.string().c_str());
+    if (!splash_plm) return;
+    if (!plm_probe(splash_plm, 5000 * 1024)) {
+        xenia_log(RETRO_LOG_WARN, "bootanim.mpg is not valid MPEG-1 PS\n");
+        splash_stop();
+        return;
+    }
+    plm_set_loop(splash_plm, 0);
+
+    splash_w = plm_get_width(splash_plm);
+    splash_h = plm_get_height(splash_plm);
+    double fps = plm_get_framerate(splash_plm);
+    if (splash_w < 16 || splash_h < 16 || splash_w > 3840 ||
+        splash_h > 2160 || fps <= 0) {
+        xenia_log(RETRO_LOG_WARN, "bootanim.mpg has unusable dimensions\n");
+        splash_stop();
+        return;
+    }
+
+    // Audio only when the stream matches the core's output rate; resampling
+    // is not worth the complexity for a boot animation.
+    splash_audio_ok =
+        plm_get_num_audio_streams(splash_plm) > 0 &&
+        plm_get_samplerate(splash_plm) == (int)core_state.audio_sample_rate;
+    plm_set_audio_enabled(splash_plm, splash_audio_ok ? 1 : 0);
+    if (!splash_audio_ok) {
+        xenia_log(RETRO_LOG_INFO,
+                  "Boot splash audio disabled (need %u Hz MP2; convert with "
+                  "-ar %u)\n",
+                  core_state.audio_sample_rate, core_state.audio_sample_rate);
+    }
+
+    splash_frame_buf.resize((size_t)splash_w * splash_h * 4);
+    splash_pacing_init = false;
+    xenia_log(RETRO_LOG_INFO, "Playing boot splash %dx%d @ %.2f fps\n",
+              splash_w, splash_h, fps);
+}
+
+// Runs one splash frame. Returns false when the splash is not active (caller
+// proceeds with normal video/audio).
+static bool splash_run_frame(void) {
+    if (!splash_plm) return false;
+
+    using clock = std::chrono::steady_clock;
+    if (!splash_pacing_init) {
+        splash_next_frame = clock::now();
+        splash_pacing_init = true;
+    }
+
+    plm_frame_t* frame = plm_decode_video(splash_plm);
+    if (!frame) {
+        splash_stop();
+        return false;
+    }
+
+    plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
+
+    // Feed splash audio decoded up to this frame's timestamp.
+    if (splash_audio_ok) {
+        static int16_t s16[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
+        while (true) {
+            plm_samples_t* s = plm_decode_audio(splash_plm);
+            if (!s) break;
+            for (unsigned i = 0; i < s->count * 2; i++) {
+                float f = s->interleaved[i] * 32767.0f;
+                if (f > 32767.0f) f = 32767.0f;
+                if (f < -32768.0f) f = -32768.0f;
+                s16[i] = (int16_t)f;
+            }
+            if (core_state.audio_batch_cb)
+                core_state.audio_batch_cb(s16, s->count);
+            if (s->time >= frame->time) break;
+        }
+    }
+
+    // Discard the booting game's audio so it doesn't burst in afterwards.
+    if (audio_ring && core_state.audio_buffer) {
+        for (int i = 0; i < 64; i++) {
+            if (!audio_ring->Pop(core_state.audio_buffer, 1600)) break;
+        }
+    }
+
+    // Pace to the video's own framerate.
+    auto now = clock::now();
+    if (now < splash_next_frame) {
+        std::this_thread::sleep_until(splash_next_frame);
+    }
+    splash_next_frame += std::chrono::nanoseconds(
+        (int64_t)(1e9 / plm_get_framerate(splash_plm)));
+    if (splash_next_frame < clock::now() - std::chrono::milliseconds(200))
+        splash_next_frame = clock::now();
+
+    core_state.video_cb(splash_frame_buf.data(), splash_w, splash_h,
+                        splash_w * 4);
+    return true;
 }
 
 // Pace software-mode retro_run to content rate. Frontends that disable both
@@ -1461,10 +1594,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     if (ok && lr_input_driver && rumble.set_rumble_state)
         lr_input_driver->SetRumbleCallback(rumble.set_rumble_state);
 
+    if (ok) splash_try_start();
+
     return ok;
 }
 
 RETRO_API void retro_unload_game(void) {
+    splash_stop();
     xenia_shutdown();
 }
 
@@ -1508,16 +1644,26 @@ RETRO_API void retro_run(void) {
 
     // Capture the latest frame via the appropriate video path.
 
-    update_audio();
-    if (vulkan_hw_render_active)
-        update_video_vulkan();
+    // Boot splash replaces game A/V while it plays (software mode only:
+    // HW-render frontends ignore memory frames).
+    bool hw_active = vulkan_hw_render_active;
 #ifdef _WIN32
-    else if (d3d12_hw_render_active)
-        update_video_d3d12();
+    hw_active = hw_active || d3d12_hw_render_active;
 #endif
-    else {
-        pace_software_frame();
-        update_video();
+    if (splash_plm && hw_active) splash_stop();
+
+    if (!splash_run_frame()) {
+        update_audio();
+        if (vulkan_hw_render_active)
+            update_video_vulkan();
+#ifdef _WIN32
+        else if (d3d12_hw_render_active)
+            update_video_d3d12();
+#endif
+        else {
+            pace_software_frame();
+            update_video();
+        }
     }
 
     // React to option changes
