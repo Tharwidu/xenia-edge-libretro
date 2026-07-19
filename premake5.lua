@@ -186,6 +186,8 @@ filter({"configurations:Valgrind", "platforms:Linux"})
 filter("platforms:Linux")
   system("linux")
   toolset("clang")
+  -- The libretro core is a shared library; all static libs it links must be PIC.
+  pic("On")
   local qt_dir = os.getenv("QT_DIR")
   if qt_dir then
     local qt_version = get_qt_version(qt_dir)

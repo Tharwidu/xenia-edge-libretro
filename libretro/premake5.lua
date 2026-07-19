@@ -66,7 +66,9 @@ project("xenia-ui-headless")
 
 --------------------------------------------------------------------------------
 -- xenia-ui-d3d12-headless: same as xenia-ui-d3d12 but links headless UI.
+-- Windows-only: D3D12 sources require Windows SDK headers.
 --------------------------------------------------------------------------------
+if os.istarget("windows") then
 project("xenia-ui-d3d12-headless")
   uuid("f93dc1a8-aaaa-4444-b0fc-ae3eefbe836b")
   kind("StaticLib")
@@ -91,6 +93,7 @@ project("xenia-ui-d3d12-headless")
   filter("platforms:Windows")
     files({ ui_src.."/d3d12/*_win.h", ui_src.."/d3d12/*_win.cc" })
   filter({})
+end
 
 --------------------------------------------------------------------------------
 -- xenia-ui-vulkan-headless: same as xenia-ui-vulkan but links headless UI.
@@ -189,7 +192,9 @@ project("xenia-gpu-headless")
 
 --------------------------------------------------------------------------------
 -- xenia-gpu-d3d12-headless
+-- Windows-only: D3D12 sources require Windows SDK headers.
 --------------------------------------------------------------------------------
+if os.istarget("windows") then
 project("xenia-gpu-d3d12-headless")
   uuid("c057eae4-aaaa-4444-9a69-1fe07b735c49")
   kind("StaticLib")
@@ -217,6 +222,7 @@ project("xenia-gpu-d3d12-headless")
   filter("platforms:Windows")
     files({ gpu_src.."/d3d12/*_win.h", gpu_src.."/d3d12/*_win.cc" })
   filter({})
+end
 
 --------------------------------------------------------------------------------
 -- xenia-gpu-vulkan-headless
@@ -324,7 +330,6 @@ project("xenia-libretro")
     "libretro_graphics_system.cc",
     "libretro_hid.cc",
     "libretro_vk_presenter.cc",
-    "libretro_d3d12_presenter.cc",
     "libretro_headless_stubs.cc",
     "libretro.h",
     "libretro_core_options.h",
@@ -353,7 +358,6 @@ project("xenia-libretro")
     "xenia-core",
     "xenia-cpu",
     "xenia-gpu-headless",
-    "xenia-gpu-d3d12-headless",
     "xenia-gpu-vulkan-headless",
     "xenia-gpu-null-headless",
     "xenia-hid",
@@ -361,7 +365,6 @@ project("xenia-libretro")
     "xenia-kernel",
     "xenia-patcher",
     "xenia-ui-headless",
-    "xenia-ui-d3d12-headless",
     "xenia-ui-vulkan-headless",
     "xenia-vfs",
   })
@@ -396,7 +399,12 @@ project("xenia-libretro")
     })
 
   filter("platforms:Windows")
+    files({
+      "libretro_d3d12_presenter.cc",
+    })
     links({
+      "xenia-gpu-d3d12-headless",
+      "xenia-ui-d3d12-headless",
       "d3d12",
       "dxgi",
       "vulkan-1",
@@ -412,6 +420,9 @@ project("xenia-libretro")
       "X11",
       "xcb",
       "X11-xcb",
+      -- The libretro VK presenter calls Vulkan functions directly (Windows
+      -- links vulkan-1); xenia itself only loads Vulkan dynamically.
+      "vulkan",
     })
     defines({
       "XENIA_LIBRETRO=1",
