@@ -214,10 +214,31 @@ if(MSVC)
   add_compile_options(
     /utf-8             # non-Latin-codepage-safe source parsing
     /Zc:__cplusplus    # correct __cplusplus macro value
-    /Zc:preprocessor   # conformant preprocessor
     /wd4201            # nameless struct/unions are ok
-    /MP
   )
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # clang-cl: already-conformant preprocessor; /MP is a no-op that trips
+    # -Wunused-command-line-argument under -Werror. The -Wno- set mirrors
+    # the clang warning disables from the Linux branch.
+    add_compile_options(
+      -Wno-unused-command-line-argument
+      -Wno-character-conversion         # utfcpp third-party headers
+      -Wno-deprecated-literal-operator  # tabulate/third-party
+      -Wno-nontrivial-memcall
+      -Wno-switch                       # mirrors the Linux branch
+      -Wno-tautological-pointer-compare
+      -Wno-ignored-pragmas              # MSVC #pragma optimize("s"/"t", ...)
+      -Wno-deprecated-enum-enum-conversion
+      -Wno-deprecated-volatile
+      -Wno-deprecated-register
+      -Wno-undefined-inline             # inline-declared, cc-defined methods
+    )
+  else()
+    add_compile_options(
+      /Zc:preprocessor # conformant preprocessor
+      /MP
+    )
+  endif()
   if(XE_TARGET_X86_64)
     add_compile_options(/arch:AVX)
   endif()

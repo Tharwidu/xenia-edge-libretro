@@ -8,12 +8,14 @@
  * (at your option) any later version.
  */
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
 #include <filesystem>
 #include <memory>
+#include <thread>
 
 #include "libretro.h"
 #include "libretro_vulkan.h"
@@ -92,12 +94,8 @@ DEFINE_path(cache_root, "", "Root path for cache files.", "Storage");
 DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
 DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
 
-#ifdef _WIN32
-DEFINE_bool(win32_high_resolution_timer, true,
-            "Requests high-resolution timer from the NT kernel", "Win32");
-DEFINE_bool(win32_mmcss, true,
-            "Opt in MMCSS scheduling for prioritized CPU access", "Win32");
-#endif
+// win32_high_resolution_timer / win32_mmcss are now defined upstream in
+// base/main_win.cc, which the libretro build links.
 
 DEFINE_transient_bool(portable, false, "Portable mode.", "General");
 DEFINE_bool(discord, false, "Enable Discord rich presence", "General");
@@ -751,6 +749,24 @@ static void update_audio(void) {
     }
 }
 
+// Pace software-mode retro_run to content rate. Frontends that disable both
+// vsync and audio sync (EmuVR's config does) call retro_run in a free spin,
+// which turns the per-frame CaptureGuestOutput readback into a GPU flood.
+// Under a normally throttled frontend the deadline is already past and this
+// is a no-op.
+static void pace_software_frame(void) {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point next = clock::now();
+    auto now = clock::now();
+    if (now < next) {
+        std::this_thread::sleep_until(next);
+        now = clock::now();
+    }
+    next += std::chrono::nanoseconds(
+        core_state.pal_mode ? 20000000 : 16683350);  // 50 / 59.94 Hz
+    if (next < now - std::chrono::milliseconds(100)) next = now;
+}
+
 static void update_video(void) {
     // Capture frame using presenter's CaptureGuestOutput.
     if (lr_graphics && lr_graphics->presenter()) {
@@ -1172,8 +1188,9 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         core_state.log_cb = log_cb.log;
     }
 
-    // Publish core options v2
-    cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &xenia_core_options_v2_def);
+    // Publish core options (v2 with legacy SET_VARIABLES fallback for
+    // frontends like EmuVR's RetroArch 1.7.5)
+    xenia_publish_core_options(cb);
 
     // Publish input descriptors for 4 Xbox 360 controllers
     static const struct retro_input_descriptor descs[] = {
@@ -1284,6 +1301,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
                 sizeof(core_state.graphics_backend) - 1);
     }
+    // Explicit backend option overrides the frontend-derived choice. The
+    // frontend's HW render interface is only negotiated when its preferred
+    // context matches, so a forced backend simply renders internally and
+    // delivers software frames (the Wine/Proton-friendly path: Vulkan there
+    // avoids the D3D12 Agility SDK requirement entirely).
+    {
+        const char* bopt = opt_get(XENIA_OPT_GPU_BACKEND);
+        if (bopt && strcmp(bopt, "auto") != 0) {
+            strncpy(core_state.graphics_backend, bopt,
+                    sizeof(core_state.graphics_backend) - 1);
+            if (strcmp(bopt, XENIA_GRAPHICS_VULKAN) != 0)
+                preferred_hw = RETRO_HW_CONTEXT_NONE;
+        }
+    }
     // Also update the gpu cvar so internal Xenia code stays consistent
     cvars::gpu = core_state.graphics_backend;
     xenia_log(RETRO_LOG_INFO,
@@ -1393,8 +1424,10 @@ RETRO_API void retro_run(void) {
     else if (d3d12_hw_render_active)
         update_video_d3d12();
 #endif
-    else
+    else {
+        pace_software_frame();
         update_video();
+    }
 
     // React to option changes
     bool vars_updated = false;

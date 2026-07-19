@@ -21,6 +21,7 @@ struct xenia_core_state;
 #define XENIA_OPT_ANISOTROPIC_FILTERING "xenia_anisotropic_filtering"
 #define XENIA_OPT_ASYNC_SHADERS         "xenia_async_shader_compilation"
 #define XENIA_OPT_READBACK_RESOLVE      "xenia_readback_resolve"
+#define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
 #define XENIA_OPT_STORE_SHADERS         "xenia_store_shaders"
 #define XENIA_OPT_HALF_PIXEL_OFFSET     "xenia_half_pixel_offset"
 #define XENIA_OPT_GPU_INVALID_FETCH     "xenia_gpu_allow_invalid_fetch_constants"
@@ -149,6 +150,26 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "enabled"
+    },
+    {
+        XENIA_OPT_GPU_BACKEND,
+        "GPU Backend",
+        "Backend",
+        "Graphics backend for Xenia's internal rendering.\n"
+        "Auto: follow the frontend's preferred context (D3D12 when none).\n"
+        "Vulkan: best under Wine/Proton; no Agility SDK requirement.\n"
+        "D3D12: Windows only; requires the DirectX 12 Agility runtime.",
+        NULL,
+        "Graphics",
+        {
+            { "auto",   "Auto" },
+            { "vulkan", "Vulkan" },
+#ifdef _WIN32
+            { "d3d12",  "Direct3D 12" },
+#endif
+            { NULL, NULL }
+        },
+        "auto"
     },
     {
         XENIA_OPT_READBACK_RESOLVE,
@@ -692,5 +713,60 @@ static struct retro_core_options_v2 xenia_core_options_v2_def = {
     xenia_core_option_categories,
     xenia_core_options_v2_defs
 };
+
+/* Publish core options with a legacy fallback. Frontends before options v2
+ * (RetroArch <= 1.9.11, including EmuVR's 1.7.5) return false for
+ * SET_CORE_OPTIONS_V2 and would silently end up with all-default options;
+ * convert the v2 definitions to the v0 SET_VARIABLES format
+ * ("Label; default|value1|value2", default listed first) for them. */
+static void xenia_publish_core_options(retro_environment_t cb) {
+    unsigned version = 0;
+    if (!cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &version))
+        version = 0;
+    if (version >= 2) {
+        cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &xenia_core_options_v2_def);
+        return;
+    }
+
+    #define XENIA_NUM_OPTS \
+        (sizeof(xenia_core_options_v2_defs) / sizeof(xenia_core_options_v2_defs[0]))
+    static struct retro_variable vars[XENIA_NUM_OPTS];
+    static char var_bufs[XENIA_NUM_OPTS][2048];
+    size_t out = 0;
+
+    for (size_t i = 0; xenia_core_options_v2_defs[i].key; i++) {
+        const struct retro_core_option_v2_definition *def =
+            &xenia_core_options_v2_defs[i];
+        char *buf = var_bufs[out];
+        size_t cap = sizeof(var_bufs[out]);
+        size_t pos = (size_t)snprintf(buf, cap, "%s; ",
+                                      def->desc ? def->desc : def->key);
+
+        if (def->default_value && pos < cap) {
+            pos += (size_t)snprintf(buf + pos, cap - pos, "%s",
+                                    def->default_value);
+        }
+        for (size_t v = 0; v < RETRO_NUM_CORE_OPTION_VALUES_MAX &&
+                           def->values[v].value; v++) {
+            if (def->default_value &&
+                !strcmp(def->values[v].value, def->default_value)) {
+                continue;
+            }
+            if (pos < cap) {
+                pos += (size_t)snprintf(buf + pos, cap - pos, "|%s",
+                                        def->values[v].value);
+            }
+        }
+
+        vars[out].key = def->key;
+        vars[out].value = buf;
+        out++;
+    }
+    vars[out].key = NULL;
+    vars[out].value = NULL;
+    #undef XENIA_NUM_OPTS
+
+    cb(RETRO_ENVIRONMENT_SET_VARIABLES, vars);
+}
 
 #endif /* LIBRETRO_CORE_OPTIONS_H */

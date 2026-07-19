@@ -27,7 +27,9 @@ class Win32MappedMemory : public MappedMemory {
  public:
   // CreateFile returns INVALID_HANDLE_VALUE in case of failure.
   // chrispy: made inline const to get around clang error
-  static inline constexpr HANDLE kFileHandleInvalid = INVALID_HANDLE_VALUE;
+  // Not constexpr: INVALID_HANDLE_VALUE's pointer cast is only accepted as a
+  // constant expression by MSVC's extension, not by clang-cl.
+  static inline const HANDLE kFileHandleInvalid = INVALID_HANDLE_VALUE;
   // CreateFileMapping returns nullptr in case of failure.
   static constexpr HANDLE kMappingHandleInvalid = nullptr;
 

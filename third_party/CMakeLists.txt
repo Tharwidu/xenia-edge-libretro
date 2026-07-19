@@ -192,6 +192,14 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND XE_TARGET_AARCH64
     AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
   set(_xe_use_host_shader_cc TRUE)
 endif()
+# Explicit host tool for other cross setups (e.g. Linux->Windows): a
+# target-built shader-cc can't spawn the host slangc, so point
+# XENIA_HOST_SHADER_CC at a native build's binary.
+set(XENIA_HOST_SHADER_CC "" CACHE FILEPATH
+    "Path to a host-runnable xenia-shader-cc for cross builds")
+if(XENIA_HOST_SHADER_CC)
+  set(_xe_use_host_shader_cc TRUE)
+endif()
 
 if(NOT _xe_use_host_shader_cc)
 
@@ -429,6 +437,15 @@ endif()
 
 else()  # _xe_use_host_shader_cc: x64→ARM64 cross-compile, use native build's binary
 
+if(XENIA_HOST_SHADER_CC)
+  if(NOT EXISTS "${XENIA_HOST_SHADER_CC}")
+    message(FATAL_ERROR "XENIA_HOST_SHADER_CC not found: ${XENIA_HOST_SHADER_CC}")
+  endif()
+  add_executable(xenia-shader-cc IMPORTED GLOBAL)
+  set_target_properties(xenia-shader-cc PROPERTIES
+    IMPORTED_LOCATION "${XENIA_HOST_SHADER_CC}")
+else()
+
 # Native x64 build lives at <repo>/build/ (xenia-build.py: get_build_dir(None)).
 set(_xe_host_shader_cc_dir "${CMAKE_SOURCE_DIR}/build/host_tools")
 set(_xe_host_shader_cc_any "")
@@ -452,6 +469,8 @@ set_target_properties(xenia-shader-cc PROPERTIES
   IMPORTED_LOCATION_RELEASE "${_xe_host_shader_cc_dir}/Release/xenia-shader-cc.exe"
   IMPORTED_LOCATION_CHECKED "${_xe_host_shader_cc_dir}/Checked/xenia-shader-cc.exe"
   IMPORTED_LOCATION_DEBUG "${_xe_host_shader_cc_dir}/Debug/xenia-shader-cc.exe")
+
+endif()  # XENIA_HOST_SHADER_CC
 
 endif()
 
@@ -633,11 +652,13 @@ else()
     X86_AVX512VNNI
     WITH_GZFILEOP
   )
-  if(NOT MSVC)
+  if(NOT MSVC OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
     # GCC/Clang have native __builtin_ctz/__builtin_ctzll (MSVC gets these
     # from fallback_builtins.h). Defining these enables optimized compare256
     # and longest_match codepaths. HAVE_ATTRIBUTE_ALIGNED gates GCC-style
     # __attribute__((aligned)); MSVC uses __declspec(align) via its fallback.
+    # clang-cl reports as MSVC but gates intrinsics like clang, so it takes
+    # this branch too (it accepts the -m flags).
     target_compile_definitions(zlib-ng PRIVATE HAVE_BUILTIN_CTZ HAVE_BUILTIN_CTZLL HAVE_ATTRIBUTE_ALIGNED)
     # GCC/Clang need per-file ISA flags; MSVC handles this via runtime dispatch
     set_source_files_properties(
@@ -1351,6 +1372,34 @@ if(WIN32)
   endforeach()
 
   include(ExternalProject)
+  # Cross builds (clang-cl on a non-Windows host) need a meson cross file so
+  # meson doesn't probe the host cc with MSVC-style flags.
+  set(_xe_meson_cross_args "")
+  if(CMAKE_CROSSCOMPILING AND XWIN_ROOT)
+    set(_xe_meson_cross_file "${CMAKE_BINARY_DIR}/meson-clang-cl-cross.ini")
+    file(WRITE "${_xe_meson_cross_file}" "
+[binaries]
+# Include paths live in the compiler arrays: -Dc_args on the setup command
+# line would override cross-file [built-in options] c_args.
+c = ['clang-cl', '--target=x86_64-pc-windows-msvc', '-fuse-ld=lld', '/imsvc${XWIN_ROOT}/crt/include', '/imsvc${XWIN_ROOT}/sdk/include/ucrt', '/imsvc${XWIN_ROOT}/sdk/include/um', '/imsvc${XWIN_ROOT}/sdk/include/shared', '/imsvc${XWIN_ROOT}/sdk/include/winrt']
+cpp = ['clang-cl', '--target=x86_64-pc-windows-msvc', '-fuse-ld=lld', '/imsvc${XWIN_ROOT}/crt/include', '/imsvc${XWIN_ROOT}/sdk/include/ucrt', '/imsvc${XWIN_ROOT}/sdk/include/um', '/imsvc${XWIN_ROOT}/sdk/include/shared', '/imsvc${XWIN_ROOT}/sdk/include/winrt']
+ar = 'llvm-lib'
+c_ld = 'lld-link'
+cpp_ld = 'lld-link'
+windres = ['llvm-rc', '/I', '${XWIN_ROOT}/sdk/include/um', '/I', '${XWIN_ROOT}/sdk/include/shared', '/I', '${XWIN_ROOT}/crt/include', '/I', '${XWIN_ROOT}/sdk/include/ucrt']
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[built-in options]
+c_link_args = ['/libpath:${XWIN_ROOT}/crt/lib/x64', '/libpath:${XWIN_ROOT}/sdk/lib/um/x64', '/libpath:${XWIN_ROOT}/sdk/lib/ucrt/x64']
+cpp_link_args = ['/libpath:${XWIN_ROOT}/crt/lib/x64', '/libpath:${XWIN_ROOT}/sdk/lib/um/x64', '/libpath:${XWIN_ROOT}/sdk/lib/ucrt/x64']
+")
+    set(_xe_meson_cross_args --cross-file "${_xe_meson_cross_file}")
+  endif()
   # Wipe then setup keeps the configure step idempotent across reconfigures.
   # /wd4189 overrides mesa's /we4189: Release strips asserts, leaving assert-only
   # locals that would otherwise trip the promoted warning as an error.
@@ -1359,6 +1408,7 @@ if(WIN32)
     CONFIGURE_COMMAND
       "${CMAKE_COMMAND}" -E rm -rf "${_xe_s2d_build}"
       COMMAND "${XE_MESON_EXECUTABLE}" setup "${_xe_s2d_build}" "${_xe_mesa_dir}"
+        ${_xe_meson_cross_args}
         --default-library=static --buildtype=release -Db_vscrt=md
         -Dc_args=/wd4189 -Dcpp_args=/wd4189
         -Dspirv-to-dxil=true
