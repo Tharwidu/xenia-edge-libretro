@@ -77,6 +77,8 @@ DECLARE_bool(disable_context_promotion);
 #include "libretro_d3d12_presenter.h"
 #endif
 #include "xenia/vfs/virtual_file_system.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/profile_manager.h"
 #include "libretro_audio_driver.h"
 #include "libretro_hid.h"
 
@@ -1129,6 +1131,33 @@ static bool xenia_setup_and_launch(const char *path) {
                       "Emulator::SetupSubsystems failed 0x%08X\n", status);
             xenia_emulator.reset();
             return false;
+        }
+
+        // Sign in a profile before launch so the title sees a logged-in user
+        // (saves and scores in profile-aware games, XBLA especially). The
+        // standalone app does this through its profile dialog; headless we
+        // reuse the first profile on disk or generate one.
+        {
+            const char* pv = opt_get(XENIA_OPT_AUTO_PROFILE);
+            bool auto_profile = !pv || strcmp(pv, "disabled") != 0;
+            auto* xam = xenia_emulator->kernel_state()
+                            ? xenia_emulator->kernel_state()->xam_state()
+                            : nullptr;
+            auto* pm = xam ? xam->profile_manager() : nullptr;
+            if (auto_profile && pm && !pm->IsAnyProfileSignedIn()) {
+                const auto* accounts = pm->GetAccounts();
+                if (accounts && !accounts->empty()) {
+                    pm->Login(accounts->begin()->first, 0);
+                    xenia_log(RETRO_LOG_INFO,
+                              "Signed in existing profile (slot 0)\n");
+                } else if (pm->CreateProfile("PlayerOne", true)) {
+                    xenia_log(RETRO_LOG_INFO,
+                              "Created and signed in profile 'PlayerOne'\n");
+                } else {
+                    xenia_log(RETRO_LOG_WARN,
+                              "Failed to create default profile\n");
+                }
+            }
         }
 
         status = xenia_launch_path_seh(fs::path(path));
