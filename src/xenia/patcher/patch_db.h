@@ -16,7 +16,14 @@
 #include <optional>
 #include <regex>
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wabsolute-value"
+#endif
 #include "third_party/tomlplusplus/toml.hpp"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 namespace xe {
 namespace patcher {
@@ -93,12 +100,13 @@ struct PatchData {
 
 class PatchDB {
  public:
-  PatchDB(const std::filesystem::path patches_root);
+  explicit PatchDB(std::filesystem::path patches_dir);
   ~PatchDB();
 
   void LoadPatches();
 
-  PatchFileEntry ReadPatchFile(const std::filesystem::path& file_path) const;
+  PatchFileEntry ReadPatchFromString(const std::string& filename,
+                                     std::string_view toml_content) const;
 
   std::vector<PatchFileEntry> GetTitlePatches(
       const uint32_t title_id, const std::optional<uint64_t> hash);
@@ -127,9 +135,19 @@ class PatchDB {
       {"be16", PatchData(sizeof(uint16_t), PatchDataType::kBE16)},
       {"be8", PatchData(sizeof(uint8_t), PatchDataType::kBE8)}};
 
+  std::filesystem::path patches_dir_;
   std::vector<PatchFileEntry> loaded_patches_;
-  std::filesystem::path patches_root_;
 };
+
+struct BundledPatchFile {
+  std::string filename;
+  std::string toml_content;
+  PatchFileEntry entry;
+};
+
+std::vector<BundledPatchFile> EnumerateBundledPatchesForTitle(
+    uint32_t title_id);
+
 }  // namespace patcher
 }  // namespace xe
 

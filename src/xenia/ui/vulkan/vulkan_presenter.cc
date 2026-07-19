@@ -21,6 +21,9 @@
 #if XE_PLATFORM_ANDROID
 #include "xenia/ui/surface_android.h"
 #endif
+#if XE_PLATFORM_MAC
+#include "xenia/ui/surface_mac.h"
+#endif
 #if XE_PLATFORM_GNU_LINUX
 #include "xenia/ui/surface_gnulinux.h"
 #endif
@@ -48,6 +51,11 @@ DEFINE_bool(
     "may present with tearing if frames don't meet the host display refresh "
     "rate.",
     "Vulkan");
+#if XE_PLATFORM_MAC
+DEFINE_bool(vulkan_presenter_use_backing_scale, false,
+            "Use the macOS view backing scale factor for MoltenVK drawables.",
+            "Vulkan");
+#endif  // XE_PLATFORM_MAC
 
 namespace xe {
 namespace ui {
@@ -205,6 +213,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #if XE_PLATFORM_ANDROID
   if (instance_extensions.ext_KHR_android_surface) {
     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
+  }
+#endif
+#if XE_PLATFORM_MAC
+  if (instance_extensions.ext_EXT_metal_surface) {
+    type_flags |= Surface::kTypeFlag_MacNSView;
   }
 #endif
 #if XE_PLATFORM_GNU_LINUX
@@ -615,7 +628,8 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     }
 
     {
-      VulkanGPUCompletionTimeline completion_timeline(vulkan_device_);
+      VulkanGPUCompletionTimeline completion_timeline(vulkan_device_,
+                                                      "guest-capture");
       VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
       submit_info.commandBufferCount = 1;
       submit_info.pCommandBuffers = &command_buffer;
@@ -778,6 +792,17 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+#if XE_PLATFORM_MAC
+    if (new_surface.GetType() == Surface::kTypeIndex_MacNSView) {
+      auto& mac_nsview_surface =
+          static_cast<const MacNSViewSurface&>(new_surface);
+      const double contents_scale = cvars::vulkan_presenter_use_backing_scale
+                                        ? mac_nsview_surface.GetBackingScale()
+                                        : 1.0;
+      mac_nsview_surface.ConfigureMetalLayer(
+          new_surface_width, new_surface_height, contents_scale);
+    }
+#endif  // XE_PLATFORM_MAC
     VkSwapchainKHR old_swapchain =
         paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
@@ -858,6 +883,33 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
                                       &paint_context_.vulkan_surface);
       } break;
 #endif
+#if XE_PLATFORM_MAC
+      case Surface::kTypeIndex_MacNSView: {
+        auto& mac_nsview_surface =
+            static_cast<const MacNSViewSurface&>(new_surface);
+        const double contents_scale = cvars::vulkan_presenter_use_backing_scale
+                                          ? mac_nsview_surface.GetBackingScale()
+                                          : 1.0;
+        mac_nsview_surface.ConfigureMetalLayer(
+            new_surface_width, new_surface_height, contents_scale);
+        CAMetalLayer* const metal_layer =
+            mac_nsview_surface.GetOrCreateMetalLayer();
+        if (!metal_layer) {
+          XELOGE(
+              "VulkanPresenter: Failed to create a CAMetalLayer for MoltenVK");
+          return SurfacePaintConnectResult::kFailureSurfaceUnusable;
+        }
+        VkMetalSurfaceCreateInfoEXT surface_create_info;
+        surface_create_info.sType =
+            VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.pLayer = metal_layer;
+        vulkan_surface_create_result =
+            ifn.vkCreateMetalSurfaceEXT(instance, &surface_create_info, nullptr,
+                                        &paint_context_.vulkan_surface);
+      } break;
+#endif  // XE_PLATFORM_MAC
 #if XE_PLATFORM_WIN32
       case Surface::kTypeIndex_Win32Hwnd: {
         auto& win32_hwnd_surface =
@@ -1506,9 +1558,20 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
   VkSwapchainKHR swapchain;
-  if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr,
-                               &swapchain) != VK_SUCCESS) {
-    XELOGE("VulkanPresenter: Failed to create a swapchain");
+  VkResult swapchain_create_result = dfn.vkCreateSwapchainKHR(
+      device, &swapchain_create_info, nullptr, &swapchain);
+  if (swapchain_create_result != VK_SUCCESS) {
+    XELOGE(
+        "VulkanPresenter: Failed to create a swapchain (VkResult {}, "
+        "extent {}x{}, format {}, color space {}, present mode {}, "
+        "minImageCount {})",
+        int32_t(swapchain_create_result),
+        swapchain_create_info.imageExtent.width,
+        swapchain_create_info.imageExtent.height,
+        uint32_t(swapchain_create_info.imageFormat),
+        uint32_t(swapchain_create_info.imageColorSpace),
+        uint32_t(swapchain_create_info.presentMode),
+        swapchain_create_info.minImageCount);
     return VK_NULL_HANDLE;
   }
   XELOGI(
@@ -2316,8 +2379,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
           vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
   if (submit_result != VK_SUCCESS) {
     XELOGE(
-        "VulkanPresenter: Failed to submit the presentation command buffer: {}",
-        vk::to_string(vk::Result(submit_result)));
+        "VulkanPresenter: Failed to submit the presentation command buffer: {} "
+        "- submission: {} (completed: {}, in-flight: {}), swapchain "
+        "image_index: {}, ui_setup_buffer_index: {}, execute_ui_drawers: {}",
+        vk::to_string(vk::Result(submit_result)),
+        paint_context_.completion_timeline.GetUpcomingSubmission(),
+        paint_context_.completion_timeline
+            .GetCompletedSubmissionFromLastUpdate(),
+        paint_context_.completion_timeline.pending_submission_count(),
+        swapchain_image_index,
+        ui_setup_command_buffer_index == SIZE_MAX
+            ? -1
+            : int64_t(ui_setup_command_buffer_index),
+        execute_ui_drawers);
     if (ui_setup_command_buffer_index != SIZE_MAX) {
       // If failed to submit, make the UI setup command buffer available for
       // immediate reuse, as the completed submission index won't be updated to
@@ -2374,7 +2448,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     case VK_ERROR_DEVICE_LOST:
       XELOGE(
           "VulkanPresenter: Failed to present the swapchain image as the "
-          "device has been lost");
+          "device has been lost (image_index: {}, paint submission: {} "
+          "completed: {}, in-flight: {})",
+          swapchain_image_index,
+          paint_context_.completion_timeline.GetUpcomingSubmission(),
+          paint_context_.completion_timeline
+              .GetCompletedSubmissionFromLastUpdate(),
+          paint_context_.completion_timeline.pending_submission_count());
       return PaintResult::kGpuLostResponsible;
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_ERROR_SURFACE_LOST_KHR:

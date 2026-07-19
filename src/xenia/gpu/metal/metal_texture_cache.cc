@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -94,12 +96,31 @@
 #include "xenia/gpu/xenos.h"
 
 DEFINE_bool(metal_force_bc_decompress, false,
-            "Force BC1/2/3/5/DXN decompression to RGBA8/RG8 (debug).", "GPU");
+            "Force BC1/2/3/5/DXN decompression to RGBA8/RG8 (debug).", "Metal");
+DEFINE_bool(metal_texture_cache_use_private, true,
+            "Use MTLStorageModePrivate for Metal texture cache textures when "
+            "GPU upload paths support it.",
+            "Metal");
+DEFINE_bool(metal_texture_upload_via_blit, true,
+            "Upload textures via staging buffers and GPU blit copies instead "
+            "of CPU replaceRegion.",
+            "Metal");
+
+DECLARE_bool(metal_use_heaps);
+DECLARE_int32(metal_heap_min_bytes);
 
 namespace xe {
 namespace gpu {
 namespace metal {
 namespace {
+
+#if XE_PLATFORM_IOS
+constexpr uint64_t kUploadBufferPoolMaxBytes = 128ull * 1024ull * 1024ull;
+constexpr uint64_t kScaledResolveRetiredMaxBytes = 64ull * 1024ull * 1024ull;
+#else
+constexpr uint64_t kUploadBufferPoolMaxBytes = 512ull * 1024ull * 1024ull;
+constexpr uint64_t kScaledResolveRetiredMaxBytes = 256ull * 1024ull * 1024ull;
+#endif
 
 struct MetalLoadConstants {
   uint32_t is_tiled_3d_endian_scale;
@@ -263,37 +284,52 @@ MTL::TextureSwizzleChannels ToMetalTextureSwizzle(uint32_t xenos_swizzle) {
 class MetalTextureCache::UploadBufferPool
     : public std::enable_shared_from_this<UploadBufferPool> {
  public:
-  explicit UploadBufferPool(MTL::Device* device) : device_(device) {}
+  explicit UploadBufferPool(MTL::Device* device, uint64_t max_pooled_bytes)
+      : device_(device), max_pooled_bytes_(max_pooled_bytes) {}
 
   MTL::Buffer* Acquire(size_t size) {
     if (!device_) {
       return nullptr;
     }
     size = xe::round_up(size, size_t(256));
-    std::lock_guard<std::mutex> lock(mutex_);
-    size_t best_index = entries_.size();
-    size_t best_size = std::numeric_limits<size_t>::max();
-    for (size_t i = 0; i < entries_.size(); ++i) {
-      Entry& entry = entries_[i];
-      if (entry.in_use || entry.size < size) {
-        continue;
+    bool can_pool = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++usage_tick_;
+      size_t best_index = entries_.size();
+      size_t best_size = std::numeric_limits<size_t>::max();
+      for (size_t i = 0; i < entries_.size(); ++i) {
+        Entry& entry = entries_[i];
+        if (entry.in_use || entry.size < size) {
+          continue;
+        }
+        if (entry.size < best_size) {
+          best_index = i;
+          best_size = entry.size;
+        }
       }
-      if (entry.size < best_size) {
-        best_index = i;
-        best_size = entry.size;
+      if (best_index < entries_.size()) {
+        entries_[best_index].in_use = true;
+        entries_[best_index].last_used_tick = usage_tick_;
+        return entries_[best_index].buffer;
       }
+      can_pool = pooled_bytes_ + size <= max_pooled_bytes_;
     }
-    if (best_index < entries_.size()) {
-      entries_[best_index].in_use = true;
-      return entries_[best_index].buffer;
-    }
-
     MTL::Buffer* buffer =
         device_->newBuffer(size, MTL::ResourceStorageModeShared);
     if (!buffer) {
       return nullptr;
     }
-    entries_.push_back({buffer, size, true});
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++usage_tick_;
+      if (can_pool && pooled_bytes_ + size <= max_pooled_bytes_) {
+        pooled_bytes_ += size;
+        entries_.push_back({buffer, size, true, true, usage_tick_});
+        return buffer;
+      }
+      ++transient_allocations_;
+    }
     return buffer;
   }
 
@@ -301,12 +337,21 @@ class MetalTextureCache::UploadBufferPool
     if (!buffer) {
       return;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (Entry& entry : entries_) {
-      if (entry.buffer == buffer) {
-        entry.in_use = false;
-        return;
+    bool release_transient = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++usage_tick_;
+      for (Entry& entry : entries_) {
+        if (entry.buffer == buffer) {
+          entry.in_use = false;
+          entry.last_used_tick = usage_tick_;
+          release_transient = false;
+          break;
+        }
       }
+    }
+    if (release_transient) {
+      buffer->release();
     }
   }
 
@@ -318,10 +363,18 @@ class MetalTextureCache::UploadBufferPool
       ReleaseImmediate(buffer);
       return;
     }
-    std::shared_ptr<UploadBufferPool> self = shared_from_this();
-    cmd->addCompletedHandler(^(MTL::CommandBuffer*) {
-      self->ReleaseImmediate(buffer);
-    });
+    bool add_handler = false;
+    {
+      std::lock_guard<std::mutex> lock(PendingReleasesMutex());
+      auto& pending = PendingReleasesMap()[cmd];
+      add_handler = pending.empty();
+      pending.push_back({shared_from_this(), buffer});
+    }
+    if (add_handler) {
+      cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
+        UploadBufferPool::HandleCommandBufferCompleted(completed_cmd);
+      });
+    }
   }
 
   void Shutdown() {
@@ -332,6 +385,7 @@ class MetalTextureCache::UploadBufferPool
         entry.buffer = nullptr;
       }
     }
+    pooled_bytes_ = 0;
     entries_.clear();
   }
 
@@ -342,24 +396,68 @@ class MetalTextureCache::UploadBufferPool
 
   uint64_t GetTotalBytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    uint64_t total = 0;
-    for (const Entry& entry : entries_) {
-      total += entry.size;
-    }
-    return total;
+    return pooled_bytes_;
   }
 
  private:
   struct Entry {
     MTL::Buffer* buffer = nullptr;
     size_t size = 0;
+    bool pooled = false;
     bool in_use = false;
+    uint64_t last_used_tick = 0;
   };
+
+  struct PendingRelease {
+    std::shared_ptr<UploadBufferPool> pool;
+    MTL::Buffer* buffer = nullptr;
+  };
+
+  using PendingReleasesByCommandBuffer =
+      std::unordered_map<MTL::CommandBuffer*, std::vector<PendingRelease>>;
+
+  static std::mutex& PendingReleasesMutex() {
+    // Heap-allocated and intentionally leaked to avoid static destruction order
+    // issues on macOS/POSIX where threads may outlive static destructors.
+    static std::mutex* pending_releases_mutex = new std::mutex();
+    return *pending_releases_mutex;
+  }
+
+  static PendingReleasesByCommandBuffer& PendingReleasesMap() {
+    // Heap-allocated and intentionally leaked for the same reason as the mutex.
+    static PendingReleasesByCommandBuffer* pending_releases =
+        new PendingReleasesByCommandBuffer();
+    return *pending_releases;
+  }
+
+  static void HandleCommandBufferCompleted(MTL::CommandBuffer* cmd);
 
   mutable std::mutex mutex_;
   std::vector<Entry> entries_;
   MTL::Device* device_ = nullptr;
+  uint64_t max_pooled_bytes_ = 0;
+  uint64_t pooled_bytes_ = 0;
+  uint64_t usage_tick_ = 0;
+  uint64_t transient_allocations_ = 0;
 };
+
+void MetalTextureCache::UploadBufferPool::HandleCommandBufferCompleted(
+    MTL::CommandBuffer* cmd) {
+  std::vector<PendingRelease> releases;
+  {
+    std::lock_guard<std::mutex> lock(PendingReleasesMutex());
+    auto& pending_releases = PendingReleasesMap();
+    auto it = pending_releases.find(cmd);
+    if (it == pending_releases.end()) {
+      return;
+    }
+    releases = std::move(it->second);
+    pending_releases.erase(it);
+  }
+  for (auto& release : releases) {
+    release.pool->ReleaseImmediate(release.buffer);
+  }
+}
 
 MetalTextureCache::MetalTextureCache(MetalCommandProcessor* command_processor,
                                      const RegisterFile& register_file,
@@ -384,6 +482,89 @@ bool MetalTextureCache::ShouldUploadViaBlit() const {
   return ::cvars::metal_texture_upload_via_blit;
 }
 
+bool MetalTextureCache::CanUseCurrentCommandBufferForTextureUploads() const {
+  if (!ShouldUploadViaBlit() || !command_processor_) {
+    return false;
+  }
+  if (!command_processor_->GetCurrentCommandBuffer()) {
+    return false;
+  }
+  return !command_processor_->HasActiveRenderEncoder();
+}
+
+void MetalTextureCache::BeginUploadCommandBufferBatch() {
+  ++upload_batch_depth_;
+  if (upload_batch_depth_ != 1) {
+    return;
+  }
+  if (!ShouldUploadViaBlit() || !command_processor_) {
+    return;
+  }
+  // Avoid cross-command-buffer upload batching while a draw/copy command
+  // buffer is already active in the command processor. Keeping upload work on
+  // a separate command buffer in that state can reorder with in-flight render
+  // setup and lead to startup rendering regressions.
+  if (command_processor_->GetCurrentCommandBuffer()) {
+    return;
+  }
+  MTL::CommandQueue* queue = command_processor_->GetMetalCommandQueue();
+  if (!queue) {
+    return;
+  }
+  MTL::CommandBuffer* cmd = queue->commandBuffer();
+  if (!cmd) {
+    return;
+  }
+  cmd->retain();
+  cmd->setLabel(
+      NS::String::string("XeniaTextureUploadBatch", NS::UTF8StringEncoding));
+  upload_batch_command_buffer_ = cmd;
+  upload_batch_command_buffer_has_work_ = false;
+}
+
+void MetalTextureCache::EndUploadCommandBufferBatch() {
+  if (!upload_batch_depth_) {
+    return;
+  }
+  --upload_batch_depth_;
+  if (upload_batch_depth_ != 0) {
+    return;
+  }
+  MTL::CommandBuffer* cmd = upload_batch_command_buffer_;
+  upload_batch_command_buffer_ = nullptr;
+  bool has_work = upload_batch_command_buffer_has_work_;
+  upload_batch_command_buffer_has_work_ = false;
+  if (!cmd) {
+    return;
+  }
+  if (!has_work) {
+    cmd->release();
+    return;
+  }
+  cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
+    completed_cmd->release();
+  });
+  cmd->commit();
+}
+
+void MetalTextureCache::AbortUploadCommandBufferBatch(bool commit_if_has_work) {
+  MTL::CommandBuffer* cmd = upload_batch_command_buffer_;
+  upload_batch_command_buffer_ = nullptr;
+  bool has_work = upload_batch_command_buffer_has_work_;
+  upload_batch_command_buffer_has_work_ = false;
+  if (!cmd) {
+    return;
+  }
+  if (!has_work || !commit_if_has_work) {
+    cmd->release();
+    return;
+  }
+  cmd->addCompletedHandler(^(MTL::CommandBuffer* completed_cmd) {
+    completed_cmd->release();
+  });
+  cmd->commit();
+}
+
 bool MetalTextureCache::IsDecompressionNeededForKey(TextureKey key) const {
   switch (key.format) {
     case xenos::TextureFormat::k_DXT1:
@@ -391,6 +572,11 @@ bool MetalTextureCache::IsDecompressionNeededForKey(TextureKey key) const {
     case xenos::TextureFormat::k_DXT4_5:
     case xenos::TextureFormat::k_DXN: {
       if (::cvars::metal_force_bc_decompress) {
+        return true;
+      }
+      // BC support is GPU-family dependent on iOS. Creating BC textures on a
+      // device that doesn't support them may trip Metal validation and abort.
+      if (!supports_bc_texture_compression_) {
         return true;
       }
       const FormatInfo* format_info = FormatInfo::Get(key.format);
@@ -797,7 +983,11 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     return false;
   }
 
-  auto buffer_pool = upload_buffer_pool_;
+  std::shared_ptr<UploadBufferPool> buffer_pool;
+  {
+    std::lock_guard<std::mutex> lock(upload_buffer_pool_mutex_);
+    buffer_pool = upload_buffer_pool_;
+  }
   auto acquire_buffer = [&](size_t size) -> MTL::Buffer* {
     if (buffer_pool) {
       return buffer_pool->Acquire(size);
@@ -850,17 +1040,86 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   }
 
   const bool use_blit_upload = ShouldUploadViaBlit();
+
+  auto find_stored_level =
+      [&](bool is_base_storage,
+          uint32_t stored_level) -> const StoredLevelHostLayout* {
+    for (const StoredLevelHostLayout& layout : stored_levels) {
+      if (layout.is_base == is_base_storage && layout.level == stored_level) {
+        return &layout;
+      }
+    }
+    return nullptr;
+  };
+
+  MTL::CommandBuffer* current_command_buffer =
+      command_processor_ ? command_processor_->GetCurrentCommandBuffer()
+                         : nullptr;
+  bool use_upload_batch = use_blit_upload && upload_batch_command_buffer_ &&
+                          command_processor_ && !current_command_buffer;
+  // Reuse the current command buffer whenever no render pass encoder is active.
+  // This keeps copy/resolve and texture-upload ordering within one submission.
+  bool use_current_command_buffer =
+      use_blit_upload && command_processor_ && current_command_buffer &&
+      !command_processor_->HasActiveRenderEncoder();
+  if (use_upload_batch && texture_resolution_scaled) {
+    bool needs_base_scaled_range = false;
+    bool needs_mips_scaled_range = false;
+    for (const StoredLevelHostLayout& stored_level : stored_levels) {
+      if (stored_level.is_base) {
+        needs_base_scaled_range = true;
+      } else {
+        needs_mips_scaled_range = true;
+      }
+    }
+    if (needs_base_scaled_range &&
+        !IsScaledResolveRangeResident(base_guest_address,
+                                      texture.GetGuestBaseSize(), 4)) {
+      use_upload_batch = false;
+    }
+    if (use_upload_batch && needs_mips_scaled_range &&
+        !IsScaledResolveRangeResident(mips_guest_address,
+                                      texture.GetGuestMipsSize(), 4)) {
+      use_upload_batch = false;
+    }
+  }
+
   ScopedAutoreleasePool autorelease_pool;
-  MTL::CommandBuffer* cmd = queue->commandBuffer();
+  MTL::CommandBuffer* cmd = nullptr;
+  if (use_upload_batch) {
+    cmd = upload_batch_command_buffer_;
+  } else if (use_current_command_buffer) {
+    cmd = current_command_buffer;
+  } else {
+    cmd = queue->commandBuffer();
+  }
   if (!cmd) {
     release_buffer_immediate(constants_buffer, constants_buffer_size);
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
     return false;
   }
-  MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
-  if (!encoder) {
+  bool command_buffer_has_work = false;
+  auto handle_upload_failure = [&](bool abort_batch) {
+    if ((use_upload_batch || use_current_command_buffer) &&
+        command_buffer_has_work) {
+      release_buffer_after(cmd, constants_buffer, constants_buffer_size);
+      release_buffer_after(cmd, dest_buffer, size_t(dest_buffer_size));
+      if (use_upload_batch) {
+        upload_batch_command_buffer_has_work_ = true;
+        AbortUploadCommandBufferBatch();
+      }
+      return;
+    }
     release_buffer_immediate(constants_buffer, constants_buffer_size);
     release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+    if (use_upload_batch && abort_batch) {
+      AbortUploadCommandBufferBatch();
+    }
+  };
+
+  MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
+  if (!encoder) {
+    handle_upload_failure(true);
     return false;
   }
   encoder->setComputePipelineState(pipeline);
@@ -894,11 +1153,10 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                                          ? texture.GetGuestBaseSize()
                                          : texture.GetGuestMipsSize();
       if (!MakeScaledResolveRangeCurrent(guest_address, guest_size_unscaled,
-                                         load_shader_info.source_bpe_log2) ||
+                                         4) ||
           !GetCurrentScaledResolveBuffer(source_buffer, source_buffer_offset,
                                          source_buffer_length)) {
-        release_buffer_immediate(constants_buffer, constants_buffer_size);
-        release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+        handle_upload_failure(false);
         return false;
       }
       encoder->setBuffer(source_buffer, source_buffer_offset, 2);
@@ -978,6 +1236,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
                              slice * stored_level.slice_size_bytes,
                          1);
       encoder->dispatchThreadgroups(threadgroups, threads_per_group);
+      command_buffer_has_work = true;
       ++dispatch_index;
     }
   }
@@ -988,24 +1247,12 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
   if (use_blit_upload) {
     MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
     if (!blit) {
-      release_buffer_immediate(constants_buffer, constants_buffer_size);
-      release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+      handle_upload_failure(true);
       return false;
     }
 
     uint32_t bytes_per_host_block = load_shader_info.bytes_per_host_block;
     const uint32_t blit_alignment = 256;
-
-    auto find_stored_level =
-        [&](bool is_base_storage,
-            uint32_t stored_level) -> const StoredLevelHostLayout* {
-      for (const StoredLevelHostLayout& layout : stored_levels) {
-        if (layout.is_base == is_base_storage && layout.level == stored_level) {
-          return &layout;
-        }
-      }
-      return nullptr;
-    };
 
     for (uint32_t level = level_first; level <= level_last; ++level) {
       uint32_t stored_level = std::min(level, level_packed);
@@ -1085,8 +1332,7 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
           MTL::Buffer* staging_buffer = acquire_buffer(staging_size);
           if (!staging_buffer) {
             blit->endEncoding();
-            release_buffer_immediate(constants_buffer, constants_buffer_size);
-            release_buffer_immediate(dest_buffer, size_t(dest_buffer_size));
+            handle_upload_failure(true);
             return false;
           }
 
@@ -1126,11 +1372,15 @@ bool MetalTextureCache::TryGpuLoadTexture(Texture& texture, bool load_base,
     blit->endEncoding();
     release_buffer_after(cmd, constants_buffer, constants_buffer_size);
     release_buffer_after(cmd, dest_buffer, size_t(dest_buffer_size));
-    cmd->retain();
-    cmd->addCompletedHandler(^(MTL::CommandBuffer* cb) {
-      cb->release();
-    });
-    cmd->commit();
+    if (use_upload_batch) {
+      upload_batch_command_buffer_has_work_ = true;
+    } else if (!use_current_command_buffer) {
+      cmd->retain();
+      cmd->addCompletedHandler(^(MTL::CommandBuffer* cb) {
+        cb->release();
+      });
+      cmd->commit();
+    }
   } else {
     cmd->commit();
     cmd->waitUntilCompleted();
@@ -1335,6 +1585,12 @@ bool MetalTextureCache::Initialize() {
         "processor");
     return false;
   }
+  supports_bc_texture_compression_ = device->supportsBCTextureCompression();
+  if (!supports_bc_texture_compression_) {
+    XELOGW(
+        "Metal: BC texture compression not supported by this device; forcing "
+        "BCn decompression");
+  }
   if (::cvars::metal_texture_cache_use_private &&
       !::cvars::metal_texture_upload_via_blit) {
     XELOGW(
@@ -1342,7 +1598,11 @@ bool MetalTextureCache::Initialize() {
         "disabled; forcing shared textures");
   }
 
-  upload_buffer_pool_ = std::make_shared<UploadBufferPool>(device);
+  {
+    std::lock_guard<std::mutex> lock(upload_buffer_pool_mutex_);
+    upload_buffer_pool_ =
+        std::make_shared<UploadBufferPool>(device, kUploadBufferPoolMaxBytes);
+  }
   if (::cvars::metal_use_heaps) {
     size_t min_heap_bytes = std::max<int32_t>(0, ::cvars::metal_heap_min_bytes);
     texture_heap_pool_ = std::make_unique<MetalHeapPool>(
@@ -1643,6 +1903,8 @@ void MetalTextureCache::InitializeNorm16Selection(MTL::Device* device) {
 void MetalTextureCache::Shutdown() {
   SCOPE_profile_cpu_f("gpu");
 
+  AbortUploadCommandBufferBatch(false);
+
   ClearCache();
 
   for (size_t i = 0; i < kLoadShaderCount; ++i) {
@@ -1670,9 +1932,15 @@ void MetalTextureCache::Shutdown() {
     null_texture_cube_ = nullptr;
   }
 
-  if (upload_buffer_pool_) {
-    upload_buffer_pool_->Shutdown();
-    upload_buffer_pool_.reset();
+  {
+    std::shared_ptr<UploadBufferPool> buffer_pool;
+    {
+      std::lock_guard<std::mutex> lock(upload_buffer_pool_mutex_);
+      buffer_pool = std::move(upload_buffer_pool_);
+    }
+    if (buffer_pool) {
+      buffer_pool->Shutdown();
+    }
   }
   if (texture_heap_pool_) {
     texture_heap_pool_->Shutdown();
@@ -1690,16 +1958,40 @@ void MetalTextureCache::ClearScaledResolveBuffers() {
     }
   }
   scaled_resolve_buffers_.clear();
-  for (auto& buffer : scaled_resolve_retired_buffers_) {
-    if (buffer.buffer) {
-      buffer.buffer->release();
-      buffer.buffer = nullptr;
+  for (auto& retired : scaled_resolve_retired_buffers_) {
+    if (retired.buffer) {
+      retired.buffer->release();
+      retired.buffer = nullptr;
     }
   }
   scaled_resolve_retired_buffers_.clear();
+  scaled_resolve_retired_bytes_ = 0;
   scaled_resolve_current_buffer_index_ = size_t(-1);
   scaled_resolve_current_range_start_scaled_ = 0;
   scaled_resolve_current_range_length_scaled_ = 0;
+}
+
+void MetalTextureCache::CompletedSubmissionUpdated(
+    uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+  if (scaled_resolve_retired_buffers_.empty()) {
+    return;
+  }
+  for (auto it = scaled_resolve_retired_buffers_.begin();
+       it != scaled_resolve_retired_buffers_.end();) {
+    if (it->submission_id <= completed_submission_index) {
+      if (it->buffer) {
+        it->buffer->release();
+      }
+      scaled_resolve_retired_bytes_ =
+          scaled_resolve_retired_bytes_ > it->length_scaled
+              ? (scaled_resolve_retired_bytes_ - it->length_scaled)
+              : 0;
+      it = scaled_resolve_retired_buffers_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void MetalTextureCache::ClearCache() {
@@ -1730,23 +2022,6 @@ bool MetalTextureCache::UploadTextureCube(const TextureInfo& texture_info) {
   XELOGD("UploadTextureCube: Legacy method called - delegating to base class");
   // The base class RequestTextures will handle texture creation and loading
   return true;
-}
-
-MTL::Texture* MetalTextureCache::GetTexture2D(const TextureInfo& texture_info) {
-  // Legacy method - now uses base class texture management
-  // This method is kept for compatibility but should be migrated to use
-  // the standard texture binding flow via RequestTextures
-  XELOGD("GetTexture2D: Legacy method called - use RequestTextures instead");
-  return null_texture_2d_;
-}
-
-MTL::Texture* MetalTextureCache::GetTextureCube(
-    const TextureInfo& texture_info) {
-  // Legacy method - now uses base class texture management
-  // This method is kept for compatibility but should be migrated to use
-  // the standard texture binding flow via RequestTextures
-  XELOGD("GetTextureCube: Legacy method called - use RequestTextures instead");
-  return null_texture_cube_;
 }
 
 MTL::PixelFormat MetalTextureCache::ConvertXenosFormat(
@@ -1910,9 +2185,10 @@ MTL::Texture* MetalTextureCache::CreateTextureCube(
   }
 
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
-  // Always use TextureTypeCubeArray to match the shader binding type (which is
-  // always texturecube_array in the translated MSL).
-  descriptor->setTextureType(MTL::TextureTypeCubeArray);
+  // Use cube for single-cube textures to match non-array cube bindings in the
+  // translated MSL, and cube-array only when multiple cubes are present.
+  descriptor->setTextureType(cube_count > 1 ? MTL::TextureTypeCubeArray
+                                            : MTL::TextureTypeCube);
   descriptor->setArrayLength(std::max(cube_count, 1u));
   descriptor->setPixelFormat(format);
   descriptor->setWidth(width);
@@ -1942,30 +2218,6 @@ MTL::Texture* MetalTextureCache::CreateTextureCube(
   }
 
   return texture;
-}
-
-bool MetalTextureCache::UpdateTexture2D(MTL::Texture* texture,
-                                        const TextureInfo& texture_info) {
-  // Legacy method - memory access will be handled by base class during
-  // RequestTextures For now, return success to avoid build errors. Real texture
-  // loading happens in LoadTextureDataFromResidentMemoryImpl which is called by
-  // the base class.
-  XELOGD(
-      "UpdateTexture2D: Legacy method called - base class handles memory "
-      "access");
-  return true;
-}
-
-bool MetalTextureCache::UpdateTextureCube(MTL::Texture* texture,
-                                          const TextureInfo& texture_info) {
-  // Legacy method - memory access will be handled by base class during
-  // RequestTextures For now, return success to avoid build errors. Real texture
-  // loading happens in LoadTextureDataFromResidentMemoryImpl which is called by
-  // the base class.
-  XELOGD(
-      "UpdateTextureCube: Legacy method called - base class handles memory "
-      "access");
-  return true;
 }
 
 MTL::Texture* MetalTextureCache::CreateNullTexture2D() {
@@ -2051,8 +2303,8 @@ MTL::Texture* MetalTextureCache::CreateNullTextureCube() {
   }
 
   MTL::TextureDescriptor* descriptor = MTL::TextureDescriptor::alloc()->init();
-  // Always create as CubeArray for binding compatibility.
-  descriptor->setTextureType(MTL::TextureTypeCubeArray);
+  // Null cube texture must match non-array cube bindings in translated MSL.
+  descriptor->setTextureType(MTL::TextureTypeCube);
   descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
   descriptor->setWidth(1);
   descriptor->setHeight(1);
@@ -2083,8 +2335,12 @@ MTL::Texture* MetalTextureCache::CreateNullTextureCube() {
 void MetalTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 
+  BeginUploadCommandBufferBatch();
+
   // Call base class implementation first
   TextureCache::RequestTextures(used_texture_mask);
+
+  EndUploadCommandBufferBatch();
 
   // Intentionally no Metal-specific per-fetch logging here - invalid fetch
   // constants are already reported by the shared TextureCache logic.
@@ -2330,20 +2586,34 @@ MTL::Texture* MetalTextureCache::RequestSwapTexture(
   return view;
 }
 
-MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
-    const DxbcShader::SamplerBinding& binding) const {
-  const RegisterFile& regs = register_file();
-  xenos::xe_gpu_texture_fetch_t fetch =
-      regs.GetTextureFetch(binding.fetch_constant);
+// Normalize clamp modes to values Metal supports.
+static xenos::ClampMode NormalizeClampModeStatic(xenos::ClampMode clamp_mode) {
+  if (clamp_mode == xenos::ClampMode::kClampToHalfway) {
+    return xenos::ClampMode::kClampToEdge;
+  }
+  if (clamp_mode == xenos::ClampMode::kMirrorClampToHalfway ||
+      clamp_mode == xenos::ClampMode::kMirrorClampToBorder) {
+    return xenos::ClampMode::kMirrorClampToEdge;
+  }
+  return clamp_mode;
+}
 
-  SamplerParameters parameters;
+// Shared helper: build SamplerParameters from fetch constant + filter
+// overrides.
+static MetalTextureCache::SamplerParameters BuildSamplerParametersFromFetch(
+    const RegisterFile& regs, uint32_t fetch_constant,
+    xenos::TextureFilter req_mag_filter, xenos::TextureFilter req_min_filter,
+    xenos::TextureFilter req_mip_filter, xenos::AnisoFilter req_aniso_filter) {
+  xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
+
+  MetalTextureCache::SamplerParameters parameters;
 
   xenos::ClampMode fetch_clamp_x, fetch_clamp_y, fetch_clamp_z;
   texture_util::GetClampModesForDimension(fetch, fetch_clamp_x, fetch_clamp_y,
                                           fetch_clamp_z);
-  parameters.clamp_x = NormalizeClampMode(fetch_clamp_x);
-  parameters.clamp_y = NormalizeClampMode(fetch_clamp_y);
-  parameters.clamp_z = NormalizeClampMode(fetch_clamp_z);
+  parameters.clamp_x = NormalizeClampModeStatic(fetch_clamp_x);
+  parameters.clamp_y = NormalizeClampModeStatic(fetch_clamp_y);
+  parameters.clamp_z = NormalizeClampModeStatic(fetch_clamp_z);
 
   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
@@ -2360,16 +2630,15 @@ MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
   parameters.mip_min_level = mip_min_level;
 
   xenos::AnisoFilter aniso_filter =
-      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+      req_aniso_filter == xenos::AnisoFilter::kUseFetchConst
           ? fetch.aniso_filter
-          : binding.aniso_filter;
+          : req_aniso_filter;
   aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
   parameters.aniso_filter = aniso_filter;
 
   xenos::TextureFilter mip_filter =
-      binding.mip_filter == xenos::TextureFilter::kUseFetchConst
-          ? fetch.mip_filter
-          : binding.mip_filter;
+      req_mip_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mip_filter
+                                                             : req_mip_filter;
 
   if (aniso_filter != xenos::AnisoFilter::kDisabled) {
     parameters.mag_linear = 1;
@@ -2377,15 +2646,15 @@ MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
     parameters.mip_linear = 1;
   } else {
     xenos::TextureFilter mag_filter =
-        binding.mag_filter == xenos::TextureFilter::kUseFetchConst
+        req_mag_filter == xenos::TextureFilter::kUseFetchConst
             ? fetch.mag_filter
-            : binding.mag_filter;
+            : req_mag_filter;
     parameters.mag_linear = mag_filter == xenos::TextureFilter::kLinear;
 
     xenos::TextureFilter min_filter =
-        binding.min_filter == xenos::TextureFilter::kUseFetchConst
+        req_min_filter == xenos::TextureFilter::kUseFetchConst
             ? fetch.min_filter
-            : binding.min_filter;
+            : req_min_filter;
     parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
 
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
@@ -2395,6 +2664,13 @@ MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
       mip_filter == xenos::TextureFilter::kBaseMap ? 1 : 0;
 
   return parameters;
+}
+
+MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
+    const SpirvShader::SamplerBinding& binding) const {
+  return BuildSamplerParametersFromFetch(
+      register_file(), binding.fetch_constant, binding.mag_filter,
+      binding.min_filter, binding.mip_filter, binding.aniso_filter);
 }
 
 MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(
@@ -2486,14 +2762,7 @@ MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(
 
 xenos::ClampMode MetalTextureCache::NormalizeClampMode(
     xenos::ClampMode clamp_mode) const {
-  if (clamp_mode == xenos::ClampMode::kClampToHalfway) {
-    return xenos::ClampMode::kClampToEdge;
-  }
-  if (clamp_mode == xenos::ClampMode::kMirrorClampToHalfway ||
-      clamp_mode == xenos::ClampMode::kMirrorClampToBorder) {
-    return xenos::ClampMode::kMirrorClampToEdge;
-  }
-  return clamp_mode;
+  return NormalizeClampModeStatic(clamp_mode);
 }
 
 // GetHostFormatSwizzle implementation
@@ -2670,6 +2939,39 @@ bool MetalTextureCache::GetScaledResolveRange(
   return true;
 }
 
+bool MetalTextureCache::IsScaledResolveRangeResident(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t length_scaled_alignment_log2) const {
+  if (!IsDrawResolutionScaled() || !length_unscaled) {
+    return false;
+  }
+
+  uint64_t start_scaled = 0;
+  uint64_t length_scaled = 0;
+  if (!GetScaledResolveRange(start_unscaled, length_unscaled,
+                             length_scaled_alignment_log2, start_scaled,
+                             length_scaled) ||
+      !length_scaled) {
+    return false;
+  }
+
+  for (const ScaledResolveBuffer& buffer : scaled_resolve_buffers_) {
+    if (!buffer.buffer || !buffer.length_scaled ||
+        start_scaled < buffer.base_scaled) {
+      continue;
+    }
+    uint64_t buffer_offset = start_scaled - buffer.base_scaled;
+    if (buffer_offset > buffer.length_scaled) {
+      continue;
+    }
+    uint64_t buffer_remaining = buffer.length_scaled - buffer_offset;
+    if (length_scaled <= buffer_remaining) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
                                                        uint64_t length_scaled) {
   if (!length_scaled) {
@@ -2728,15 +3030,31 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
   new_buffer->setLabel(
       NS::String::string("XeniaScaledResolveBuffer", NS::UTF8StringEncoding));
 
+  uint64_t overlap_total_bytes = 0;
+  for (size_t overlap_index : overlap_indices) {
+    overlap_total_bytes += scaled_resolve_buffers_[overlap_index].length_scaled;
+  }
+  MTL::CommandBuffer* current_cmd =
+      command_processor_->GetCurrentCommandBuffer();
+  bool retain_overlaps = current_cmd != nullptr;
+  if (retain_overlaps) {
+    bool exceeds_retired_budget =
+        overlap_total_bytes > kScaledResolveRetiredMaxBytes ||
+        scaled_resolve_retired_bytes_ >
+            (kScaledResolveRetiredMaxBytes - overlap_total_bytes);
+    if (exceeds_retired_budget) {
+      retain_overlaps = false;
+    }
+  }
+
   if (!overlap_indices.empty()) {
-    MTL::CommandBuffer* cmd = command_processor_->GetCurrentCommandBuffer();
+    MTL::CommandBuffer* cmd = retain_overlaps ? current_cmd : nullptr;
     if (!cmd) {
       MTL::CommandQueue* queue = command_processor_->GetMetalCommandQueue();
       if (!queue) {
         new_buffer->release();
         return false;
       }
-      ScopedAutoreleasePool autorelease_pool;
       cmd = queue->commandBuffer();
       if (!cmd) {
         new_buffer->release();
@@ -2761,15 +3079,13 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
     }
 
     blit->endEncoding();
-    if (cmd != command_processor_->GetCurrentCommandBuffer()) {
+    if (cmd != current_cmd) {
       cmd->commit();
       cmd->waitUntilCompleted();
     }
   }
 
   std::vector<ScaledResolveBuffer> new_buffers;
-  bool retain_overlaps =
-      command_processor_->GetCurrentCommandBuffer() != nullptr;
   new_buffers.reserve(scaled_resolve_buffers_.size() - overlap_indices.size() +
                       1);
   for (size_t i = 0; i < scaled_resolve_buffers_.size(); ++i) {
@@ -2782,7 +3098,18 @@ bool MetalTextureCache::EnsureScaledResolveBufferRange(uint64_t start_scaled,
     }
     if (overlapping) {
       if (retain_overlaps) {
-        scaled_resolve_retired_buffers_.push_back(scaled_resolve_buffers_[i]);
+        RetiredScaledResolveBuffer retired;
+        retired.buffer = scaled_resolve_buffers_[i].buffer;
+        retired.submission_id = command_processor_->GetCurrentSubmission();
+        retired.length_scaled = scaled_resolve_buffers_[i].length_scaled;
+        scaled_resolve_retired_buffers_.push_back(retired);
+        if (std::numeric_limits<uint64_t>::max() -
+                scaled_resolve_retired_bytes_ <
+            retired.length_scaled) {
+          scaled_resolve_retired_bytes_ = std::numeric_limits<uint64_t>::max();
+        } else {
+          scaled_resolve_retired_bytes_ += retired.length_scaled;
+        }
       } else if (scaled_resolve_buffers_[i].buffer) {
         scaled_resolve_buffers_[i].buffer->release();
       }
@@ -2992,8 +3319,25 @@ MTL::Texture* MetalTextureCache::MetalTexture::GetOrCreateView(
   MTL::PixelFormat view_format =
       get_view_pixel_format(key(), is_signed, metal_texture_->pixelFormat());
 
+  MTL::TextureType view_type = metal_texture_->textureType();
+  switch (dimension) {
+    case xenos::FetchOpDimension::kCube:
+      // SPIRV-Cross translates cube fetches to non-array cube textures.
+      view_type = MTL::TextureTypeCube;
+      break;
+    case xenos::FetchOpDimension::k3DOrStacked:
+      view_type = key().dimension == xenos::DataDimension::k3D
+                      ? MTL::TextureType3D
+                      : MTL::TextureType2DArray;
+      break;
+    default:
+      view_type = MTL::TextureType2DArray;
+      break;
+  }
+
   if (host_swizzle == xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA) {
-    if (!is_signed || view_format == metal_texture_->pixelFormat()) {
+    if ((!is_signed || view_format == metal_texture_->pixelFormat()) &&
+        metal_texture_->textureType() == view_type) {
       return metal_texture_;
     }
   }
@@ -3006,25 +3350,13 @@ MTL::Texture* MetalTextureCache::MetalTexture::GetOrCreateView(
     return found->second;
   }
 
-  MTL::TextureType view_type = metal_texture_->textureType();
-  switch (dimension) {
-    case xenos::FetchOpDimension::kCube:
-      view_type = MTL::TextureTypeCubeArray;
-      break;
-    case xenos::FetchOpDimension::k3DOrStacked:
-      view_type = key().dimension == xenos::DataDimension::k3D
-                      ? MTL::TextureType3D
-                      : MTL::TextureType2DArray;
-      break;
-    default:
-      view_type = MTL::TextureType2DArray;
-      break;
-  }
-
   uint32_t slice_count = 1;
   switch (view_type) {
     case MTL::TextureType2DArray:
       slice_count = metal_texture_->arrayLength();
+      break;
+    case MTL::TextureTypeCube:
+      slice_count = 6;
       break;
     case MTL::TextureTypeCubeArray:
       slice_count = metal_texture_->arrayLength() * 6;
@@ -3045,7 +3377,9 @@ MTL::Texture* MetalTextureCache::MetalTexture::GetOrCreateView(
   MTL::Texture* view = metal_texture_->newTextureView(
       view_format, view_type, level_range, slice_range, swizzle);
   if (!view) {
-    return metal_texture_;
+    // Returning a mismatched base type can trigger Metal validation asserts.
+    return metal_texture_->textureType() == view_type ? metal_texture_
+                                                      : nullptr;
   }
 
   swizzled_view_cache_.emplace(view_key, view);

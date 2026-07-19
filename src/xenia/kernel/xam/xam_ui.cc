@@ -34,6 +34,8 @@ DEFINE_bool(storage_selection_dialog, false,
 
 DECLARE_int32(license_mask);
 
+constexpr std::chrono::milliseconds kUIDelayMillis(200);
+
 namespace xe {
 namespace kernel {
 namespace xam {
@@ -81,8 +83,11 @@ X_RESULT xeXamDispatchDialog(T* dialog,
     return result;
   };
   auto post = []() {
-    xe::threading::Sleep(std::chrono::milliseconds(100));
-    kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    std::jthread t([] {
+      xe::threading::Sleep(kUIDelayMillis);
+      kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    });
+    t.detach();
   };
   if (!overlapped) {
     pre();
@@ -123,7 +128,7 @@ X_RESULT xeXamDispatchDialogEx(
     return result;
   };
   auto post = []() {
-    xe::threading::Sleep(std::chrono::milliseconds(100));
+    xe::threading::Sleep(kUIDelayMillis);
     kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
   };
   if (!overlapped) {
@@ -143,10 +148,15 @@ X_RESULT xeXamDispatchHeadless(std::function<X_RESULT()> run_callback,
                                uint32_t overlapped) {
   auto pre = []() {
     kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
+    xe::threading::Sleep(std::chrono::milliseconds(25));
   };
   auto post = []() {
-    xe::threading::Sleep(std::chrono::milliseconds(100));
-    kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    std::jthread t([]() {
+      xe::threading::Sleep(kUIDelayMillis);
+      kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    });
+
+    t.detach();
   };
   if (!overlapped) {
     pre();
@@ -167,7 +177,7 @@ X_RESULT xeXamDispatchHeadlessEx(
     kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
   };
   auto post = []() {
-    xe::threading::Sleep(std::chrono::milliseconds(100));
+    xe::threading::Sleep(kUIDelayMillis);
     kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
   };
   if (!overlapped) {
@@ -198,7 +208,7 @@ X_RESULT xeXamDispatchDialogAsync(T* dialog,
     kernel_state()->xam_state()->xam_dialogs_shown_--;
 
     auto run = []() -> void {
-      xe::threading::Sleep(std::chrono::milliseconds(100));
+      xe::threading::Sleep(kUIDelayMillis);
       kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
     };
 
@@ -220,7 +230,7 @@ X_RESULT xeXamDispatchHeadlessAsync(std::function<void()> run_callback) {
     kernel_state()->xam_state()->xam_dialogs_shown_--;
 
     auto run = []() -> void {
-      xe::threading::Sleep(std::chrono::milliseconds(100));
+      xe::threading::Sleep(kUIDelayMillis);
       kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
     };
 
@@ -381,7 +391,14 @@ static dword_result_t XamShowMessageBoxUi(
     uint32_t button_ptr = button_ptrs[i];
     auto button = xe::load_and_swap<std::u16string>(
         kernel_state()->memory()->TranslateVirtual(button_ptr));
-    buttons.push_back(xe::to_utf8(button));
+
+    if (!button.empty()) {
+      buttons.push_back(xe::to_utf8(button));
+    }
+  }
+
+  if (buttons.empty()) {
+    buttons.push_back("OK");
   }
 
   X_RESULT result;
@@ -591,7 +608,9 @@ dword_result_t XamShowDeviceSelectorUI_entry(
     // Default to the first storage device (HDD) if headless.
     return xeXamDispatchHeadless(
         [device_id_ptr, devices]() -> X_RESULT {
-          if (devices.empty()) return X_ERROR_CANCELLED;
+          if (devices.empty()) {
+            return X_ERROR_CANCELLED;
+          }
 
           const DummyDeviceInfo* device_info = devices.front();
           *device_id_ptr = static_cast<uint32_t>(device_info->device_id);
@@ -602,7 +621,9 @@ dword_result_t XamShowDeviceSelectorUI_entry(
 
   auto close = [device_id_ptr, devices](MessageBoxDialog* dialog) -> X_RESULT {
     uint32_t button = dialog->chosen_button();
-    if (button >= devices.size()) return X_ERROR_CANCELLED;
+    if (button >= devices.size()) {
+      return X_ERROR_CANCELLED;
+    }
 
     const DummyDeviceInfo* device_info = devices.at(button);
     *device_id_ptr = static_cast<uint32_t>(device_info->device_id);
@@ -998,7 +1019,9 @@ X_RESULT xeXamShowSigninUI(uint32_t user_index, uint32_t users_needed,
         UserProfile* profile = kernel_state()->xam_state()->GetUserProfile(i);
         if (profile) {
           xuids[i] = profile->xuid();
-          if (xuids.size() >= users_needed) break;
+          if (xuids.size() >= users_needed) {
+            break;
+          }
         }
       }
 

@@ -16,12 +16,6 @@
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/render_target_cache.h"
 
-DEFINE_bool(
-    ac6_ground_fix, false,
-    "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
-    "Might cause issues in other titles.",
-    "HACKS");
-
 namespace xe {
 namespace gpu {
 using namespace ucode;
@@ -88,14 +82,7 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
           a_.OpAdd(address_dest, index_operand, dxbc::Src::LF(0.5f));
           a_.OpRoundNI(address_dest, address_src);
         } else {
-          // UGLY HACK. Remove ASAP.
-          // Proper fix requires accurate RCP implementation.
-          if (cvars::ac6_ground_fix) {
-            a_.OpAdd(address_dest, index_operand, dxbc::Src::LF(0.00025f));
-            a_.OpRoundNI(address_dest, address_src);
-          } else {
-            a_.OpRoundNI(address_dest, index_operand);
-          }
+          a_.OpRoundNI(address_dest, index_operand);
         }
         if (index_operand_temp_pushed) {
           PopSystemTemp();
@@ -509,6 +496,12 @@ uint32_t DxbcShaderTranslator::FindOrAddTextureBinding(
     return kMaxTextureBindings - 1;
   }
   uint32_t texture_binding_index = uint32_t(texture_bindings_.size());
+  // NOTE: Calculate bindless_descriptor_index BEFORE emplace_back so indices
+  // start at 0, not 1. This ensures the descriptor_indices buffer (which is
+  // sized based on binding count) has enough space for all indices.
+  // Consistently 0 if not bindless as it may be used for hashing.
+  uint32_t bindless_descriptor_index =
+      bindless_resources_used_ ? GetBindlessResourceCount() : 0;
   TextureBinding& new_texture_binding = texture_bindings_.emplace_back();
   if (!bindless_resources_used_) {
     new_texture_binding.bindful_srv_index = srv_count_++;
@@ -532,9 +525,7 @@ uint32_t DxbcShaderTranslator::FindOrAddTextureBinding(
     new_texture_binding.bindful_srv_index = kBindingIndexUnallocated;
   }
   new_texture_binding.bindful_srv_rdef_name_ptr = 0;
-  // Consistently 0 if not bindless as it may be used for hashing.
-  new_texture_binding.bindless_descriptor_index =
-      bindless_resources_used_ ? GetBindlessResourceCount() : 0;
+  new_texture_binding.bindless_descriptor_index = bindless_descriptor_index;
   new_texture_binding.fetch_constant = fetch_constant;
   new_texture_binding.dimension = dimension;
   new_texture_binding.is_signed = is_signed;
@@ -568,10 +559,14 @@ uint32_t DxbcShaderTranslator::FindOrAddSamplerBinding(
     assert_always();
     return kMaxSamplerBindings - 1;
   }
-  SamplerBinding& new_sampler_binding = sampler_bindings_.emplace_back();
+  // NOTE: Calculate bindless_descriptor_index BEFORE emplace_back so indices
+  // start at 0, not 1. This ensures the descriptor_indices buffer (which is
+  // sized based on binding count) has enough space for all indices.
   // Consistently 0 if not bindless as it may be used for hashing.
-  new_sampler_binding.bindless_descriptor_index =
+  uint32_t bindless_descriptor_index =
       bindless_resources_used_ ? GetBindlessResourceCount() : 0;
+  SamplerBinding& new_sampler_binding = sampler_bindings_.emplace_back();
+  new_sampler_binding.bindless_descriptor_index = bindless_descriptor_index;
   new_sampler_binding.fetch_constant = fetch_constant;
   new_sampler_binding.mag_filter = mag_filter;
   new_sampler_binding.min_filter = min_filter;
@@ -720,9 +715,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   uint32_t tfetch_index = instr.operands[1].storage_index;
 
   // Whether to use gradients (implicit or explicit) for LOD calculation.
-  bool use_computed_lod =
-      instr.attributes.use_computed_lod &&
-      (is_pixel_shader() || instr.attributes.use_register_gradients);
+  bool use_computed_lod = TextureFetchUsesComputedLod(instr);
   if (instr.opcode == FetchOpcode::kGetTextureComputedLod &&
       (!use_computed_lod || instr.attributes.use_register_gradients)) {
     assert_always();
@@ -2143,6 +2136,40 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         a_.OpBreak();
         a_.OpEndSwitch();
       }
+      // num_format is applied after signedness. A fixed-point format's host
+      // view returns normalized values, so for an integer num_format restore
+      // the guest integer range here.
+      uint32_t integer_scale_bits_temp = PushSystemTemp();
+      uint32_t integer_scale_temp = PushSystemTemp();
+      dxbc::Dest integer_scale_bits_dest(dxbc::Dest::R(
+          integer_scale_bits_temp, used_result_nonzero_components));
+      dxbc::Src integer_scale_bits_src(dxbc::Src::R(integer_scale_bits_temp));
+      dxbc::Dest integer_scale_dest(
+          dxbc::Dest::R(integer_scale_temp, used_result_nonzero_components));
+      dxbc::Src integer_scale_src(dxbc::Src::R(integer_scale_temp));
+      dxbc::Src integer_scale_bits_packed = LoadSystemConstant(
+          SystemConstants::Index::kTextureIntegerScaleBits,
+          offsetof(SystemConstants, texture_integer_scale_bits) +
+              sizeof(uint32_t) * tfetch_index,
+          dxbc::Src::kXXXX);
+      // Uniform early out. Zero means leave the sample alone. Only integer
+      // num_format on fixed textures has scale bits.
+      a_.OpIf(true, integer_scale_bits_packed);
+      a_.OpUBFE(integer_scale_bits_dest, dxbc::Src::LU(5),
+                dxbc::Src::LU(0, 5, 10, 15), integer_scale_bits_packed);
+      a_.OpAnd(integer_scale_dest, integer_scale_bits_src, dxbc::Src::LU(0xF));
+      a_.OpIAdd(integer_scale_dest, integer_scale_src, dxbc::Src::LU(1));
+      a_.OpUShR(integer_scale_bits_dest, integer_scale_bits_src,
+                dxbc::Src::LU(4));
+      a_.OpIAdd(integer_scale_dest, integer_scale_src, -integer_scale_bits_src);
+      a_.OpIShL(integer_scale_dest, dxbc::Src::LU(1), integer_scale_src);
+      a_.OpIAdd(integer_scale_dest, integer_scale_src, dxbc::Src::LI(-1));
+      a_.OpUToF(integer_scale_dest, integer_scale_src);
+      a_.OpMul(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_), integer_scale_src);
+      a_.OpEndIf();
+      PopSystemTemp(2);
     }
     if (signs_temp != UINT32_MAX) {
       PopSystemTemp();

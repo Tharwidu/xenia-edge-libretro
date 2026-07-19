@@ -354,6 +354,7 @@ namespace spv {
 // Backward compatibility for ImageOperands
 #define ImageOperandsGradMask ImageOperandsMask::Grad
 #define ImageOperandsLodMask ImageOperandsMask::Lod
+#define ImageOperandsBiasMask ImageOperandsMask::Bias
 #define ImageOperandsMaskNone ImageOperandsMask::MaskNone
 
 // Backward compatibility for StorageClass
@@ -429,6 +430,8 @@ namespace spv {
 #define ExecutionModeVertexOrderCw ExecutionMode::VertexOrderCw
 #define ExecutionModeVertexOrderCcw ExecutionMode::VertexOrderCcw
 #define ExecutionModeDepthReplacing ExecutionMode::DepthReplacing
+#define ExecutionModeDepthGreater ExecutionMode::DepthGreater
+#define ExecutionModeDepthLess ExecutionMode::DepthLess
 #define ExecutionModeStencilRefReplacingEXT \
   ExecutionMode::StencilRefReplacingEXT
 #define ExecutionModeLocalSize ExecutionMode::LocalSize
@@ -440,6 +443,7 @@ namespace spv {
 #define DecorationBufferBlock Decoration::BufferBlock
 #define DecorationCoherent Decoration::Coherent
 #define DecorationCentroid Decoration::Centroid
+#define DecorationSample Decoration::Sample
 #define DecorationSpecId Decoration::SpecId
 #define DecorationNonReadable Decoration::NonReadable
 

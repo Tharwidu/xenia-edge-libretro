@@ -796,6 +796,13 @@ class Shader {
     // True if the shader has already been translated.
     bool is_translated() const { return is_translated_; }
 
+    // For background-thread translation: atomically claim the right to
+    // translate. Returns true if the caller should translate, false if another
+    // thread already claimed it (and is_translated() should be awaited).
+    bool TryClaimTranslation() {
+      return !translation_claimed_.test_and_set(std::memory_order_acq_rel);
+    }
+
     // Errors that occurred during translation.
     const std::vector<Error>& errors() const { return errors_; }
 
@@ -842,6 +849,7 @@ class Shader {
 
     bool is_valid_ = false;
     bool is_translated_ = false;
+    std::atomic_flag translation_claimed_ = ATOMIC_FLAG_INIT;
     std::vector<Error> errors_;
     std::string host_disassembly_;
   };
@@ -898,6 +906,9 @@ class Shader {
   uint8_t memexport_eM_potentially_written_before_end() const {
     return memexport_eM_potentially_written_before_end_;
   }
+
+  // Whether the shader contains subroutine calls (cond_call).
+  bool uses_subroutine_calls() const { return uses_subroutine_calls_; }
 
   // c# registers used as the addend in MAD operations to eA.
   const std::set<uint32_t>& memexport_stream_constants() const {
@@ -1082,6 +1093,8 @@ class Shader {
   // multiple predecessor chains exporting to memory).
   uint8_t memexport_eM_potentially_written_before_end_ = 0;
   std::set<uint32_t> memexport_stream_constants_;
+  // Set during analysis if the shader contains any cond_call.
+  bool uses_subroutine_calls_ = false;
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <tuple>
 
 #include "third_party/dxbc/DXBCChecksum.h"
 #include "third_party/fmt/include/fmt/xchar.h"
@@ -43,40 +44,42 @@ namespace gpu {
 namespace d3d12 {
 
 // Generated with `xb buildshaders`.
+// Internal shaders always use DXBC (SM 5.1) because the transfer pixel shaders
+// are dynamically generated as DXBC and can't be mixed with DXIL vertex
+// shaders.
 namespace shaders {
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/clear_uint2_ps.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/host_depth_store_1xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/host_depth_store_2xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/host_depth_store_4xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_clear_64bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_4xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_32bpp_4xmsaa_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_64bpp_1x2xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_64bpp_1x2xmsaa_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_64bpp_4xmsaa_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_fast_64bpp_4xmsaa_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_128bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_128bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_16bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_16bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_32bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_32bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_64bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_64bpp_scaled_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_8bpp_cs.h"
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_8bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/clear_uint2_ps.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/fullscreen_cw_vs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/host_depth_store_1xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/host_depth_store_2xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/host_depth_store_4xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/passthrough_position_xy_vs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_clear_32bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_clear_32bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_clear_64bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_clear_64bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_32bpp_1x2xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_32bpp_4xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_32bpp_4xmsaa_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_64bpp_1x2xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_64bpp_1x2xmsaa_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_64bpp_4xmsaa_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_fast_64bpp_4xmsaa_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_128bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_128bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_16bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_16bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_32bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_32bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_64bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_64bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_8bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/resolve_full_8bpp_scaled_cs.h"
 }  // namespace shaders
 
-constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
-    D3D12RenderTargetCache::kResolveCopyShaders[size_t(
-        draw_util::ResolveCopyShaderIndex::kCount)] = {
+static constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
+    kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)] = {
         {shaders::resolve_fast_32bpp_1x2xmsaa_cs,
          sizeof(shaders::resolve_fast_32bpp_1x2xmsaa_cs),
          shaders::resolve_fast_32bpp_1x2xmsaa_scaled_cs,
@@ -186,6 +189,17 @@ bool D3D12RenderTargetCache::Initialize() {
       command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
+  // The transfer pixel shaders are hand-built as DXBC but must share a pipeline
+  // with the DXIL passthrough vertex shader, so they need to be converted to
+  // DXIL with dxilconv. Without it host render target transfers will fail (but
+  // the pixel shader interlock path doesn't use them).
+  if (FAILED(provider.DxbcConverterCreateInstance(
+          CLSID_DxbcConverter, IID_PPV_ARGS(&dxbc_to_dxil_converter_)))) {
+    XELOGE(
+        "Failed to create the DXBC to DXIL converter for transfer pixel "
+        "shaders. Place dxilconv.dll next to the executable.");
+  }
+
   if (cvars::render_target_path == "performance") {
     path_ = Path::kHostRenderTargets;
   } else if (cvars::render_target_path == "accuracy") {
@@ -247,6 +261,7 @@ bool D3D12RenderTargetCache::Initialize() {
     return false;
   }
   edram_buffer_->SetName(L"EDRAM Buffer");
+  edram_buffer_gpu_address_ = edram_buffer_->GetGPUVirtualAddress();
   edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
 
@@ -337,31 +352,15 @@ bool D3D12RenderTargetCache::Initialize() {
   resolve_copy_root_parameters[0].ShaderVisibility =
       D3D12_SHADER_VISIBILITY_ALL;
   // Parameter 1 is the destination (shared memory).
-  D3D12_DESCRIPTOR_RANGE resolve_copy_dest_range;
-  resolve_copy_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  resolve_copy_dest_range.NumDescriptors = 1;
-  resolve_copy_dest_range.BaseShaderRegister = 0;
-  resolve_copy_dest_range.RegisterSpace = 0;
-  resolve_copy_dest_range.OffsetInDescriptorsFromTableStart = 0;
-  resolve_copy_root_parameters[1].ParameterType =
-      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  resolve_copy_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-  resolve_copy_root_parameters[1].DescriptorTable.pDescriptorRanges =
-      &resolve_copy_dest_range;
+  resolve_copy_root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  resolve_copy_root_parameters[1].Descriptor.ShaderRegister = 0;
+  resolve_copy_root_parameters[1].Descriptor.RegisterSpace = 0;
   resolve_copy_root_parameters[1].ShaderVisibility =
       D3D12_SHADER_VISIBILITY_ALL;
   // Parameter 2 is the source (EDRAM).
-  D3D12_DESCRIPTOR_RANGE resolve_copy_source_range;
-  resolve_copy_source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  resolve_copy_source_range.NumDescriptors = 1;
-  resolve_copy_source_range.BaseShaderRegister = 0;
-  resolve_copy_source_range.RegisterSpace = 0;
-  resolve_copy_source_range.OffsetInDescriptorsFromTableStart = 0;
-  resolve_copy_root_parameters[2].ParameterType =
-      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  resolve_copy_root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
-  resolve_copy_root_parameters[2].DescriptorTable.pDescriptorRanges =
-      &resolve_copy_source_range;
+  resolve_copy_root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  resolve_copy_root_parameters[2].Descriptor.ShaderRegister = 0;
+  resolve_copy_root_parameters[2].Descriptor.RegisterSpace = 0;
   resolve_copy_root_parameters[2].ShaderVisibility =
       D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC resolve_copy_root_signature_desc;
@@ -557,20 +556,11 @@ bool D3D12RenderTargetCache::Initialize() {
         &host_depth_store_root_source_range;
     host_depth_store_root_source.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     // Destination.
-    D3D12_DESCRIPTOR_RANGE host_depth_store_root_dest_range;
-    host_depth_store_root_dest_range.RangeType =
-        D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    host_depth_store_root_dest_range.NumDescriptors = 1;
-    host_depth_store_root_dest_range.BaseShaderRegister = 0;
-    host_depth_store_root_dest_range.RegisterSpace = 0;
-    host_depth_store_root_dest_range.OffsetInDescriptorsFromTableStart = 0;
     D3D12_ROOT_PARAMETER& host_depth_store_root_dest =
         host_depth_store_root_parameters[kHostDepthStoreRootParameterDest];
-    host_depth_store_root_dest.ParameterType =
-        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    host_depth_store_root_dest.DescriptorTable.NumDescriptorRanges = 1;
-    host_depth_store_root_dest.DescriptorTable.pDescriptorRanges =
-        &host_depth_store_root_dest_range;
+    host_depth_store_root_dest.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    host_depth_store_root_dest.Descriptor.ShaderRegister = 0;
+    host_depth_store_root_dest.Descriptor.RegisterSpace = 0;
     host_depth_store_root_dest.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     // Root signature.
     D3D12_ROOT_SIGNATURE_DESC host_depth_store_root_desc;
@@ -818,12 +808,6 @@ bool D3D12RenderTargetCache::Initialize() {
     dump_root_stencil_range.BaseShaderRegister = 1;
     dump_root_stencil_range.RegisterSpace = 0;
     dump_root_stencil_range.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_DESCRIPTOR_RANGE dump_root_edram_range;
-    dump_root_edram_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    dump_root_edram_range.NumDescriptors = 1;
-    dump_root_edram_range.BaseShaderRegister = 0;
-    dump_root_edram_range.RegisterSpace = 0;
-    dump_root_edram_range.OffsetInDescriptorsFromTableStart = 0;
     D3D12_ROOT_PARAMETER
     dump_root_color_parameters[kDumpRootParameterColorCount];
     D3D12_ROOT_PARAMETER
@@ -876,11 +860,9 @@ bool D3D12RenderTargetCache::Initialize() {
       D3D12_ROOT_PARAMETER& dump_root_edram =
           i ? dump_root_depth_parameters[kDumpRootParameterDepthEdram]
             : dump_root_color_parameters[kDumpRootParameterColorEdram];
-      dump_root_edram.ParameterType =
-          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      dump_root_edram.DescriptorTable.NumDescriptorRanges = 1;
-      dump_root_edram.DescriptorTable.pDescriptorRanges =
-          &dump_root_edram_range;
+      dump_root_edram.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+      dump_root_edram.Descriptor.ShaderRegister = 0;
+      dump_root_edram.Descriptor.RegisterSpace = 0;
       dump_root_edram.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     D3D12_ROOT_SIGNATURE_DESC dump_root_desc;
@@ -1022,18 +1004,10 @@ bool D3D12RenderTargetCache::Initialize() {
     resolve_rov_clear_root_parameters[0].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_ALL;
     // Parameter 1 is the destination (EDRAM).
-    D3D12_DESCRIPTOR_RANGE resolve_rov_clear_dest_range;
-    resolve_rov_clear_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    resolve_rov_clear_dest_range.NumDescriptors = 1;
-    resolve_rov_clear_dest_range.BaseShaderRegister = 0;
-    resolve_rov_clear_dest_range.RegisterSpace = 0;
-    resolve_rov_clear_dest_range.OffsetInDescriptorsFromTableStart = 0;
     resolve_rov_clear_root_parameters[1].ParameterType =
-        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    resolve_rov_clear_root_parameters[1].DescriptorTable.NumDescriptorRanges =
-        1;
-    resolve_rov_clear_root_parameters[1].DescriptorTable.pDescriptorRanges =
-        &resolve_rov_clear_dest_range;
+        D3D12_ROOT_PARAMETER_TYPE_UAV;
+    resolve_rov_clear_root_parameters[1].Descriptor.ShaderRegister = 0;
+    resolve_rov_clear_root_parameters[1].Descriptor.RegisterSpace = 0;
     resolve_rov_clear_root_parameters[1].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC resolve_rov_clear_root_signature_desc;
@@ -1056,12 +1030,15 @@ bool D3D12RenderTargetCache::Initialize() {
     }
 
     // Create the resolve EDRAM buffer clearing pipelines.
-    resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device,
-        draw_resolution_scaled ? shaders::resolve_clear_32bpp_scaled_cs
-                               : shaders::resolve_clear_32bpp_cs,
+    const void* resolve_clear_32bpp_cs =
+        draw_resolution_scaled
+            ? static_cast<const void*>(shaders::resolve_clear_32bpp_scaled_cs)
+            : static_cast<const void*>(shaders::resolve_clear_32bpp_cs);
+    size_t resolve_clear_32bpp_cs_size =
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_32bpp_cs),
+                               : sizeof(shaders::resolve_clear_32bpp_cs);
+    resolve_rov_clear_32bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, resolve_clear_32bpp_cs, resolve_clear_32bpp_cs_size,
         resolve_rov_clear_root_signature_);
     if (resolve_rov_clear_32bpp_pipeline_ == nullptr) {
       XELOGE(
@@ -1071,12 +1048,15 @@ bool D3D12RenderTargetCache::Initialize() {
       return false;
     }
     resolve_rov_clear_32bpp_pipeline_->SetName(L"Resolve Clear 32bpp");
-    resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
-        device,
-        draw_resolution_scaled ? shaders::resolve_clear_64bpp_scaled_cs
-                               : shaders::resolve_clear_64bpp_cs,
+    const void* resolve_clear_64bpp_cs =
+        draw_resolution_scaled
+            ? static_cast<const void*>(shaders::resolve_clear_64bpp_scaled_cs)
+            : static_cast<const void*>(shaders::resolve_clear_64bpp_cs);
+    size_t resolve_clear_64bpp_cs_size =
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_64bpp_cs),
+                               : sizeof(shaders::resolve_clear_64bpp_cs);
+    resolve_rov_clear_64bpp_pipeline_ = ui::d3d12::util::CreateComputePipeline(
+        device, resolve_clear_64bpp_cs, resolve_clear_64bpp_cs_size,
         resolve_rov_clear_root_signature_);
     if (resolve_rov_clear_64bpp_pipeline_ == nullptr) {
       XELOGE(
@@ -1098,6 +1078,7 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  ui::d3d12::util::ReleaseAndNull(dxbc_to_dxil_converter_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1387,95 +1368,52 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
                                        resolve_info.copy_dest_extent_length);
       }
       if (copy_dest_committed) {
-        // Write the descriptors and transition the resources.
-        // Full shared memory without resolution scaling, range of the scaled
-        // resolve buffer with scaling because only at least 128 * 2^20 R32
-        // elements must be addressable
-        // (D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP).
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
-        if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2,
-                descriptors)) {
-          if (bindless_resources_used_) {
-            if (draw_resolution_scaled) {
-              descriptor_dest = descriptors[0];
-            } else {
-              descriptor_dest =
-                  command_processor_
-                      .GetSharedMemoryUintPow2BindlessUAVHandlePair(
-                          copy_shader_info.dest_bpe_log2);
-            }
-            if (copy_shader_info.source_is_raw) {
-              descriptor_source =
-                  command_processor_.GetSystemBindlessViewHandlePair(
-                      D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
-            } else {
-              descriptor_source =
-                  command_processor_.GetEdramUintPow2BindlessSRVHandlePair(
-                      copy_shader_info.source_bpe_log2);
-            }
-          } else {
-            descriptor_dest = descriptors[0];
-            if (!draw_resolution_scaled) {
-              shared_memory.WriteUintPow2UAVDescriptor(
-                  descriptor_dest.first, copy_shader_info.dest_bpe_log2);
-            }
-            descriptor_source = descriptors[1];
-            if (copy_shader_info.source_is_raw) {
-              WriteEdramRawSRVDescriptor(descriptor_source.first);
-            } else {
-              WriteEdramUintPow2SRVDescriptor(descriptor_source.first,
-                                              copy_shader_info.source_bpe_log2);
-            }
-          }
-          if (draw_resolution_scaled) {
-            texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
-                descriptor_dest.first, copy_shader_info.dest_bpe_log2);
-            texture_cache.TransitionCurrentScaledResolveRange(
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-          } else {
-            shared_memory.UseForWriting();
-          }
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
 
-          // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
-          command_list.D3DSetComputeRootDescriptorTable(
-              2, descriptor_source.second);
-          command_list.D3DSetComputeRootDescriptorTable(1,
-                                                        descriptor_dest.second);
-          if (draw_resolution_scaled) {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0,
-                sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
-                &copy_shader_constants.dest_relative, 0);
-          } else {
-            command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(copy_shader_constants) / sizeof(uint32_t),
-                &copy_shader_constants, 0);
-          }
-          command_processor_.SetExternalPipeline(
-              resolve_copy_pipelines_[size_t(copy_shader)]);
-          command_processor_.SubmitBarriers();
-          command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+        // Source.
+        TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        command_list.D3DSetComputeRootShaderResourceView(
+            2, edram_buffer_gpu_address_);
 
-          // Order the resolve with other work using the destination as a UAV.
-          if (draw_resolution_scaled) {
-            texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
-          } else {
-            shared_memory.MarkUAVWritesCommitNeeded();
-          }
+        // Destination and constants.
+        if (draw_resolution_scaled) {
+          texture_cache.TransitionCurrentScaledResolveRange(
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          command_list.D3DSetComputeRootUnorderedAccessView(
+              1, texture_cache.GetCurrentScaledResolveRangeGPUAddress());
 
-          // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(
-              resolve_info.copy_dest_extent_start,
-              resolve_info.copy_dest_extent_length);
-          written_address_out = resolve_info.copy_dest_extent_start;
-          written_length_out = resolve_info.copy_dest_extent_length;
-          copied = true;
+          command_list.D3DSetComputeRoot32BitConstants(
+              0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
+              &copy_shader_constants.dest_relative, 0);
+        } else {
+          shared_memory.UseForWriting();
+          command_list.D3DSetComputeRootUnorderedAccessView(
+              1, shared_memory.GetGPUAddress());
+
+          command_list.D3DSetComputeRoot32BitConstants(
+              0, sizeof(copy_shader_constants) / sizeof(uint32_t),
+              &copy_shader_constants, 0);
         }
+
+        // Dispatch the resolve.
+        command_processor_.SetExternalPipeline(
+            resolve_copy_pipelines_[size_t(copy_shader)]);
+        command_processor_.SubmitBarriers();
+        command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+
+        // Order the resolve with other work using the destination as a UAV.
+        if (draw_resolution_scaled) {
+          texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+        } else {
+          shared_memory.MarkUAVWritesCommitNeeded();
+        }
+
+        // Invalidate textures and mark the range as scaled if needed.
+        texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                          resolve_info.copy_dest_extent_length);
+        written_address_out = resolve_info.copy_dest_extent_start;
+        written_length_out = resolve_info.copy_dest_extent_length;
+        copied = true;
       } else {
         XELOGE(
             "D3D12RenderTargetCache: Failed to obtain the resolve destination "
@@ -1510,8 +1448,14 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
                 clear_transfers_[1])) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
-          clear_values[1] = resolve_info.rb_color_clear |
-                            (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+          // For 64bpp formats, RB_COLOR_CLEAR_LO is the lower 32 bits of the
+          // packed clear value. RB_COLOR_CLEAR is the upper 32 bits and, for
+          // 32bpp formats, the whole value.
+          clear_values[1] =
+              resolve_info.color_edram_info.format_is_64bpp
+                  ? resolve_info.rb_color_clear_lo |
+                        (uint64_t(resolve_info.rb_color_clear) << 32)
+                  : resolve_info.rb_color_clear;
           PerformTransfersAndResolveClears(2, clear_render_targets,
                                            clear_transfers_, clear_values,
                                            &clear_rectangle);
@@ -1519,76 +1463,57 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         cleared = true;
       } break;
       case Path::kPixelShaderInterlock: {
-        ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_edram;
-        bool descriptor_edram_obtained;
-        if (bindless_resources_used_) {
-          descriptor_edram = command_processor_.GetSystemBindlessViewHandlePair(
-              D3D12CommandProcessor::SystemBindlessView ::
-                  kEdramR32G32B32A32UintUAV);
-          descriptor_edram_obtained = true;
-        } else {
-          descriptor_edram_obtained =
-              command_processor_.RequestOneUseSingleViewDescriptors(
-                  1, &descriptor_edram);
-          if (descriptor_edram_obtained) {
-            WriteEdramUintPow2UAVDescriptor(descriptor_edram.first, 4);
-          }
+        TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Should be safe to only commit once (if was UAV / ROV previously - if
+        // there was nothing to copy, only to clear, for some reason, for
+        // instance), overlap of the depth and the color ranges is highly
+        // unlikely.
+        CommitEdramBufferUAVWrites();
+        command_list.D3DSetComputeRootSignature(
+            resolve_rov_clear_root_signature_);
+        command_list.D3DSetComputeRootUnorderedAccessView(
+            1, edram_buffer_gpu_address_);
+        std::pair<uint32_t, uint32_t> clear_group_count =
+            resolve_info.GetClearShaderGroupCount(draw_resolution_scale_x(),
+                                                  draw_resolution_scale_y());
+        assert_true(clear_group_count.first && clear_group_count.second);
+        if (clear_depth) {
+          draw_util::ResolveClearShaderConstants depth_clear_constants;
+          resolve_info.GetDepthClearShaderConstants(depth_clear_constants);
+          command_list.D3DSetComputeRoot32BitConstants(
+              0, sizeof(depth_clear_constants) / sizeof(uint32_t),
+              &depth_clear_constants, 0);
+          command_processor_.SetExternalPipeline(
+              resolve_rov_clear_32bpp_pipeline_);
+          command_processor_.SubmitBarriers();
+          command_list.D3DDispatch(clear_group_count.first,
+                                   clear_group_count.second, 1);
         }
-        if (descriptor_edram_obtained) {
-          TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-          // Should be safe to only commit once (if was UAV / ROV previously -
-          // if there was nothing to copy, only to clear, for some reason, for
-          // instance), overlap of the depth and the color ranges is highly
-          // unlikely.
-          CommitEdramBufferUAVWrites();
-          command_list.D3DSetComputeRootSignature(
-              resolve_rov_clear_root_signature_);
-          command_list.D3DSetComputeRootDescriptorTable(
-              1, descriptor_edram.second);
-          std::pair<uint32_t, uint32_t> clear_group_count =
-              resolve_info.GetClearShaderGroupCount(draw_resolution_scale_x(),
-                                                    draw_resolution_scale_y());
-          assert_true(clear_group_count.first && clear_group_count.second);
+        if (clear_color) {
+          draw_util::ResolveClearShaderConstants color_clear_constants;
+          resolve_info.GetColorClearShaderConstants(color_clear_constants);
           if (clear_depth) {
-            draw_util::ResolveClearShaderConstants depth_clear_constants;
-            resolve_info.GetDepthClearShaderConstants(depth_clear_constants);
+            // Non-RT-specific constants have already been set.
             command_list.D3DSetComputeRoot32BitConstants(
-                0, sizeof(depth_clear_constants) / sizeof(uint32_t),
-                &depth_clear_constants, 0);
-            command_processor_.SetExternalPipeline(
-                resolve_rov_clear_32bpp_pipeline_);
-            command_processor_.SubmitBarriers();
-            command_list.D3DDispatch(clear_group_count.first,
-                                     clear_group_count.second, 1);
+                0, sizeof(color_clear_constants.rt_specific) / sizeof(uint32_t),
+                &color_clear_constants.rt_specific,
+                offsetof(draw_util::ResolveClearShaderConstants, rt_specific) /
+                    sizeof(uint32_t));
+          } else {
+            command_list.D3DSetComputeRoot32BitConstants(
+                0, sizeof(color_clear_constants) / sizeof(uint32_t),
+                &color_clear_constants, 0);
           }
-          if (clear_color) {
-            draw_util::ResolveClearShaderConstants color_clear_constants;
-            resolve_info.GetColorClearShaderConstants(color_clear_constants);
-            if (clear_depth) {
-              // Non-RT-specific constants have already been set.
-              command_list.D3DSetComputeRoot32BitConstants(
-                  0,
-                  sizeof(color_clear_constants.rt_specific) / sizeof(uint32_t),
-                  &color_clear_constants.rt_specific,
-                  offsetof(draw_util::ResolveClearShaderConstants,
-                           rt_specific) /
-                      sizeof(uint32_t));
-            } else {
-              command_list.D3DSetComputeRoot32BitConstants(
-                  0, sizeof(color_clear_constants) / sizeof(uint32_t),
-                  &color_clear_constants, 0);
-            }
-            command_processor_.SetExternalPipeline(
-                resolve_info.color_edram_info.format_is_64bpp
-                    ? resolve_rov_clear_64bpp_pipeline_
-                    : resolve_rov_clear_32bpp_pipeline_);
-            command_processor_.SubmitBarriers();
-            command_list.D3DDispatch(clear_group_count.first,
-                                     clear_group_count.second, 1);
-          }
-          MarkEdramBufferModified();
-          cleared = true;
+          command_processor_.SetExternalPipeline(
+              resolve_info.color_edram_info.format_is_64bpp
+                  ? resolve_rov_clear_64bpp_pipeline_
+                  : resolve_rov_clear_32bpp_pipeline_);
+          command_processor_.SubmitBarriers();
+          command_list.D3DDispatch(clear_group_count.first,
+                                   clear_group_count.second, 1);
         }
+        MarkEdramBufferModified();
+        cleared = true;
       } break;
       default:
         assert_unhandled_case(GetPath());
@@ -2120,6 +2045,31 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
   PixelShaderInterlockFullEdramBarrierPlaced();
+}
+
+// 7e3 (HDR float) source -> 8_8_8_8 dest: decode the 7e3 floats and saturate to
+// [0, 1] (r2 scratch) instead of bit-reinterpreting. See
+// IsTransferValueConverted7e3And8888 for why and when.
+static void TransferConvert7e3To8888(dxbc::Assembler& a) {
+  for (uint32_t i = 0; i < 3; ++i) {
+    DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::R(2, 1 << i), 1, 0,
+                                       i * 10, 0, 0, 0, 1);
+  }
+  a.OpUBFE(dxbc::Dest::R(2, 0b1000), dxbc::Src::LU(2), dxbc::Src::LU(30),
+           dxbc::Src::R(1, dxbc::Src::kXXXX));
+  a.OpUToF(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(2, dxbc::Src::kWWWW));
+  a.OpMul(dxbc::Dest::R(2, 0b1000), dxbc::Src::R(2, dxbc::Src::kWWWW),
+          dxbc::Src::LF(1.0f / 3.0f));
+  a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(2), true);
+}
+
+// Reverse of TransferConvert7e3To8888: unpack the 8_8_8_8 bytes to [0, 1] and
+// store directly into the 7e3 host R16G16B16A16_FLOAT (r2 scratch).
+static void TransferConvert8888To7e3(dxbc::Assembler& a) {
+  a.OpUBFE(dxbc::Dest::R(2), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+           dxbc::Src::R(1, dxbc::Src::kXXXX));
+  a.OpUToF(dxbc::Dest::R(2), dxbc::Src::R(2));
+  a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(2), dxbc::Src::LF(1.0f / 255.0f));
 }
 
 ID3D12PipelineState* const*
@@ -3576,6 +3526,75 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
       if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
         a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX));
         a.OpMov(dxbc::Dest::O(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX));
+      } else if (dest_is_gamma_unorm16) {
+        // For gamma_unorm16, only r1.x has a valid packed 32-bit EDRAM
+        // dword (one pixel, since gamma_unorm16 is 32bpp Xenos / 64bpp
+        // host). Reinterpret as k_8_8_8_8_GAMMA (4 gamma-encoded bytes)
+        // and convert to linear float for R16G16B16A16_UNORM output.
+        //
+        // Use midpoint encoding to survive the UNORM16 quantization
+        // round-trip through PreSaturatedLinearToPWLGamma (which uses
+        // trunc()). Storing the exact PWLGammaToLinear result puts values
+        // at the lower boundary of the valid range, where UNORM16
+        // quantization can push them below threshold causing +/-1 byte
+        // errors that corrupt cross-format EDRAM reinterpretation.
+        //
+        // For gamma byte B, the midpoint linear value is:
+        //   Piece 0 (B < 64):    F = (B + 0.5) / 1023.0
+        //   Piece 1 (64<=B<96):  F = (B - 31.5) / 511.5
+        //   Piece 2 (96<=B<192): F = (B - 63.5) / 255.75
+        //   Piece 3 (B >= 192):  F = (B - 127.5) / 127.875
+        // Using MAd form: F = B * recip + offset.
+
+        // Extract 4 bytes: r1.xyzw = [R, G, B, A] as uint.
+        a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8, 8, 8, 8),
+                 dxbc::Src::LU(0, 8, 16, 24),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX));
+
+        // Alpha: o0.w = float(A) / 255.0 (no gamma conversion).
+        a.OpUToF(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
+        a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
+                dxbc::Src::LF(1.0f / 255.0f));
+
+        // RGB: per-channel midpoint encoding using r0.xy as (recip,
+        // offset) and r2.x as comparison temp.
+        for (uint32_t j = 0; j < 3; ++j) {
+          // Default to piece 0.
+          a.OpMov(dxbc::Dest::R(0, 0b0001), dxbc::Src::LF(1.0f / 1023.0f));
+          a.OpMov(dxbc::Dest::R(0, 0b0010), dxbc::Src::LF(0.5f / 1023.0f));
+          // Piece 1: byte >= 64.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(64));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-31.5f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 2: byte >= 96.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(96));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-63.5f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // Piece 3: byte >= 192.
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(192));
+          a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(1.0f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
+          a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                   dxbc::Src::LF(-127.5f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
+          // F = float(byte) * recip + offset.
+          a.OpUToF(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j));
+          a.OpMAd(dxbc::Dest::O(0, 1 << j), dxbc::Src::R(2, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kYYYY));
+        }
       } else {
         for (uint32_t i = 0; i < 2; ++i) {
           a.OpUBFE(dxbc::Dest::O(0, 0b11 << (i * 2)), dxbc::Src::LU(16),
@@ -3811,8 +3830,20 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
         // 32bpp color output. Any register can be used as temporary if needed -
         // this is the end of the shader.
         if (color_packed_in_r1x) {
+          // Value-converted 7e3 source. See
+          // IsTransferValueConverted7e3And8888 and TransferConvert7e3To8888.
+          const bool source_is_7e3 =
+              key.value_convert && source_is_color &&
+              (source_color_format ==
+                   xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+               source_color_format == xenos::ColorRenderTargetFormat::
+                                          k_2_10_10_10_FLOAT_AS_16_16_16_16);
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
+              if (source_is_7e3) {
+                TransferConvert7e3To8888(a);
+                break;
+              }
               a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
                        dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
@@ -3823,6 +3854,10 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
               // 8_8_8_8_GAMMA is represented by linear stored in
               // R16G16B16A16_UNORM.
+              if (source_is_7e3) {
+                TransferConvert7e3To8888(a);
+                break;
+              }
               a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
                        dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
@@ -3853,6 +3888,12 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+              if (key.value_convert && source_is_color &&
+                  source_color_format ==
+                      xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                TransferConvert8888To7e3(a);
+                break;
+              }
               // Color using r1.yz as temporary.
               for (uint32_t i = 0; i < 3; ++i) {
                 DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i),
@@ -4374,10 +4415,28 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
   pipeline_desc.pRootSignature = transfer_root_signatures_[size_t(
       use_stencil_reference_output_ ? mode.root_signature_with_stencil_ref
                                     : mode.root_signature_no_stencil_ref)];
+  // Convert the hand-built DXBC pixel shader to DXIL so it can pair with the
+  // DXIL passthrough vertex shader in a single pipeline.
+  std::vector<uint8_t> built_shader_dxil;
+  {
+    void* dxil = nullptr;
+    UINT32 dxil_size = 0;
+    if (!dxbc_to_dxil_converter_ ||
+        FAILED(dxbc_to_dxil_converter_->Convert(
+            built_shader_.data(), built_shader_size_bytes, nullptr, &dxil,
+            &dxil_size, nullptr)) ||
+        dxil == nullptr) {
+      XELOGE("Failed to convert a transfer pixel shader from DXBC to DXIL");
+      return nullptr;
+    }
+    built_shader_dxil.assign(static_cast<const uint8_t*>(dxil),
+                             static_cast<const uint8_t*>(dxil) + dxil_size);
+    CoTaskMemFree(dxil);
+  }
   pipeline_desc.VS.pShaderBytecode = shaders::passthrough_position_xy_vs;
   pipeline_desc.VS.BytecodeLength = sizeof(shaders::passthrough_position_xy_vs);
-  pipeline_desc.PS.pShaderBytecode = built_shader_.data();
-  pipeline_desc.PS.BytecodeLength = built_shader_size_bytes;
+  pipeline_desc.PS.pShaderBytecode = built_shader_dxil.data();
+  pipeline_desc.PS.BytecodeLength = UINT(built_shader_dxil.size());
   if (key.dest_msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported_) {
     // Using sample 0 as 0 and 3 as 1 for 2x instead.
     pipeline_desc.SampleMask = 0b1001;
@@ -4576,38 +4635,19 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         continue;
       }
       if (!host_depth_store_set_up) {
-        // Bindings.
-        // 0 - source.
-        // 1 - EDRAM if bindful.
+        // Source descriptor.
         ui::d3d12::util::DescriptorCpuGpuHandlePair
-            host_depth_store_descriptors[2];
+            host_depth_store_descriptor_source;
         if (!command_processor_.RequestOneUseSingleViewDescriptors(
-                1 + uint32_t(!bindless_resources_used_),
-                host_depth_store_descriptors)) {
+                1, &host_depth_store_descriptor_source)) {
           continue;
         }
         command_list.D3DSetComputeRootSignature(
             host_depth_store_root_signature_);
-        // Destination (EDRAM uint4 buffer).
-        if (bindless_resources_used_) {
-          command_list.D3DSetComputeRootDescriptorTable(
-              kHostDepthStoreRootParameterDest,
-              command_processor_.GetEdramUintPow2BindlessUAVHandlePair(4)
-                  .second);
-        } else {
-          const ui::d3d12::util::DescriptorCpuGpuHandlePair&
-              host_depth_store_descriptor_dest =
-                  host_depth_store_descriptors[1];
-          WriteEdramUintPow2UAVDescriptor(
-              host_depth_store_descriptor_dest.first, 4);
-          command_list.D3DSetComputeRootDescriptorTable(
-              kHostDepthStoreRootParameterDest,
-              host_depth_store_descriptor_dest.second);
-        }
+        // Destination (EDRAM buffer).
+        command_list.D3DSetComputeRootUnorderedAccessView(
+            kHostDepthStoreRootParameterDest, edram_buffer_gpu_address_);
         // Depth source texture.
-        const ui::d3d12::util::DescriptorCpuGpuHandlePair&
-            host_depth_store_descriptor_source =
-                host_depth_store_descriptors[0];
         device->CopyDescriptorsSimple(
             1, host_depth_store_descriptor_source.first,
             dest_d3d12_rt.descriptor_srv().GetHandle(),
@@ -4944,6 +4984,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format =
               source_rt_key.resource_format;
+          new_transfer_shader_key.value_convert =
+              IsTransferValueConverted7e3And8888(source_rt_key, dest_rt_key);
           bool host_depth_source_is_copy =
               host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy =
@@ -5778,7 +5820,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   // Bindings.
   // - Texture2D/Texture2DMS<float4/uint4> xe_edram_dump_source : t0
   // - Optionally, Texture2D/Texture2DMS<uint2> xe_edram_dump_stencil : t1
-  // - RWBuffer<uint/uint2> xe_edram : u0
+  // - RWByteAddressBuffer xe_edram : u0
   // - Constant buffers
   uint32_t rdef_binding_count = 1 + key.is_depth + 1 + kDumpCbufferCount;
   // Names.
@@ -5851,13 +5893,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
     dxbc::RdefInputBind& rdef_binding_edram =
         rdef_bindings[rdef_binding_index++];
     rdef_binding_edram.name_ptr = rdef_xe_edram_name_ptr;
-    rdef_binding_edram.type = dxbc::RdefInputType::kUAVRWTyped;
-    rdef_binding_edram.return_type = dxbc::ResourceReturnType::kUInt;
+    rdef_binding_edram.type = dxbc::RdefInputType::kUAVRWByteAddress;
+    rdef_binding_edram.return_type = dxbc::ResourceReturnType::kMixed;
     rdef_binding_edram.dimension = dxbc::RdefDimension::kUAVBuffer;
-    rdef_binding_edram.sample_count = UINT32_MAX;
     rdef_binding_edram.bind_count = 1;
-    rdef_binding_edram.flags =
-        format_is_64bpp ? dxbc::kRdefInputFlags2Component : 0;
     // xe_edram_dump_offsets
     dxbc::RdefInputBind& rdef_binding_offsets =
         rdef_bindings[rdef_binding_index++];
@@ -5982,10 +6021,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
         dxbc::Src::T(dxbc::Src::Dcl, 1, 1, 1));
   }
   // EDRAM buffer.
-  a.OpDclUnorderedAccessViewTyped(
-      dxbc::ResourceDimension::kBuffer, 0,
-      dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-      dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
+  a.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
   a.OpDclInput(dxbc::Dest::VThreadID(0b0011));
   // r0 - addressing before the load, then addressing and conversion scratch
   // r1 - addressing scratch before the load, then data
@@ -6118,6 +6154,9 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
     a.OpIAdd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
              dxbc::Src::R(1, dxbc::Src::kXXXX));
   }
+  // Convert the destination address from samples to bytes.
+  a.OpIShL(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+           dxbc::Src::LU(format_is_64bpp ? 3 : 2));
 
   // Extract the source texture base tile index to r1.x.
   // r0.x = X sample position within the tile
@@ -6401,9 +6440,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   }
 
   // Write the sample to the destination address stored in r0.z.
-  a.OpStoreUAVTyped(
-      dxbc::Dest::U(0, 0), dxbc::Src::R(0, dxbc::Src::kZZZZ), 1,
-      dxbc::Src::R(1, format_is_64bpp ? 0b0100 : dxbc::Src::kXXXX));
+  a.OpStoreRaw(dxbc::Dest::U(0, 0, format_is_64bpp ? 0b0011 : 0b0001),
+               dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(1));
 
   a.OpRet();
 
@@ -6549,29 +6587,8 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
     pipeline_key.is_depth = rt_key.is_depth;
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
-  // 32bpp and 64bpp.
-  size_t edram_uav_indices[2] = {SIZE_MAX, SIZE_MAX};
-  const ui::d3d12::D3D12Provider& provider =
-      command_processor_.GetD3D12Provider();
-  if (!bindless_resources_used_) {
-    if (any_sources_32bpp_64bpp[0]) {
-      edram_uav_indices[0] = current_temporary_descriptors_cpu_.size();
-      current_temporary_descriptors_cpu_.push_back(
-          provider.OffsetViewDescriptor(
-              edram_buffer_descriptor_heap_start_,
-              uint32_t(EdramBufferDescriptorIndex::kR32UintUAV)));
-    }
-    if (any_sources_32bpp_64bpp[1]) {
-      edram_uav_indices[1] = current_temporary_descriptors_cpu_.size();
-      current_temporary_descriptors_cpu_.push_back(
-          provider.OffsetViewDescriptor(
-              edram_buffer_descriptor_heap_start_,
-              uint32_t(EdramBufferDescriptorIndex::kR32G32UintUAV)));
-    }
-  }
 
   // Copy source descriptors to a shader-visible heap.
-  ID3D12Device* device = provider.GetDevice();
   uint32_t descriptor_count =
       uint32_t(current_temporary_descriptors_cpu_.size());
   current_temporary_descriptors_gpu_.resize(descriptor_count);
@@ -6579,6 +6596,7 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
           descriptor_count, current_temporary_descriptors_gpu_.data())) {
     return;
   }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   for (uint32_t i = 0; i < descriptor_count; ++i) {
     device->CopyDescriptorsSimple(1,
                                   current_temporary_descriptors_gpu_[i].first,
@@ -6593,6 +6611,8 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   DeferredCommandList& command_list =
       command_processor_.GetDeferredCommandList();
   ID3D12RootSignature* last_root_signature = nullptr;
+  // `root_parameters_set` doesn't include the EDRAM buffer, which is never
+  // changed.
   uint32_t root_parameters_set = 0;
   uint32_t last_descriptor_index_source = UINT32_MAX;
   uint32_t last_descriptor_index_stencil = UINT32_MAX;
@@ -6617,35 +6637,10 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       last_root_signature = root_signature;
       command_list.D3DSetComputeRootSignature(root_signature);
       root_parameters_set = 0;
-    }
-
-    DumpRootParameter root_parameter_edram = pipeline_key.is_depth
-                                                 ? kDumpRootParameterDepthEdram
-                                                 : kDumpRootParameterColorEdram;
-    uint32_t root_parameter_edram_bit = uint32_t(1) << root_parameter_edram;
-    bool format_is_64bpp = rt_key.Is64bpp();
-    if (last_edram_uav_is_64bpp != format_is_64bpp) {
-      last_edram_uav_is_64bpp = format_is_64bpp;
-      root_parameters_set &= ~root_parameter_edram_bit;
-    }
-    if (!(root_parameters_set & root_parameter_edram_bit)) {
-      D3D12_GPU_DESCRIPTOR_HANDLE descriptor_handle_edram;
-      if (bindless_resources_used_) {
-        descriptor_handle_edram = command_processor_
-                                      .GetEdramUintPow2BindlessUAVHandlePair(
-                                          2 + uint32_t(last_edram_uav_is_64bpp))
-                                      .second;
-      } else {
-        assert_true(edram_uav_indices[size_t(last_edram_uav_is_64bpp)] !=
-                    SIZE_MAX);
-        descriptor_handle_edram =
-            current_temporary_descriptors_gpu_[edram_uav_indices[size_t(
-                                                   last_edram_uav_is_64bpp)]]
-                .second;
-      }
-      command_list.D3DSetComputeRootDescriptorTable(root_parameter_edram,
-                                                    descriptor_handle_edram);
-      root_parameters_set |= root_parameter_edram_bit;
+      command_list.D3DSetComputeRootUnorderedAccessView(
+          pipeline_key.is_depth ? kDumpRootParameterDepthEdram
+                                : kDumpRootParameterColorEdram,
+          edram_buffer_gpu_address_);
     }
 
     DumpRootParameter root_parameter_pitches =
@@ -6706,6 +6701,7 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         uint32_t(1) << kDumpRootParameterOffsets;
     DumpOffsets offsets;
     offsets.source_base_tiles = rt_key.base_tiles;
+    bool format_is_64bpp = rt_key.Is64bpp();
     ResolveCopyDumpRectangle::Dispatch
         dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
     uint32_t dispatch_count =

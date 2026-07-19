@@ -17,17 +17,20 @@
 #include <utility>
 #include <vector>
 
+#include "xenia/base/platform.h"
 #include "xenia/gpu/shader_translator.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/xenos.h"
-#include "xenia/ui/vulkan/vulkan_device.h"
 
 namespace xe {
 namespace ui {
 namespace vulkan {
-class SpirvToolsContext;
+class VulkanDevice;
 }  // namespace vulkan
 }  // namespace ui
+}  // namespace xe
+
+namespace xe {
 namespace gpu {
 
 class SpirvShaderTranslator : public ShaderTranslator {
@@ -39,15 +42,31 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 10;
+    static constexpr uint32_t kVersion = 15;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
       // Early fragment tests - enable if alpha test and alpha to coverage are
       // disabled; ignored if anything in the shader blocks early Z writing.
       kEarlyHint,
-      // TODO(Triang3l): Unorm24 (rounding) and float24 (truncating and
-      // rounding) output modes.
+      // Converting the depth to the closest 32-bit float representable exactly
+      // as a 20e4 float, truncating towards zero, so SV_DepthLessEqual-style
+      // conservative depth output (ExecutionModeDepthLess) can still allow
+      // coarse early Z culling. MSAA depth must be per-sample, so the shader
+      // runs at sample frequency.
+      // Fixed-function viewport depth bounds must be snapped to float24 too.
+      kFloat24Truncating,
+      // Similar to kFloat24Truncating, but rounding to the nearest even, so
+      // plain ExecutionModeDepthReplacing is used rather than DepthLess.
+      kFloat24Rounding,
+      // Host RT shader polygon offset for suspected coplanar redraws with tiny
+      // biases. Writes the biased depth from the pixel shader and zeroes fixed
+      // function depth bias to avoid host slope/quantization quirks. This path
+      // is controlled by depth_bias_shader_offset.
+      kPolygonOffset,
+      kFloat24TruncatingPolygonOffset,
+      kFloat24RoundingPolygonOffset,
+      // TODO(Triang3l): Unorm24 (rounding) output mode.
     };
 
     struct {
@@ -70,6 +89,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // If user_clip_plane_count is non-zero, whether they should be cull
       // distances instead of clip distances.
       uint32_t user_clip_plane_cull : 1;
+      // Vertex kill (oPts.z) with the "and" operator - the primitive is culled
+      // only when all of its vertices request the kill, emulated with an extra
+      // cull distance written after the user clip plane cull distances. The
+      // "or" operator sets the position to NaN instead and needs no bit here.
+      uint32_t vertex_kill_and : 1;
+      // For domain shaders - the tessellation mode, selecting the tessellation
+      // evaluation shader spacing (Direct3D 12 sets it in the hull shaders, but
+      // in SPIR-V the spacing lives in the domain shader). Discrete uses equal
+      // spacing, continuous and adaptive use fractional even.
+      xenos::TessellationMode tessellation_mode : 2;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -199,8 +228,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   struct SystemConstants {
     uint32_t flags;
     uint32_t vertex_index_load_address;
+    uint32_t vertex_index_count;
     xenos::Endian vertex_index_endian;
     int32_t vertex_base_index;
+    uint32_t padding_after_vertex_index[3];
 
     float ndc_scale[3];
     float point_vertex_diameter_min;
@@ -228,12 +259,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t textures_resolved;
 
     float alpha_test_reference;
-    uint32_t edram_32bpp_tile_pitch_dwords_scaled;
-    uint32_t edram_depth_base_dwords_scaled;
     // If alpha to mask is disabled, the entire alpha_to_mask value must be 0.
     // If alpha to mask is enabled, bits 0:7 are sample offsets, and bit 8 must
     // be 1.
     uint32_t alpha_to_mask;
+
+    // UINT32_MAX when the draw is outside an active ZPD segment, which is used
+    // as a skip writing sentinel to the FSI counter buffer.
+    uint32_t zpd_fsi_counter_index;
+
+    uint32_t edram_32bpp_tile_pitch_dwords_scaled;
+    uint32_t edram_depth_base_dwords_scaled;
+    uint32_t padding_after_depth_info[2];
 
     float color_exp_bias[4];
 
@@ -280,27 +317,47 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
-  };
 
-  // Separate constant buffer for user clip planes
-  struct ClipPlaneConstants {
+    // User clip planes. Also read by the GLSL tessellation helpers in
+    // xenos_draw.glsli at fixed std140 offsets, guarded by the static_assert
+    // below.
     float user_clip_planes[6][4];
+    // Tessellation factor range: [0] = min, [1] = max. 1.0 is added on the CPU
+    // per Xbox 360 docs. fractional_even partitioning needs min >= 2.0.
+    float tessellation_factor_range[2];
+    float tessellation_padding0[2];
+    uint32_t tessellation_vertex_index_endian;
+    uint32_t tessellation_vertex_index_offset;
+    uint32_t tessellation_vertex_index_min_max[2];
+
+    // Ucode interpreter VS placeholder. Guest VS ucode location in shared
+    // memory as a dword address, and its control-flow instruction count. Zero
+    // unless the interpreter is bound for this draw. Appended after the
+    // tessellation tail so the static_assert offsets above are unaffected.
+    // Read as std140 uint4 [34].xy by ucode_interpreter.vs.slang.
+    uint32_t interpreter_ucode_base_dwords;
+    uint32_t interpreter_cf_instr_count;
+    uint32_t texture_integer_scale_pad[2];
+
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed.
+    // Zero means no scale.
+    // Appended at the very tail (std140 uint4 [35]) so it disturbs neither the
+    // xenos_draw.glsli tessellation offsets nor the interpreter [34] slot.
+    uint32_t texture_integer_scale_bits[32];
   };
 
-  // Separate constant buffer for tessellation parameters.
-  // Must match the layout in xenos_draw.glsli (std140).
-  struct TessellationConstants {
-    // Tessellation factor range: [0] = min, [1] = max.
-    // 1.0 is added on the CPU according to Xbox 360 tessellation documentation.
-    // For fractional_even partitioning, minimum factor must be >= 2.0.
-    float tessellation_factor_range[2];
-    // Padding to align next member to 8 bytes (std140 rules).
-    float padding0[2];
-    // Vertex/index processing parameters.
-    uint32_t vertex_index_endian;
-    uint32_t vertex_index_offset;
-    uint32_t vertex_index_min_max[2];
-  };
+  // xenos_draw.glsli reads these tessellation fields from the system constants
+  // UBO at these fixed std140 offsets. Keep them in sync.
+  static_assert(
+      offsetof(SystemConstants, tessellation_factor_range) == 512 &&
+          offsetof(SystemConstants, tessellation_vertex_index_endian) == 528 &&
+          offsetof(SystemConstants, tessellation_vertex_index_offset) == 532 &&
+          offsetof(SystemConstants, tessellation_vertex_index_min_max) == 536,
+      "Keep xenos_draw.glsli tessellation offsets in sync with "
+      "SystemConstants");
 
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
@@ -308,8 +365,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kConstantBufferFloatPixel,
     kConstantBufferBoolLoop,
     kConstantBufferFetch,
-    kConstantBufferClipPlanes,
-    kConstantBufferTessellation,
 
     kConstantBufferCount,
   };
@@ -396,23 +451,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool demote_to_helper_invocation;
 
     bool fragment_shader_barycentric;
+
+    bool allow_float_contraction = false;
   };
 
-  SpirvShaderTranslator(
-      const Features& features, bool native_2x_msaa_with_attachments,
-      bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
-      uint32_t draw_resolution_scale_x = 1,
-      uint32_t draw_resolution_scale_y = 1,
-      ui::vulkan::SpirvToolsContext* spirv_tools_context = nullptr,
-      bool spirv_optimize = true)
+  SpirvShaderTranslator(const Features& features,
+                        bool native_2x_msaa_with_attachments,
+                        bool native_2x_msaa_no_attachments,
+                        bool edram_fragment_shader_interlock,
+                        uint32_t draw_resolution_scale_x = 1,
+                        uint32_t draw_resolution_scale_y = 1)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y),
-        spirv_tools_context_(spirv_tools_context),
-        spirv_optimize_(spirv_optimize) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y) {}
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -420,6 +474,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
           Shader::HostVertexShaderType::kVertex) const override;
   uint64_t GetDefaultPixelShaderModification(
       uint32_t dynamic_addressable_register_count) const override;
+
+  // Feature set the translator emits for, so host helper shaders (e.g. the
+  // built-in geometry shader) can match the SPIR-V version and float controls.
+  const Features& features() const { return features_; }
 
   static constexpr uint32_t GetSharedMemoryStorageBufferCountLog2(
       uint32_t max_storage_buffer_range) {
@@ -438,7 +496,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // Creates a special fragment shader without color outputs - this resets the
   // state of the translator.
-  std::vector<uint8_t> CreateDepthOnlyFragmentShader();
+  // Creates a synthetic depth-only fragment shader. When depth_stencil_mode is
+  // a float24 mode, the shader reads gl_FragCoord.z, converts to float24, and
+  // writes the result to gl_FragDepth - matching the substitute pixel shader
+  // the DXBC backend uses when a guest draw has no pixel shader.
+  std::vector<uint8_t> CreateDepthOnlyFragmentShader(
+      Modification::DepthStencilMode depth_stencil_mode =
+          Modification::DepthStencilMode::kNoModifiers);
 
   // Common functions useful not only for the translator, but also for EDRAM
   // emulation via conventional render targets.
@@ -472,6 +536,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
                                uint32_t f24_shift, bool remap_to_0_to_0_5,
                                bool result_as_uint,
                                spv::Id ext_inst_glsl_std_450);
+  // Piecewise-linear gamma conversions for k_8_8_8_8_GAMMA render targets
+  // stored as linear in a higher-precision host format. value may be a float
+  // scalar or a vector of up to 3 components. If not pre_saturated, the input
+  // is clamped to [0, 1] (flushing NaN to 0).
+  static spv::Id PWLGammaToLinear(SpirvBuilder& builder, spv::Id value,
+                                  bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
+  static spv::Id LinearToPWLGamma(SpirvBuilder& builder, spv::Id value,
+                                  bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
 
  protected:
   void Reset() override;
@@ -546,6 +620,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
            GetSpirvShaderModification().vertex.host_vertex_shader_type ==
                Shader::HostVertexShaderType::kMemExportCompute;
   }
+  bool IsSpirvRectListAsTriangleStrip() const {
+    return IsSpirvVertexShader() &&
+           GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+  }
 
   bool IsExecutionModeEarlyFragmentTests() const {
     return is_pixel_shader() &&
@@ -553,6 +632,45 @@ class SpirvShaderTranslator : public ShaderTranslator {
                Modification::DepthStencilMode::kEarlyHint &&
            !edram_fragment_shader_interlock_ &&
            current_shader().implicit_early_z_write_allowed();
+  }
+
+  // Whether the current non-FSI pixel shader should convert the depth to 20e4.
+  bool DSV_IsWritingFloat24Depth() const {
+    if (edram_fragment_shader_interlock_) {
+      return false;
+    }
+    Modification::DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    return depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24Truncating ||
+           depth_stencil_mode == Modification::DepthStencilMode::
+                                     kFloat24TruncatingPolygonOffset ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24Rounding ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
+  }
+  // Whether the current non-FSI pixel shader applies polygon offset via shader
+  // depth output instead of fixed function bias.
+  bool DSV_IsApplyingPolygonOffset() const {
+    if (edram_fragment_shader_interlock_) {
+      return false;
+    }
+    Modification::DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    return depth_stencil_mode ==
+               Modification::DepthStencilMode::kPolygonOffset ||
+           depth_stencil_mode == Modification::DepthStencilMode::
+                                     kFloat24TruncatingPolygonOffset ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
+  }
+  // Whether the shader runs at sample frequency - when converting depth to
+  // float24 from the rasterizer's own depth (not guest oDepth), each sample
+  // needs its own depth value for intersections to be antialiased.
+  bool IsSampleRate() const {
+    return is_pixel_shader() && DSV_IsWritingFloat24Depth() &&
+           !current_shader().writes_depth();
   }
 
   uint32_t GetModificationInterpolatorMask() const {
@@ -573,10 +691,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartVertexOrTessEvalShaderBeforeMain();
   void StartVertexOrTessEvalShaderInMain();
   void CompleteVertexOrTessEvalShaderInMain();
+  void ResetUcodeInvocationStateInMain();
+  void ResetVertexShaderInvocationStateInMain();
+  void WriteVertexIndexToRegister0(spv::Id vertex_index);
 
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
   void CompleteFragmentShaderInMain();
+
+  // Writes gl_FragDepth for FBO shaders that need explicit depth: guest oDepth,
+  // float24 conversion, or the host RT decal bias path.
+  void CompleteFragmentShader_DSV_DepthTo24Bit();
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.
@@ -647,6 +772,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // (RCP, RSQ, EXP, LOG, SQRT) that provide ~2^-21 relative error tolerance
   // instead of full IEEE-754 precision (equivalent to 21 vs 23 mantissa bits).
   spv::Id ReduceFloatPrecision(spv::Id value, uint32_t mantissa_bits);
+  // Pack/unpack two floats as Xbox 360 extended-range float16, where exponent
+  // 31 is a large finite value (up to +-131008), not Inf/NaN.
+  spv::Id PackFloat16x2ExtendedRange(spv::Id float2_value);
+  spv::Id UnpackFloat16x2ExtendedRange(spv::Id packed_uint);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition,
                  uint8_t memexport_eM_potentially_written_before);
@@ -742,6 +871,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void FSI_DepthStencilTest(spv::Id msaa_samples,
                             bool sample_mask_potentially_narrowed_previouly);
 
+  // Adds the surviving coverage MSAA counts from FSI to the active ZPD counter
+  // slot after final PS depth/stencil.
+  void FSI_AddPassedMSAASamplesToZPD();
+
   // Alpha to coverage helper - tests one sample.
   // coverage_out is modified to include this sample if it passes.
   void FSI_AlphaToMaskSample(bool initialize, uint32_t sample_index,
@@ -787,8 +920,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool native_2x_msaa_no_attachments_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
-  ui::vulkan::SpirvToolsContext* spirv_tools_context_;
-  bool spirv_optimize_;
 
   // For safety with different drivers (even though fragment shader interlock in
   // SPIR-V only has one control flow requirement - that both begin and end must
@@ -883,6 +1014,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   enum SystemConstantIndex : unsigned int {
     kSystemConstantFlags,
     kSystemConstantVertexIndexLoadAddress,
+    kSystemConstantVertexIndexCount,
     kSystemConstantVertexIndexEndian,
     kSystemConstantVertexBaseIndex,
     kSystemConstantNdcScale,
@@ -896,6 +1028,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantTexturesResolved,
     kSystemConstantAlphaTestReference,
     kSystemConstantAlphaToMask,
+    kSystemConstantZpdFsiCounterIndex,
     kSystemConstantEdram32bppTilePitchDwordsScaled,
     kSystemConstantEdramDepthBaseDwordsScaled,
     kSystemConstantColorExpBias,
@@ -913,15 +1046,23 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantUserClipPlanes,
+    kSystemConstantTessellationFactorRange,
+    kSystemConstantTessellationVertexIndexEndian,
+    kSystemConstantTessellationVertexIndexOffset,
+    kSystemConstantTessellationVertexIndexMinMax,
+    kSystemConstantInterpreterUcodeBaseDwords,
+    kSystemConstantInterpreterCfInstrCount,
+    kSystemConstantTextureIntegerScaleBits,
   };
   spv::Id uniform_system_constants_;
-  spv::Id uniform_clip_plane_constants_;
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;
 
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
+  spv::Id buffer_zpd_fsi_counter_;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
@@ -932,8 +1073,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // VS as VS only - int.
   spv::Id input_vertex_index_;
-  // VS as TES only - int.
-  spv::Id input_primitive_id_;
+  // VS as TES only - per-control-point float array carrying the patch/control
+  // point index computed by the host vertex and hull shaders.
+  spv::Id input_control_point_index_;
   // VS as TES only - float3 (barycentric coordinates).
   spv::Id input_tess_coord_;
   // PS, only when needed - float2.
@@ -980,6 +1122,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
   unsigned int output_per_vertex_clip_distance_member_index_ = 0;
   unsigned int output_per_vertex_cull_distance_member_index_ = 0;
 
+  // VS, only for HostVertexShaderType::kRectangleListAsTriangleStrip.
+  bool main_vertex_rect_list_as_triangle_strip_ = false;
+  // uint (lower 2 bits of the expanded host vertex index).
+  spv::Id var_main_rect_list_strip_vertex_;
+  // int3 (guest indices for the 3 rectangle vertices after base addition).
+  spv::Id var_main_rect_list_guest_vertex_indices_;
+  // float4[3] (guest clip-space positions for the 3 rectangle vertices).
+  spv::Id var_main_rect_list_guest_positions_;
+  // For used interpolators only: float4[3].
+  std::array<spv::Id, xenos::kMaxInterpolators>
+      var_main_rect_list_guest_interpolators_;
+
   // Function-scoped variables for fragment color data.
   // Used by both FSI and FBO paths so that color values can be read back
   // (e.g., for alpha test). For FBO, these are copied to output_fragment_data_
@@ -992,10 +1146,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // output_or_var_fragment_data_.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
 
-  // Fragment shader depth output (gl_FragDepth).
-  // With fragment shader interlock, a variable in the main function.
-  // Otherwise, the depth output (only created if shader writes depth).
+  // Function-scoped staging variable for guest oDepth writes. Used by both
+  // FSI (which writes the value to the EDRAM buffer inside the interlock)
+  // and FBO (copied to output_fragment_depth_ at the end of the shader,
+  // remapping guest 0...1 to host 0...0.5 when the depth format is float24).
   spv::Id output_or_var_fragment_depth_;
+
+  // FBO only: actual gl_FragDepth Output.
+  // Written at the end of the pixel shader from output_or_var_fragment_depth_.
+  spv::Id output_fragment_depth_;
+  // Raster depth and derivatives captured early for the host RT decal path.
+  spv::Id main_fbo_depth_unbiased_;
+  std::array<spv::Id, 2> main_fbo_depth_derivatives_;
 
   // Fragment shader sample mask output (gl_SampleMask).
   // Only used for alpha-to-coverage in non-FSI mode.
@@ -1018,6 +1180,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // `base + index * stride` in dwords from the last vfetch_full as it may be
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
+  // Exclusive end (base + size) in dwords of the last vfetch_full's buffer, for
+  // clamping out-of-bounds words to 0 in both it and its vfetch_mini - int.
+  spv::Id var_main_vfetch_bound_;
   // float.
   spv::Id var_main_tfetch_lod_;
   // float3.
@@ -1081,6 +1246,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Block* main_loop_continue_;
   spv::Block* main_loop_merge_;
   spv::Id main_loop_pc_next_;
+  // VS only, for HostVertexShaderType::kRectangleListAsTriangleStrip.
+  spv::Block* main_rect_list_loop_header_;
+  spv::Block* main_rect_list_loop_continue_;
+  spv::Block* main_rect_list_loop_merge_;
+  // int (0..2), OpPhi in main_rect_list_loop_header_.
+  spv::Id main_rect_list_loop_vertex_index_;
+  // int, produced in main_rect_list_loop_continue_ and consumed by the OpPhi in
+  // main_rect_list_loop_header_.
+  spv::Id main_rect_list_loop_vertex_index_next_;
   spv::Block* main_switch_header_;
   std::unique_ptr<spv::Instruction> main_switch_op_;
   spv::Block* main_switch_merge_;

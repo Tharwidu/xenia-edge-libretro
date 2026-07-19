@@ -111,23 +111,25 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
   }
 
   // Check if the address with the correct sign and exponent was written, and
-  // that the index doesn't overflow the mantissa bits.
-  // all((eA_vector >> uvec4(30, 23, 23, 23)) == uvec4(0x1, 0x96, 0x96, 0x96))
+  // that the index doesn't overflow the mantissa bits. Z takes all 12 bits of
+  // const_0x4b0 rather than the top 9, so the constants the shader accepts
+  // match the ones draw_util::AddMemExportRanges derives ranges from.
+  // all((eA_vector >> uvec4(30, 23, 20, 23)) == uvec4(0x1, 0x96, 0x4B0, 0x96))
   spv::Id eA_vector = builder_->createUnaryOp(
       spv::OpBitcast, type_uint4_,
       builder_->createLoad(var_main_memexport_address_, spv::NoPrecision));
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeUintConstant(30));
   id_vector_temp_.push_back(builder_->makeUintConstant(23));
-  id_vector_temp_.push_back(id_vector_temp_.back());
-  id_vector_temp_.push_back(id_vector_temp_.back());
+  id_vector_temp_.push_back(builder_->makeUintConstant(20));
+  id_vector_temp_.push_back(builder_->makeUintConstant(23));
   spv::Id address_validation_shift =
       builder_->makeCompositeConstant(type_uint4_, id_vector_temp_);
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeUintConstant(0x1));
   id_vector_temp_.push_back(builder_->makeUintConstant(0x96));
-  id_vector_temp_.push_back(id_vector_temp_.back());
-  id_vector_temp_.push_back(id_vector_temp_.back());
+  id_vector_temp_.push_back(builder_->makeUintConstant(0x4B0));
+  id_vector_temp_.push_back(builder_->makeUintConstant(0x96));
   spv::Id address_validation_value =
       builder_->makeCompositeConstant(type_uint4_, id_vector_temp_);
   SpirvBuilder::IfBuilder if_address_valid(
@@ -650,7 +652,8 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
     add_format_case(fixed16_packed, 3);
   }
 
-  // TODO(Triang3l): Use the extended range float16 conversion.
+  // Xbox 360 float16 uses extended range: exponent 31 is a large finite value,
+  // not Inf/NaN. See PackFloat16x2ExtendedRange.
 
   // k_16_FLOAT
   format_switch.makeBeginCase(
@@ -662,8 +665,7 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
       id_vector_temp_.push_back(builder_->createCompositeExtract(
           eM_swapped[eM_index], type_float_, 0));
       id_vector_temp_.push_back(const_float_0_);
-      spv::Id format_packed_16_float_x = builder_->createUnaryBuiltinCall(
-          type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
+      spv::Id format_packed_16_float_x = PackFloat16x2ExtendedRange(
           builder_->createCompositeConstruct(type_float2_, id_vector_temp_));
       id_vector_temp_.clear();
       id_vector_temp_.resize(4, const_uint_0_);
@@ -683,11 +685,10 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
       uint_vector_temp_.clear();
       uint_vector_temp_.push_back(0);
       uint_vector_temp_.push_back(1);
-      spv::Id format_packed_16_16_float_xy = builder_->createUnaryBuiltinCall(
-          type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
-          builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_,
-                                        eM_swapped[eM_index],
-                                        uint_vector_temp_));
+      spv::Id format_packed_16_16_float_xy =
+          PackFloat16x2ExtendedRange(builder_->createRvalueSwizzle(
+              spv::NoPrecision, type_float2_, eM_swapped[eM_index],
+              uint_vector_temp_));
       id_vector_temp_.clear();
       id_vector_temp_.resize(4, const_uint_0_);
       id_vector_temp_.front() = format_packed_16_16_float_xy;
@@ -710,11 +711,9 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
         uint_vector_temp_.push_back(2 * component_index);
         uint_vector_temp_.push_back(2 * component_index + 1);
         format_packed_16_16_16_16_float_xy_zw[component_index] =
-            builder_->createUnaryBuiltinCall(
-                type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
-                builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_,
-                                              eM_swapped[eM_index],
-                                              uint_vector_temp_));
+            PackFloat16x2ExtendedRange(builder_->createRvalueSwizzle(
+                spv::NoPrecision, type_float2_, eM_swapped[eM_index],
+                uint_vector_temp_));
       }
       id_vector_temp_.clear();
       id_vector_temp_.push_back(format_packed_16_16_16_16_float_xy_zw[0]);

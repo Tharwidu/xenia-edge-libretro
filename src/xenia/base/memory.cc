@@ -32,6 +32,7 @@ bool IsWritableExecutableMemoryPreferred() {
 
 using xe::swcache::CacheLine;
 
+#if XE_ARCH_AMD64
 static constexpr unsigned NUM_CACHELINES_IN_PAGE = 4096 / sizeof(CacheLine);
 
 #if defined(__clang__)
@@ -218,6 +219,13 @@ void vastcpy(uint8_t* XE_RESTRICT physaddr, uint8_t* XE_RESTRICT rdmapping,
   return vastcpy_dispatch((CacheLine*)physaddr, (CacheLine*)rdmapping,
                           written_length);
 }
+#else   // !XE_ARCH_AMD64
+XE_NOINLINE
+void vastcpy(uint8_t* XE_RESTRICT physaddr, uint8_t* XE_RESTRICT rdmapping,
+             uint32_t written_length) {
+  std::memcpy(physaddr, rdmapping, written_length);
+}
+#endif  // XE_ARCH_AMD64
 }  // namespace memory
 
 // TODO(benvanik): fancy AVX versions.
@@ -478,7 +486,7 @@ void copy_and_swap_16_unaligned(void* dst_ptr, const void* src_ptr,
   auto dst = reinterpret_cast<uint8_t*>(dst_ptr);
   auto src = reinterpret_cast<const uint8_t*>(src_ptr);
 
-  constexpr uint8x16_t tbl_idx =
+  const uint8x16_t tbl_idx =
       vcombine_u8(vcreate_u8(UINT64_C(0x0607040502030001)),
                   vcreate_u8(UINT64_C(0x0E0F0C0D0A0B0809)));
 
@@ -512,7 +520,7 @@ void copy_and_swap_32_unaligned(void* dst_ptr, const void* src_ptr,
   auto dst = reinterpret_cast<uint8_t*>(dst_ptr);
   auto src = reinterpret_cast<const uint8_t*>(src_ptr);
 
-  constexpr uint8x16_t tbl_idx =
+  const uint8x16_t tbl_idx =
       vcombine_u8(vcreate_u8(UINT64_C(0x405060700010203)),
                   vcreate_u8(UINT64_C(0x0C0D0E0F08090A0B)));
 
@@ -544,7 +552,7 @@ void copy_and_swap_64_unaligned(void* dst_ptr, const void* src_ptr,
   auto dst = reinterpret_cast<uint8_t*>(dst_ptr);
   auto src = reinterpret_cast<const uint8_t*>(src_ptr);
 
-  constexpr uint8x16_t tbl_idx =
+  const uint8x16_t tbl_idx =
       vcombine_u8(vcreate_u8(UINT64_C(0x0001020304050607)),
                   vcreate_u8(UINT64_C(0x08090A0B0C0D0E0F)));
 

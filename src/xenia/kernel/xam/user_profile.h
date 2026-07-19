@@ -78,8 +78,13 @@ enum class XTileType {
 inline const std::map<XTileType, std::string> kTileFileNames = {
     {XTileType::kGamerTile, "tile_64.png"},
     {XTileType::kGamerTileSmall, "tile_32.png"},
-    {XTileType::kPersonalGamerTile, "tile_64.png"},
-    {XTileType::kPersonalGamerTileSmall, "tile_32.png"},
+    {XTileType::kLocalGamerTile, "tile_64.png"},
+    {XTileType::kLocalGamerTileSmall, "tile_32.png"},
+    {XTileType::kAwardedGamerTile, "64_{:08x}{:08x}{:08x}.png"},
+    {XTileType::kAwardedGamerTileSmall, "32_{:08x}{:08x}{:08x}.png"},
+    {XTileType::kGamerTileByImageId, "{:d}_{:08x}{:08x}{:08x}.png"},
+    {XTileType::kPersonalGamerTile, "pp_64.png"},
+    {XTileType::kPersonalGamerTileSmall, "pp_32.png"},
     {XTileType::kAvatarGamerTile, "avtr_64.png"},
     {XTileType::kAvatarGamerTileSmall, "avtr_32.png"},
 };
@@ -123,6 +128,10 @@ class UserProfile {
   };
   bool IsLiveEnabled() const { return account_info_.IsLiveEnabled(); }
 
+  void ClearProfileIcon(XTileType icon_type) {
+    profile_images_.erase(icon_type);
+  }
+
   std::span<const uint8_t> GetProfileIcon(XTileType icon_type) {
     // First check if the requested type exists
     if (profile_images_.find(icon_type) != profile_images_.cend()) {
@@ -155,19 +164,6 @@ class UserProfile {
 
   // Public accessor for dashboard GPD (for getting title paths)
   const GpdInfoProfile& dashboard_gpd() const { return dashboard_gpd_; }
-
-  // Helper for setting disc labels
-  void SetDiscLabel(uint32_t title_id, const std::filesystem::path& path,
-                    const std::string& label) {
-    dashboard_gpd_.SetDiscLabel(title_id, path, label);
-    WriteGpd(kDashboardID);
-  }
-
-  // Helper for removing disc paths
-  void RemoveDiscPath(uint32_t title_id, const std::filesystem::path& path) {
-    dashboard_gpd_.RemoveDiscPath(title_id, path);
-    WriteGpd(kDashboardID);
-  }
 
   // Public accessor for getting title icon from title GPD
   std::vector<uint8_t> GetTitleIcon(uint32_t title_id) const {

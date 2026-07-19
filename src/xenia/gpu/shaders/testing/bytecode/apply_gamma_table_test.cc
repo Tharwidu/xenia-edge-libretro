@@ -19,13 +19,13 @@
 typedef uint8_t BYTE;
 #endif
 
-// Include DXBC bytecode
+// Include DXIL bytecode (apply_gamma_table.cs migrated to Slang).
 #define apply_gamma_table_cs apply_gamma_table_cs_dxbc
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/apply_gamma_table_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/apply_gamma_table_cs.h"
 #undef apply_gamma_table_cs
 
 #define apply_gamma_table_fxaa_luma_cs apply_gamma_table_fxaa_luma_cs_dxbc
-#include "xenia/gpu/shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_dxil/apply_gamma_table_fxaa_luma_cs.h"
 #undef apply_gamma_table_fxaa_luma_cs
 
 // Include SPIR-V bytecode
@@ -49,7 +49,9 @@ static float Half2Float(uint16_t h) {
   uint32_t frac = (h & 0x03FF);
 
   if (exp == 0) {
-    if (frac == 0) return 0.0f;  // Zero
+    if (frac == 0) {
+      return 0.0f;  // Zero
+    }
     // Denormalized
     exp = 1;
     while ((frac & 0x0400) == 0) {

@@ -78,7 +78,7 @@ bool TraceViewer::OnInitialize() {
     file_picker->set_title("Select Trace File");
     file_picker->set_extensions({
         {"Supported Files", "*.xtr"},
-        {"All Files (*.*)", "*.*"},
+        {"All Files", "*"},
     });
     if (file_picker->Show()) {
       auto selected_files = file_picker->selected_files();
@@ -1763,8 +1763,8 @@ void TraceViewer::DrawStateUI() {
             regs.GetVertexFetch(vertex_binding.fetch_constant);
         assert_true(fetch.endian == xenos::Endian::k8in32);
         char tree_root_id[32];
-        sprintf(tree_root_id, "#vertices_root_%d",
-                vertex_binding.fetch_constant);
+        snprintf(tree_root_id, sizeof(tree_root_id), "#vertices_root_%d",
+                 vertex_binding.fetch_constant);
         if (ImGui::TreeNode(tree_root_id, "vf%d: 0x%.8X (%db), %s",
                             vertex_binding.fetch_constant, fetch.address << 2,
                             fetch.size * 4,

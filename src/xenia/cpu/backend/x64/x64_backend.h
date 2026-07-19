@@ -128,6 +128,8 @@ class X64Backend : public Backend {
   X64CodeCache* code_cache() const { return code_cache_.get(); }
   uintptr_t emitter_data() const { return emitter_data_; }
 
+  std::string name() const override { return "x64"; }
+
   // Call a generated function, saving all stack parameters.
   HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
   // Function that guest code can call to transition into host code.
@@ -179,6 +181,17 @@ class X64Backend : public Backend {
   virtual void FreeGuestTrampoline(uint32_t trampoline_addr) override;
   virtual void SetGuestRoundingMode(void* ctx, unsigned int mode) override;
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) override;
+
+  bool trace_instr_available() const override;
+  bool trace_data_available() const override;
+  bool trace_func_available() const override;
+  bool trace_instr_enabled() const override;
+  void set_trace_instr_enabled(bool value) override;
+  bool trace_data_enabled() const override;
+  void set_trace_data_enabled(bool value) override;
+  bool trace_func_enabled() const override;
+  void set_trace_func_enabled(bool value) override;
+
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
   uint32_t LookupXMMConstantAddress32(unsigned index) {
@@ -228,6 +241,7 @@ class X64Backend : public Backend {
   // range that will be used to dispatch to host code
   BitMap guest_trampoline_address_bitmap_;
   uint8_t* guest_trampoline_memory_;
+  bool guest_trampolines_sub4gb_ = false;
 };
 
 }  // namespace x64

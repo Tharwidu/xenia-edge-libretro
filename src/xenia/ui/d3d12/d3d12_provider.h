@@ -52,6 +52,10 @@ class D3D12Provider : public GraphicsProvider {
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
+  // Logs Device Removed Extended Data (breadcrumbs and page-fault allocations)
+  // after a device removal. Only produces data when started with --d3d12_dred.
+  void DumpDeviceRemovedData() const;
+
   uint32_t GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const {
     return descriptor_sizes_[type];
   }
@@ -114,6 +118,7 @@ class D3D12Provider : public GraphicsProvider {
   bool AreRasterizerOrderedViewsSupported() const {
     return rasterizer_ordered_views_supported_;
   }
+  bool AreBarycentricsSupported() const { return barycentrics_supported_; }
   D3D12_RESOURCE_BINDING_TIER GetResourceBindingTier() const {
     return resource_binding_tier_;
   }
@@ -126,6 +131,11 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t GetVirtualAddressBitsPerResource() const {
     return virtual_address_bits_per_resource_;
   }
+  // Returns true if Shader Model 6.6 is supported (required for SM 6.6 DXIL).
+  bool IsShaderModel66Supported() const {
+    return highest_shader_model_ >= 0x66;
+  }
+  uint16_t GetHighestShaderModel() const { return highest_shader_model_; }
 
   // Proxies for DirectX functions since they are loaded dynamically.
   HRESULT SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc,
@@ -192,6 +202,11 @@ class D3D12Provider : public GraphicsProvider {
   HMODULE library_dxcompiler_ = nullptr;
   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
 
+  // Pre-loaded by full path so dxcompiler.dll's own plain-name load of dxil.dll
+  // resolves to the copy in the D3D12 folder. May be nullptr (system-wide
+  // dxil.dll, if any, still resolves on dxcompiler's own).
+  HMODULE library_dxil_ = nullptr;
+
   IDXGIFactory2* dxgi_factory_ = nullptr;
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
@@ -210,7 +225,9 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t virtual_address_bits_per_resource_;
   bool ps_specified_stencil_reference_supported_;
   bool rasterizer_ordered_views_supported_;
+  bool barycentrics_supported_;
   bool unaligned_block_textures_supported_;
+  uint16_t highest_shader_model_;
 };
 
 }  // namespace d3d12

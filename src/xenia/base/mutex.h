@@ -15,7 +15,7 @@
 #include "platform.h"
 #if XE_PLATFORM_WIN32
 #include "platform_win.h"
-#elif XE_PLATFORM_LINUX
+#else
 #include <sys/types.h>
 #endif
 #include "memory.h"
@@ -143,7 +143,9 @@ class xe_unlikely_mutex {
 #if XE_ARCH_AMD64 == 1
       _mm_pause();
 #endif
-      if (_tryget()) return;
+      if (_tryget()) {
+        return;
+      }
     }
     // Fall back to yielding
     while (!_tryget()) {

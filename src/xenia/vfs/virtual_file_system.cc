@@ -66,6 +66,15 @@ Device* VirtualFileSystem::GetDevice(const std::string_view path) {
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();
+  auto it = std::find_if(
+      symlinks_.cbegin(), symlinks_.cend(),
+      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  if (it != symlinks_.end()) {
+    XELOGE("Trying to re-register already registered symbolic link: {} => {}",
+           path, target);
+    return false;
+  }
+
   symlinks_.insert({std::string(path), std::string(target)});
   XELOGD("Registered symbolic link: {} => {}", path, target);
 
@@ -84,6 +93,14 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 
   symlinks_.erase(it);
   return true;
+}
+
+bool VirtualFileSystem::IsSymbolicLinkRegistered(const std::string_view path) {
+  auto it = std::find_if(
+      symlinks_.cbegin(), symlinks_.cend(),
+      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+
+  return it != symlinks_.cend();
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path,
@@ -119,6 +136,25 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path,
   return was_resolved;
 }
 
+namespace {
+
+// A mount path matches only on a whole path component. Without this a device
+// mounted at ...\Content also swallows ...\Content_Eng.
+bool MountPathMatches(const std::string_view path,
+                      const std::string_view mount_path) {
+  if (mount_path.empty() || !xe::utf8::starts_with_case(path, mount_path)) {
+    return false;
+  }
+  // Mounts ending in a delimiter already sit on a component boundary.
+  const char last = mount_path.back();
+  if (last == '\\' || last == ':') {
+    return true;
+  }
+  return path.size() == mount_path.size() || path[mount_path.size()] == '\\';
+}
+
+}  // namespace
+
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -131,12 +167,17 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it =
-      std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-        return xe::utf8::starts_with_case(normalized_path, d->mount_path());
-      });
-  if (it == devices_.cend()) {
+  // Find the device with the longest matching mount path. Devices nest, e.g.
+  // \Device\Harddisk0\Partition1\Content lives inside \Device\Harddisk0, so the
+  // most specific mount must win regardless of registration order.
+  Device* device = nullptr;
+  for (const auto& d : devices_) {
+    if (MountPathMatches(normalized_path, d->mount_path()) &&
+        (!device || d->mount_path().size() > device->mount_path().size())) {
+      device = d.get();
+    }
+  }
+  if (!device) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
@@ -145,7 +186,6 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
   return device->ResolvePath(relative_path);
 }
@@ -223,7 +263,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
                                : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_NO_SUCH_FILE;
+      return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     auto file_name = xe::utf8::find_name_from_guest_path(path);
@@ -239,11 +279,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
     // If the entry does not exist on the host then remove the cached entry
     if (parent_entry) {
-      const xe::vfs::HostPathEntry* host_Path =
+      const xe::vfs::HostPathEntry* host_path =
           dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
 
-      if (host_Path) {
-        auto const file_path = host_Path->host_path() / entry->name();
+      if (host_path) {
+        auto const file_path = host_path->host_path() / entry->name();
 
         if (!std::filesystem::exists(file_path)) {
           // Remove cached entry
@@ -261,7 +301,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
-        return X_STATUS_NO_SUCH_FILE;
+        return X_STATUS_OBJECT_NAME_NOT_FOUND;
       }
       break;
     case FileDisposition::kCreate:
@@ -344,7 +384,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
 X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
                                                std::filesystem::path base_path,
-                                               uint64_t& progress,
+                                               std::atomic<uint64_t>& progress,
                                                bool extract_to_root) {
   // Allocate a buffer when needed.
   size_t buffer_size = 0;
@@ -421,8 +461,8 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
 }
 
 X_STATUS VirtualFileSystem::ExtractContentFiles(
-    Device* device, std::filesystem::path base_path, uint64_t& progress,
-    std::function<bool()> should_cancel) {
+    Device* device, std::filesystem::path base_path,
+    std::atomic<uint64_t>& progress, std::function<bool()> should_cancel) {
   // Run through all the files, breadth-first style.
   std::queue<vfs::Entry*> queue;
   auto root = device->ResolvePath("/");

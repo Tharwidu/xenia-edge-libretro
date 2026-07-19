@@ -507,13 +507,31 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   if (path_ == Path::kHostRenderTargets) {
     // Host render targets.
 
-    // TODO(Triang3l): When color space conversion is implemented in the
-    // ownership transfer and resolve dump shaders, allow
-    // `gamma_render_target_as_unorm16` if VK_FORMAT_R16G16B16A16_UNORM supports
-    // the SAMPLED_IMAGE | COLOR_ATTACHMENT | COLOR_ATTACHMENT_BLEND features.
-    gamma_render_target_as_unorm16_ = false;
+    // Store k_8_8_8_8_GAMMA as linear in R16G16B16A16_UNORM for conceptually
+    // correct blending in linear color space, with the linear <-> gamma color
+    // space conversion done in the pixel shader output, ownership transfer,
+    // resolve dump and clear paths. Requires the format to be usable as a
+    // blendable color attachment and as a sampled image (for transfers/dumps).
+    constexpr VkFormatFeatureFlags kGammaUnorm16Features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+    VkFormatProperties gamma_unorm16_properties;
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device,
+                                            VK_FORMAT_R16G16B16A16_UNORM,
+                                            &gamma_unorm16_properties);
+    gamma_render_target_as_unorm16_ =
+        cvars::gamma_render_target_as_unorm16 &&
+        (gamma_unorm16_properties.optimalTilingFeatures &
+         kGammaUnorm16Features) == kGammaUnorm16Features;
 
     depth_float24_round_ = cvars::depth_float24_round;
+    // In-PS conversion requires per-sample shading under MSAA for intersections
+    // to antialias; without sampleRateShading, fall back to transfer-time
+    // conversion so the host/PS encoding stays consistent across all draws.
+    depth_float24_convert_in_pixel_shader_ =
+        cvars::depth_float24_convert_in_pixel_shader &&
+        device_properties.sampleRateShading;
 
     // Host depth storing pipeline layout.
     VkDescriptorSetLayout host_depth_store_descriptor_set_layouts[] = {
@@ -720,8 +738,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // Piecewise linear gamma is 8-bit with programmable blending.
     gamma_render_target_as_unorm16_ = false;
 
-    // Always true float24 depth rounded to the nearest even.
+    // Always true float24 depth rounded to the nearest even, converted in the
+    // shader (FSI ignores depth_float24_convert_in_pixel_shader, but set it for
+    // parity with the host render target path).
     depth_float24_round_ = true;
+    depth_float24_convert_in_pixel_shader_ = true;
 
     // The pipeline layout and the pipelines for clearing the EDRAM buffer in
     // resolves.
@@ -1097,12 +1118,20 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
-        // TODO(Triang3l): Use a single 512 MB shared memory binding if
-        // possible.
+        // Bind the whole shared memory buffer persistently when possible
+        // (passing the destination byte offset via dest_base) instead of
+        // allocating and writing a per-resolve descriptor. Scaled resolves
+        // write to separate scaled buffers, so they use transient descriptors.
+        const bool use_persistent_dest =
+            texture_cache.shared_memory_persistent_descriptor_set() !=
+                VK_NULL_HANDLE &&
+            !draw_resolution_scaled;
         VkDescriptorSet descriptor_set_dest =
-            command_processor_.AllocateSingleTransientDescriptor(
-                VulkanCommandProcessor::SingleTransientDescriptorLayout ::
-                    kStorageBufferCompute);
+            use_persistent_dest
+                ? texture_cache.shared_memory_persistent_descriptor_set()
+                : command_processor_.AllocateSingleTransientDescriptor(
+                      VulkanCommandProcessor::SingleTransientDescriptorLayout ::
+                          kStorageBufferCompute);
         if (descriptor_set_dest != VK_NULL_HANDLE) {
           // Write the destination descriptor.
           VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
@@ -1169,7 +1198,7 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
             }
           }
 
-          if (!scaled_buffer_ready) {
+          if (!scaled_buffer_ready && !use_persistent_dest) {
             // Regular unscaled resolve - write to shared memory
             if (draw_resolution_scaled) {
               XELOGW(
@@ -1186,22 +1215,24 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 resolve_info.copy_dest_base +
                 resolve_info.copy_dest_extent_length;
           }
-          VkWriteDescriptorSet write_descriptor_set_dest;
-          write_descriptor_set_dest.sType =
-              VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-          write_descriptor_set_dest.pNext = nullptr;
-          write_descriptor_set_dest.dstSet = descriptor_set_dest;
-          write_descriptor_set_dest.dstBinding = 0;
-          write_descriptor_set_dest.dstArrayElement = 0;
-          write_descriptor_set_dest.descriptorCount = 1;
-          write_descriptor_set_dest.descriptorType =
-              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-          write_descriptor_set_dest.pImageInfo = nullptr;
-          write_descriptor_set_dest.pBufferInfo =
-              &write_descriptor_set_dest_buffer_info;
-          write_descriptor_set_dest.pTexelBufferView = nullptr;
-          dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0,
-                                     nullptr);
+          if (!use_persistent_dest) {
+            VkWriteDescriptorSet write_descriptor_set_dest;
+            write_descriptor_set_dest.sType =
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write_descriptor_set_dest.pNext = nullptr;
+            write_descriptor_set_dest.dstSet = descriptor_set_dest;
+            write_descriptor_set_dest.dstBinding = 0;
+            write_descriptor_set_dest.dstArrayElement = 0;
+            write_descriptor_set_dest.descriptorCount = 1;
+            write_descriptor_set_dest.descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write_descriptor_set_dest.pImageInfo = nullptr;
+            write_descriptor_set_dest.pBufferInfo =
+                &write_descriptor_set_dest_buffer_info;
+            write_descriptor_set_dest.pTexelBufferView = nullptr;
+            dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0,
+                                       nullptr);
+          }
 
           // Submit the resolve.
           if (!scaled_buffer_ready) {
@@ -1252,11 +1283,15 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 sizeof(copy_shader_constants.dest_relative),
                 &copy_shader_constants.dest_relative);
           } else {
-            // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
-            // memory binding, or multiple shared memory bindings in case of
+            // TODO(Triang3l): Multiple shared memory bindings in case of
             // splitting due to maxStorageBufferRange overflow.
-            copy_shader_constants.dest_base -=
-                uint32_t(write_descriptor_set_dest_buffer_info.offset);
+            if (!use_persistent_dest) {
+              // The descriptor is offset to the destination, so make dest_base
+              // relative to it. With the whole buffer bound persistently,
+              // dest_base stays the absolute byte offset.
+              copy_shader_constants.dest_base -=
+                  uint32_t(write_descriptor_set_dest_buffer_info.offset);
+            }
             command_buffer.CmdVkPushConstants(
                 resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
@@ -1325,8 +1360,14 @@ bool VulkanRenderTargetCache::Resolve(const Memory& memory,
                 clear_transfers_[1])) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
-          clear_values[1] = resolve_info.rb_color_clear |
-                            (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+          // For 64bpp formats, RB_COLOR_CLEAR_LO is the lower 32 bits of the
+          // packed clear value. RB_COLOR_CLEAR is the upper 32 bits and, for
+          // 32bpp formats, the whole value.
+          clear_values[1] =
+              resolve_info.color_edram_info.format_is_64bpp
+                  ? resolve_info.rb_color_clear_lo |
+                        (uint64_t(resolve_info.rb_color_clear) << 32)
+                  : resolve_info.rb_color_clear;
           PerformTransfersAndResolveClears(2, clear_render_targets,
                                            clear_transfers_, clear_values,
                                            &clear_rectangle);
@@ -1551,37 +1592,48 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
   RenderPassKey key = last_update_render_pass_key_;
   const RenderTarget* const* rts = last_update_accumulated_render_targets();
 
-  // Initialize depth/stencil attachments.
+  // Initialize depth/stencil attachments. Must match what pipeline creation
+  // declared (depthAttachmentFormat from key.depth_and_color_used bit 0); null
+  // RT still consumes the slot with imageView=VK_NULL_HANDLE.
   std::memset(depth_attachment, 0, sizeof(VkRenderingAttachmentInfo));
   std::memset(stencil_attachment, 0, sizeof(VkRenderingAttachmentInfo));
-
-  // Set up depth attachment if used.
-  if ((key.depth_and_color_used & 0b1) && rts[0]) {
-    const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[0]);
+  if (key.depth_and_color_used & 0b1) {
     depth_attachment->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_attachment->imageView = vulkan_rt->view_depth_stencil();
-    depth_attachment->imageLayout = VulkanRenderTarget::kDepthDrawLayout;
-    depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    // Stencil uses the same view for depth-stencil formats.
-    *stencil_attachment = *depth_attachment;
+    stencil_attachment->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    if (rts[0]) {
+      const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[0]);
+      depth_attachment->imageView = vulkan_rt->view_depth_stencil();
+      depth_attachment->imageLayout = VulkanRenderTarget::kDepthDrawLayout;
+      depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      // Stencil uses the same view for depth-stencil formats.
+      *stencil_attachment = *depth_attachment;
+    }
   }
 
-  // Set up color attachments.
+  // Set up color attachments. The slot count must match what pipeline creation
+  // declared (colorAttachmentCount from key.depth_and_color_used bits 1-4),
+  // otherwise the pipeline's FS may write a Location that has no destination
+  // and the result is undefined per the Vulkan spec - RADV hangs on this.
+  // Null RT entries get imageView=VK_NULL_HANDLE; writes to them are silently
+  // dropped per spec.
   uint32_t color_attachment_count = 0;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     VkRenderingAttachmentInfo& color_attachment = color_attachments[i];
     std::memset(&color_attachment, 0, sizeof(VkRenderingAttachmentInfo));
-    if ((key.depth_and_color_used & (1 << (1 + i))) && rts[1 + i]) {
-      const auto* vulkan_rt =
-          static_cast<const VulkanRenderTarget*>(rts[1 + i]);
-      color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-      color_attachment.imageView = vulkan_rt->view_depth_color();
-      color_attachment.imageLayout = VulkanRenderTarget::kColorDrawLayout;
-      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-      color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      color_attachment_count = i + 1;
+    if (!(key.depth_and_color_used & (1 << (1 + i)))) {
+      continue;
     }
+    color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment_count = i + 1;
+    if (!rts[1 + i]) {
+      continue;
+    }
+    const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[1 + i]);
+    color_attachment.imageView = vulkan_rt->view_depth_color();
+    color_attachment.imageLayout = VulkanRenderTarget::kColorDrawLayout;
+    color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   }
   *color_attachment_count_out = color_attachment_count;
 }
@@ -2066,12 +2118,14 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
     xenos::DepthRenderTargetFormat format) const {
-  // TODO(Triang3l): Conversion directly in shaders.
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
       return !depth_unorm24_vulkan_format_supported();
     case xenos::DepthRenderTargetFormat::kD24FS8:
-      return true;
+      // When converting in the pixel shader, the host float32 depth already
+      // holds float24-grid values, so it's the canonical encoding and the
+      // separate host depth tracking isn't needed.
+      return !depth_float24_convert_in_pixel_shader();
   }
   return false;
 }
@@ -2282,6 +2336,49 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
               .emplace(std::piecewise_construct, std::forward_as_tuple(key),
                        std::forward_as_tuple(framebuffer, host_extent))
               .first->second;
+}
+
+// Converts a raw 8-bit gamma-encoded byte (a uint scalar) to the midpoint of
+// its linear range. Used when a non-gamma EDRAM value is reinterpreted as
+// k_8_8_8_8_GAMMA for a linear unorm16 host render target. The midpoint, rather
+// than the exact lower edge produced by PWLGammaToLinear, keeps the value
+// safely inside the byte's range across the unorm16 quantization round-trip, so
+// a later linear -> gamma re-encode reproduces the original byte. Mirrors the
+// piecewise constants in the D3D12 render target cache.
+static spv::Id GammaByteToLinearMidpoint(SpirvBuilder& builder,
+                                         spv::Id byte_uint) {
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_bool = builder.makeBoolType();
+  // F = float(byte) * recip + offset, with the piece selected by the byte.
+  spv::Id recip = builder.makeFloatConstant(1.0f / 1023.0f);
+  spv::Id offset = builder.makeFloatConstant(0.5f / 1023.0f);
+  struct Piece {
+    uint32_t threshold;
+    float recip;
+    float offset;
+  };
+  static const Piece kPieces[] = {
+      {64, 1.0f / 511.5f, -31.5f / 511.5f},
+      {96, 1.0f / 255.75f, -63.5f / 255.75f},
+      {192, 1.0f / 127.875f, -127.5f / 127.875f},
+  };
+  for (const Piece& piece : kPieces) {
+    spv::Id in_piece =
+        builder.createBinOp(spv::OpUGreaterThanEqual, type_bool, byte_uint,
+                            builder.makeUintConstant(piece.threshold));
+    recip = builder.createTriOp(spv::OpSelect, type_float, in_piece,
+                                builder.makeFloatConstant(piece.recip), recip);
+    offset =
+        builder.createTriOp(spv::OpSelect, type_float, in_piece,
+                            builder.makeFloatConstant(piece.offset), offset);
+  }
+  return builder.createBinOp(
+      spv::OpFAdd, type_float,
+      builder.createBinOp(
+          spv::OpFMul, type_float,
+          builder.createUnaryOp(spv::OpConvertUToF, type_float, byte_uint),
+          recip),
+      offset);
 }
 
 VkShaderModule VulkanRenderTargetCache::GetTransferShader(
@@ -3254,6 +3351,21 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
       switch (source_color_format) {
         case xenos::ColorRenderTargetFormat::k_8_8_8_8:
         case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+          if (source_color_format ==
+              xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+            // Gamma source stores linear; encode RGB of both 32bpp samples to
+            // gamma bytes before packing into the 64bpp destination. Only
+            // loaded components are converted.
+            for (uint32_t i = 0; i < 2; ++i) {
+              for (uint32_t j = 0; j < 3; ++j) {
+                if (source_color[i][j] == spv::NoResult) {
+                  continue;
+                }
+                source_color[i][j] = SpirvShaderTranslator::LinearToPWLGamma(
+                    builder, source_color[i][j], true, ext_inst_glsl_std_450);
+              }
+            }
+          }
           spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
           spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
           spv::Id component_width = builder.makeUintConstant(8);
@@ -3454,8 +3566,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                builder, source_depth_float[i], depth_float24_round(), true,
-                ext_inst_glsl_std_450);
+                builder, source_depth_float[i],
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true, ext_inst_glsl_std_450);
           } break;
         }
         // Merge depth and stencil.
@@ -3522,15 +3636,45 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
               (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                dest_color_format ==
                    xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
-            // Same format - passthrough.
+            // Same byte layout - only a gamma color space conversion on RGB may
+            // be needed. The gamma resource format is stored as linear in the
+            // unorm16 host render target, so convert when exactly one side is
+            // gamma (alpha is never gamma-encoded).
             id_vector_temp.clear();
             for (uint32_t i = 0; i < 4; ++i) {
-              id_vector_temp.push_back(source_color[0][i]);
+              spv::Id component = source_color[0][i];
+              if (i < 3 && dest_color_format != source_color_format) {
+                if (dest_color_format ==
+                    xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                  // Gamma source (linear storage) -> plain dest (gamma bytes).
+                  component = SpirvShaderTranslator::LinearToPWLGamma(
+                      builder, component, true, ext_inst_glsl_std_450);
+                } else {
+                  // Plain source (gamma bytes) -> gamma dest (linear storage).
+                  component = SpirvShaderTranslator::PWLGammaToLinear(
+                      builder, component, true, ext_inst_glsl_std_450);
+                }
+              }
+              id_vector_temp.push_back(component);
             }
             builder.createStore(builder.createCompositeConstruct(
                                     type_fragment_data, id_vector_temp),
                                 output_fragment_data);
           } else {
+            if (source_color_format ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              // Gamma source stores linear; encode RGB to gamma bytes before
+              // packing into the raw 32bpp value reinterpreted by the
+              // differently-formatted destination. Only loaded components are
+              // converted (stencil bit output loads red only).
+              for (uint32_t j = 0; j < 3; ++j) {
+                if (source_color[0][j] == spv::NoResult) {
+                  continue;
+                }
+                source_color[0][j] = SpirvShaderTranslator::LinearToPWLGamma(
+                    builder, source_color[0][j], true, ext_inst_glsl_std_450);
+              }
+            }
             spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
             spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
             uint32_t packed_component_offset = 0;
@@ -3736,8 +3880,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             packed = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                builder, source_depth_float[0], depth_float24_round(), true,
-                ext_inst_glsl_std_450);
+                builder, source_depth_float[0],
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true, ext_inst_glsl_std_450);
           } break;
         }
         if (mode.output == TransferOutput::kDepth) {
@@ -3762,18 +3908,64 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8:
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-              spv::Id component_width = builder.makeUintConstant(8);
-              spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
-              id_vector_temp.clear();
-              for (uint32_t i = 0; i < 4; ++i) {
+              // Same-base 7e3 source -> decode the 7e3 floats to [0, 1] instead
+              // of bit-reinterpreting. See IsTransferValueConverted7e3And8888
+              // and the D3D12 TransferConvert7e3To8888.
+              if (key.value_convert && source_is_color &&
+                  (source_color_format ==
+                       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                   source_color_format ==
+                       xenos::ColorRenderTargetFormat::
+                           k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+                id_vector_temp.clear();
+                for (uint32_t i = 0; i < 3; ++i) {
+                  id_vector_temp.push_back(builder.createTriBuiltinCall(
+                      type_float, ext_inst_glsl_std_450, GLSLstd450NClamp,
+                      SpirvShaderTranslator::Float7e3To32(
+                          builder, packed, 10 * i, false,
+                          ext_inst_glsl_std_450),
+                      builder.makeFloatConstant(0.0f),
+                      builder.makeFloatConstant(1.0f)));
+                }
                 id_vector_temp.push_back(builder.createBinOp(
                     spv::OpFMul, type_float,
                     builder.createUnaryOp(
                         spv::OpConvertUToF, type_float,
-                        builder.createTriOp(
-                            spv::OpBitFieldUExtract, type_uint, packed,
-                            builder.makeUintConstant(8 * i), component_width)),
-                    unorm_scale));
+                        builder.createTriOp(spv::OpBitFieldUExtract, type_uint,
+                                            packed,
+                                            builder.makeUintConstant(30),
+                                            builder.makeUintConstant(2))),
+                    builder.makeFloatConstant(1.0f / 3.0f)));
+                builder.createStore(builder.createCompositeConstruct(
+                                        type_fragment_data, id_vector_temp),
+                                    output_fragment_data);
+                break;
+              }
+              // For a gamma destination stored as linear in unorm16, the raw
+              // EDRAM bytes are reinterpreted as gamma and decoded to the
+              // midpoint of each byte's linear range (alpha stays linear). The
+              // midpoint survives the unorm16 round-trip so a later re-encode
+              // reproduces the byte. Reaching the gamma format implies
+              // gamma_render_target_as_unorm16.
+              bool is_gamma = dest_color_format ==
+                              xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
+              spv::Id component_width = builder.makeUintConstant(8);
+              spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
+              id_vector_temp.clear();
+              for (uint32_t i = 0; i < 4; ++i) {
+                spv::Id byte_uint = builder.createTriOp(
+                    spv::OpBitFieldUExtract, type_uint, packed,
+                    builder.makeUintConstant(8 * i), component_width);
+                if (is_gamma && i < 3) {
+                  id_vector_temp.push_back(
+                      GammaByteToLinearMidpoint(builder, byte_uint));
+                } else {
+                  id_vector_temp.push_back(builder.createBinOp(
+                      spv::OpFMul, type_float,
+                      builder.createUnaryOp(spv::OpConvertUToF, type_float,
+                                            byte_uint),
+                      unorm_scale));
+                }
               }
               builder.createStore(builder.createCompositeConstruct(
                                       type_fragment_data, id_vector_temp),
@@ -3805,6 +3997,30 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+              if (key.value_convert && source_is_color &&
+                  source_color_format ==
+                      xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                // Reverse: 8_8_8_8 source -> unpack the unorm bytes to [0, 1].
+                // Matches the D3D12 TransferConvert8888To7e3.
+                spv::Id component_width = builder.makeUintConstant(8);
+                spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
+                id_vector_temp.clear();
+                for (uint32_t i = 0; i < 4; ++i) {
+                  id_vector_temp.push_back(builder.createBinOp(
+                      spv::OpFMul, type_float,
+                      builder.createUnaryOp(
+                          spv::OpConvertUToF, type_float,
+                          builder.createTriOp(spv::OpBitFieldUExtract,
+                                              type_uint, packed,
+                                              builder.makeUintConstant(8 * i),
+                                              component_width)),
+                      unorm_scale));
+                }
+                builder.createStore(builder.createCompositeConstruct(
+                                        type_fragment_data, id_vector_temp),
+                                    output_fragment_data);
+                break;
+              }
               id_vector_temp.clear();
               // Color.
               spv::Id width_rgb = builder.makeUintConstant(10);
@@ -4207,8 +4423,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
               } break;
               case xenos::DepthRenderTargetFormat::kD24FS8: {
                 host_depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
-                    builder, host_depth32, depth_float24_round(), true,
-                    ext_inst_glsl_std_450);
+                    builder, host_depth32,
+                    !depth_float24_convert_in_pixel_shader() &&
+                        depth_float24_round(),
+                    true, ext_inst_glsl_std_450);
               } break;
             }
             assert_true(host_depth24 != spv::NoResult);
@@ -5052,6 +5270,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format =
               source_rt_key.resource_format;
+          new_transfer_shader_key.value_convert =
+              IsTransferValueConverted7e3And8888(source_rt_key, dest_rt_key);
           bool host_depth_source_is_copy =
               host_depth_source_vulkan_rt == &dest_vulkan_rt;
           // The host depth copy buffer has only raw samples.
@@ -5555,6 +5775,15 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               resolve_clear_attachment.clearValue.color.float32[j] =
                   ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
             }
+            if (dest_rt_key.GetColorFormat() ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              // Stored as linear in the unorm16 host render target.
+              for (uint32_t j = 0; j < 3; ++j) {
+                resolve_clear_attachment.clearValue.color.float32[j] =
+                    xenos::PWLGammaToLinear(
+                        resolve_clear_attachment.clearValue.color.float32[j]);
+              }
+            }
           } break;
           case xenos::ColorRenderTargetFormat::k_2_10_10_10:
           case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
@@ -5949,8 +6178,9 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       } break;
       case xenos::DepthRenderTargetFormat::kD24FS8: {
         packed[0] = SpirvShaderTranslator::PreClampedDepthTo20e4(
-            builder, source_depth32, depth_float24_round(), true,
-            ext_inst_glsl_std_450);
+            builder, source_depth32,
+            !depth_float24_convert_in_pixel_shader() && depth_float24_round(),
+            true, ext_inst_glsl_std_450);
       } break;
     }
     packed[0] = builder.createQuadOp(
@@ -5960,19 +6190,34 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     switch (key.GetColorFormat()) {
       case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+        // k_8_8_8_8_GAMMA is stored as linear in the unorm16 host render
+        // target, so encode RGB linear -> gamma before packing (alpha stays
+        // linear). Reaching the gamma resource format implies
+        // gamma_render_target_as_unorm16.
+        bool is_gamma = key.GetColorFormat() ==
+                        xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
         spv::Id unorm_round_offset = builder.makeFloatConstant(0.5f);
         spv::Id unorm_scale = builder.makeFloatConstant(255.0f);
+        spv::Id source_red =
+            builder.createCompositeExtract(source_vec4, type_float, 0);
+        if (is_gamma) {
+          source_red = SpirvShaderTranslator::LinearToPWLGamma(
+              builder, source_red, true, ext_inst_glsl_std_450);
+        }
         packed[0] = builder.createUnaryOp(
             spv::OpConvertFToU, type_uint,
-            builder.createBinOp(
-                spv::OpFAdd, type_float,
-                builder.createBinOp(
-                    spv::OpFMul, type_float,
-                    builder.createCompositeExtract(source_vec4, type_float, 0),
-                    unorm_scale),
-                unorm_round_offset));
+            builder.createBinOp(spv::OpFAdd, type_float,
+                                builder.createBinOp(spv::OpFMul, type_float,
+                                                    source_red, unorm_scale),
+                                unorm_round_offset));
         spv::Id component_width = builder.makeUintConstant(8);
         for (uint32_t i = 1; i < 4; ++i) {
+          spv::Id source_component =
+              builder.createCompositeExtract(source_vec4, type_float, i);
+          if (is_gamma && i < 3) {
+            source_component = SpirvShaderTranslator::LinearToPWLGamma(
+                builder, source_component, true, ext_inst_glsl_std_450);
+          }
           packed[0] = builder.createQuadOp(
               spv::OpBitFieldInsert, type_uint, packed[0],
               builder.createUnaryOp(
@@ -5980,9 +6225,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
                   builder.createBinOp(
                       spv::OpFAdd, type_float,
                       builder.createBinOp(spv::OpFMul, type_float,
-                                          builder.createCompositeExtract(
-                                              source_vec4, type_float, i),
-                                          unorm_scale),
+                                          source_component, unorm_scale),
                       unorm_round_offset)),
               builder.makeUintConstant(8 * i), component_width);
         }

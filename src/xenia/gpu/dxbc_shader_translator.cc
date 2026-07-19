@@ -173,6 +173,7 @@ void DxbcShaderTranslator::Reset() {
   uav_count_ = 0;
   uav_index_shared_memory_ = kBindingIndexUnallocated;
   uav_index_edram_ = kBindingIndexUnallocated;
+  uav_index_zpd_rov_counter_ = kBindingIndexUnallocated;
 
   sampler_bindings_.clear();
 
@@ -662,6 +663,18 @@ void DxbcShaderTranslator::StartPixelShader() {
                             in_position_z);
       }
     }
+  } else if (DSV_IsApplyingPolygonOffset() &&
+             !current_shader().writes_depth()) {
+    // The decal path uses the original triangle depth slope. Take it before
+    // guest control flow or kill changes which pixels are still active.
+    assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+    dxbc::Src in_position_z(
+        dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+    in_position_used_ |= 0b0100;
+    a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0001),
+                        in_position_z);
+    a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0010),
+                        in_position_z);
   }
 
   // If not translating anything, we only need the depth.
@@ -915,6 +928,9 @@ void DxbcShaderTranslator::StartTranslation() {
         // X holds the guest oDepth - make sure it's always initialized because
         // assumptions can't be made about the integrity of the guest code.
         depth_stencil_temp_zero_mask = 0b0001;
+      } else if (DSV_IsApplyingPolygonOffset()) {
+        // XY hold raster depth gradients for the host RT decal path.
+        depth_stencil_temp_zero_mask = 0b0000;
       } else {
         assert_true(edram_rov_used_);
         if (ROV_IsDepthStencilEarly()) {
@@ -2146,7 +2162,9 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
         {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint,
          sizeof(uint32_t)},
         {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint,
-         sizeof(uint32_t), sizeof(uint32_t)},
+         sizeof(uint32_t)},
+        {"xe_zpd_rov_counter_index", ShaderRdefTypeIndex::kUint,
+         sizeof(uint32_t)},
 
         {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 
@@ -2175,6 +2193,9 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
 
         {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4,
          sizeof(float) * 4},
+
+        {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8,
+         sizeof(uint32_t) * 32},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
@@ -2548,6 +2569,11 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (uav_index_edram_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_edram");
   }
+  uint32_t zpd_rov_counter_name_ptr = name_ptr;
+  if (uav_index_zpd_rov_counter_ != kBindingIndexUnallocated) {
+    name_ptr +=
+        dxbc::AppendAlignedString(shader_object_, "xe_zpd_rov_counter_uav");
+  }
 
   uint32_t bindings_position_dwords = uint32_t(shader_object_.size());
 
@@ -2678,6 +2704,13 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
         uav.sample_count = UINT32_MAX;
         uav.bind_point = uint32_t(UAVRegister::kEdram);
+      } else if (i == uav_index_zpd_rov_counter_) {
+        // ROV ZPD counter buffer.
+        uav.name_ptr = zpd_rov_counter_name_ptr;
+        uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
+        uav.return_type = dxbc::ResourceReturnType::kMixed;
+        uav.dimension = dxbc::RdefDimension::kUAVBuffer;
+        uav.bind_point = uint32_t(UAVRegister::kZpdRovCounter);
       } else {
         assert_unhandled_case(i);
       }
@@ -3306,7 +3339,8 @@ void DxbcShaderTranslator::WriteOutputSignature() {
 
       // Depth (SV_Depth or SV_DepthLessEqual).
       size_t depth_position = SIZE_MAX;
-      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth()) {
+      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
+          DSV_IsApplyingPolygonOffset()) {
         depth_position = shader_object_.size();
         shader_object_.resize(shader_object_.size() + kParameterDwords);
         ++parameter_count;
@@ -3349,6 +3383,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
         }
         const char* depth_semantic_name;
         if (!current_shader().writes_depth() &&
+            !DSV_IsApplyingPolygonOffset() &&
             shader_modification.pixel.depth_stencil_mode ==
                 Modification::DepthStencilMode::kFloat24Truncating) {
           depth_semantic_name = "SV_DepthLessEqual";
@@ -3572,6 +3607,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
           dxbc::Src::U(dxbc::Src::Dcl, uav_index_edram_,
                        uint32_t(UAVRegister::kEdram),
                        uint32_t(UAVRegister::kEdram)));
+    } else if (i == uav_index_zpd_rov_counter_) {
+      // ROV ZPD counter buffer.
+      ao_.OpDclUnorderedAccessViewRaw(
+          0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_zpd_rov_counter_,
+                          uint32_t(UAVRegister::kZpdRovCounter),
+                          uint32_t(UAVRegister::kZpdRovCounter)));
     } else {
       assert_unhandled_case(i);
     }
@@ -3714,8 +3755,9 @@ void DxbcShaderTranslator::WriteShaderCode() {
         ao_.OpDclOutput(dxbc::Dest::OMask());
       }
       // Depth output.
-      if (is_writing_float24_depth || shader_writes_depth) {
-        if (!shader_writes_depth &&
+      if (is_writing_float24_depth || DSV_IsApplyingPolygonOffset() ||
+          shader_writes_depth) {
+        if (!shader_writes_depth && !DSV_IsApplyingPolygonOffset() &&
             GetDxbcShaderModification().pixel.depth_stencil_mode ==
                 Modification::DepthStencilMode::kFloat24Truncating) {
           ao_.OpDclOutput(dxbc::Dest::ODepthLE());

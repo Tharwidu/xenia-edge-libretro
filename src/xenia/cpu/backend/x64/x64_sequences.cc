@@ -71,7 +71,10 @@ using namespace xe::cpu::hir;
 using xe::cpu::hir::Instr;
 
 typedef bool (*SequenceSelectFn)(X64Emitter&, const Instr*, InstrKeyValue ikey);
-std::unordered_map<uint32_t, SequenceSelectFn> sequence_table;
+std::unordered_map<uint32_t, SequenceSelectFn>& SequenceTable() {
+  static auto* table = new std::unordered_map<uint32_t, SequenceSelectFn>();
+  return *table;
+}
 
 // ============================================================================
 // OPCODE_COMMENT
@@ -564,11 +567,18 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
     // if 0 and -0, return 0! opposite of minfp
-    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
-    auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
     e.vmaxps(e.xmm2, src1, src2);
     e.vmaxps(e.xmm3, src2, src1);
-    e.vorps(i.dest, e.xmm2, e.xmm3);
+    e.vandps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
@@ -623,11 +633,18 @@ struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
 struct MIN_V128 : Sequence<MIN_V128, I<OPCODE_MIN, V128Op, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
-    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
-    auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
     e.vminps(e.xmm2, src1, src2);
     e.vminps(e.xmm3, src2, src1);
-    e.vorps(i.dest, e.xmm2, e.xmm3);
+    e.vorps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MIN, MIN_I8, MIN_I16, MIN_I32, MIN_I64, MIN_F32,
@@ -957,8 +974,9 @@ struct COMPARE_EQ_I8
           [](X64Emitter& e, const Reg8& src1, int32_t constant) {
             if (constant == 0) {
               e.test(src1, src1);
-            } else
+            } else {
               e.cmp(src1, constant);
+            }
           });
     }
     CompareEqDoSete(e, i.instr, i.dest);
@@ -976,8 +994,9 @@ struct COMPARE_EQ_I16
           [](X64Emitter& e, const Reg16& src1, int32_t constant) {
             if (constant == 0) {
               e.test(src1, src1);
-            } else
+            } else {
               e.cmp(src1, constant);
+            }
           });
     }
     CompareEqDoSete(e, i.instr, i.dest);
@@ -995,8 +1014,9 @@ struct COMPARE_EQ_I32
           [](X64Emitter& e, const Reg32& src1, int32_t constant) {
             if (constant == 0) {
               e.test(src1, src1);
-            } else
+            } else {
               e.cmp(src1, constant);
+            }
           });
     }
     CompareEqDoSete(e, i.instr, i.dest);
@@ -1014,8 +1034,9 @@ struct COMPARE_EQ_I64
           [](X64Emitter& e, const Reg64& src1, int32_t constant) {
             if (constant == 0) {
               e.test(src1, src1);
-            } else
+            } else {
               e.cmp(src1, constant);
+            }
           });
     }
     CompareEqDoSete(e, i.instr, i.dest);
@@ -3305,8 +3326,9 @@ bool SelectSequence(X64Emitter* e, const Instr* i, const Instr** new_tail) {
   } else {
     const InstrKey key(i);
 
-    auto it = sequence_table.find(key);
-    if (it != sequence_table.end()) {
+    auto& table = SequenceTable();
+    auto it = table.find(key);
+    if (it != table.end()) {
       if (it->second(*e, i, InstrKey(i))) {
         *new_tail = i->next;
         return true;

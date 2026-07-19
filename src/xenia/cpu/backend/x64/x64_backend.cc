@@ -21,16 +21,13 @@
 #include "xenia/cpu/backend/x64/x64_function.h"
 #include "xenia/cpu/backend/x64/x64_sequences.h"
 #include "xenia/cpu/backend/x64/x64_stack_layout.h"
+#include "xenia/cpu/backend/x64/x64_tracers.h"
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/xex_module.h"
 
-DEFINE_bool(record_mmio_access_exceptions, true,
-            "For guest addresses records whether we caught any mmio accesses "
-            "for them. This info can then be used on a subsequent run to "
-            "instruct the recompiler to emit checks",
-            "x64");
+DECLARE_bool(record_mmio_access_exceptions);
 
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
@@ -115,22 +112,35 @@ X64Backend::X64Backend() : Backend(), code_cache_(nullptr) {
   cs_option(capstone_handle_, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
   cs_option(capstone_handle_, CS_OPT_DETAIL, CS_OPT_ON);
   cs_option(capstone_handle_, CS_OPT_SKIPDATA, CS_OPT_OFF);
-  uint32_t base_address = 0x10000;
+  // Probe for trampoline memory sub-4GB.  Succeeds on most Windows/Linux
+  // configs; required by the fast indirection path (32-bit absolute slot
+  // values).  If it fails, fall back to any VA and the code cache will
+  // pick the encoded path. macOS rejects fixed sub-2GB PROT_EXEC, so skip
+  // the scan there.
   void* buf_trampoline_code = nullptr;
-  while (base_address < 0x80000000) {
+#if !XE_PLATFORM_MAC
+  for (uint32_t base_address = 0x10000; base_address < 0x80000000;
+       base_address += 65536) {
     buf_trampoline_code = memory::AllocFixed(
         (void*)(uintptr_t)base_address,
         sizeof(guest_trampoline_template) * MAX_GUEST_TRAMPOLINES,
         xe::memory::AllocationType::kReserveCommit,
         xe::memory::PageAccess::kExecuteReadWrite);
-    if (!buf_trampoline_code) {
-      base_address += 65536;
-    } else {
+    if (buf_trampoline_code) {
       break;
     }
   }
+#endif
+  if (!buf_trampoline_code) {
+    buf_trampoline_code = memory::AllocFixed(
+        nullptr, sizeof(guest_trampoline_template) * MAX_GUEST_TRAMPOLINES,
+        xe::memory::AllocationType::kReserveCommit,
+        xe::memory::PageAccess::kExecuteReadWrite);
+  }
   xenia_assert(buf_trampoline_code);
   guest_trampoline_memory_ = (uint8_t*)buf_trampoline_code;
+  guest_trampolines_sub4gb_ =
+      reinterpret_cast<uintptr_t>(buf_trampoline_code) < 0x100000000ull;
   guest_trampoline_address_bitmap_.Resize(MAX_GUEST_TRAMPOLINES);
 }
 
@@ -223,10 +233,18 @@ bool X64Backend::Initialize(Processor* processor) {
   }
 
   Xbyak::util::Cpu cpu;
+#if XE_PLATFORM_MAC
+  if (!cpu.has(Xbyak::util::Cpu::tAVX)) {
+    XELOGW(
+        "This CPU does not support AVX. Continuing anyway (performance and "
+        "compatibility may be reduced).");
+  }
+#else
   if (!cpu.has(Xbyak::util::Cpu::tAVX)) {
     XELOGE("This CPU does not support AVX. The emulator will now crash.");
     return false;
   }
+#endif
 
   // Need movbe to do advanced LOAD/STORE tricks.
   if (cvars::x64_extension_mask & kX64EmitMovbe) {
@@ -251,6 +269,8 @@ bool X64Backend::Initialize(Processor* processor) {
 
   code_cache_ = X64CodeCache::Create();
   Backend::code_cache_ = code_cache_.get();
+  // Fast indirection is only viable if trampolines made it under 4GB.
+  code_cache_->set_allow_fast_indirection(guest_trampolines_sub4gb_);
   if (!code_cache_->Initialize()) {
     return false;
   }
@@ -259,6 +279,9 @@ bool X64Backend::Initialize(Processor* processor) {
                                       GUEST_TRAMPOLINE_END);
   // Allocate emitter constant data.
   emitter_data_ = X64Emitter::PlaceConstData();
+  if (!emitter_data_) {
+    return false;
+  }
 
   // Generate thunks used to transition between jitted code and host code.
   XbyakAllocator allocator;
@@ -289,11 +312,9 @@ bool X64Backend::Initialize(Processor* processor) {
   vrsqrtefp_vector_helper =
       thunk_emitter.EmitVectorVRsqrteHelper(vrsqrtefp_scalar_helper);
   frsqrtefp_helper = thunk_emitter.EmitFrsqrteHelper();
-  // Set the code cache to use the ResolveFunction thunk for default
-  // indirections.
-  assert_zero(uint64_t(resolve_function_thunk_) & 0xFFFFFFFF00000000ull);
-  code_cache_->set_indirection_default(
-      uint32_t(uint64_t(resolve_function_thunk_)));
+  // Default indirection slots point at the resolve thunk.
+  code_cache_->set_indirection_default_64(
+      reinterpret_cast<uint64_t>(resolve_function_thunk_));
 
   // Allocate some special indirections.
   code_cache_->CommitExecutableRange(0x9FFF0000, 0x9FFFFFFF);
@@ -579,7 +600,9 @@ void X64Backend::RecordMMIOExceptionForGuestInstruction(void* host_address) {
             xex_guest_module->GetInstructionAddressFlags(guestaddr);
 
         if (icf) {
-          icf->accessed_mmio = true;
+          cpu::InfoCacheFlags bits{};
+          bits.accessed_mmio = true;
+          cpu::AtomicSetInfoCacheFlags(icf, bits);
         }
       }
     }
@@ -666,7 +689,7 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
   mov(rdx, qword[rsp + 8 * 2]);
   mov(r8, qword[rsp + 8 * 3]);
   ret();
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // System-V ABI args:
   // rdi = target
   // rsi = arg0 (context)
@@ -708,8 +731,6 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
 
   add(rsp, stack_size);
   ret();
-#else
-  assert_always("Unknown platform ABI in host to guest thunk!");
 #endif
 
   code_offsets.tail = getSize();
@@ -757,12 +778,15 @@ GuestToHostThunk X64HelperEmitter::EmitGuestToHostThunk() {
   call(rax);
 
   EmitLoadVolatileRegs();
+  // Host callbacks may change MXCSR. Restore the guest scalar rounding mode
+  // so later guest FP ops observe the correct PPC rounding state.
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
 
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
   ret();
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // This function is being called using the Microsoft ABI from CallNative
   // rcx = target function
   // rdx = arg0
@@ -805,13 +829,14 @@ GuestToHostThunk X64HelperEmitter::EmitGuestToHostThunk() {
   call(rax);
 
   EmitLoadVolatileRegs();
+  // Host callbacks may change MXCSR. Restore the guest scalar rounding mode
+  // so later guest FP ops observe the correct PPC rounding state.
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
 
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
   ret();
-#else
-  assert_always("Unknown platform ABI in guest to host thunk!")
 #endif
 
   code_offsets.tail = getSize();
@@ -836,8 +861,8 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address);
 
 ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 #if XE_PLATFORM_WIN32
-  // ebx = target PPC address
-  // rcx = context
+  // edx = target PPC address
+  // rsi = context
 
   _code_offsets code_offsets = {};
 
@@ -854,8 +879,7 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
   // Save volatile registers
   EmitSaveVolatileRegs();
 
-  mov(rcx, rsi);  // context
-  mov(rdx, rbx);
+  mov(rcx, rsi);  // arg0 = context (rdx is already the target PPC address)
   mov(rax, reinterpret_cast<uint64_t>(&ResolveFunction));
   call(rax);
 
@@ -865,9 +889,9 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 
   add(rsp, stack_size);
   jmp(rax);
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // Function is called with the following params:
-  // ebx = target PPC address
+  // edx = target PPC address
   // rsi = context
 
   // System-V ABI args:
@@ -893,8 +917,8 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 
   // Save volatile registers
   EmitSaveVolatileRegs();
-  mov(rdi, rsi);  // context
-  mov(rsi, rbx);  // target PPC address
+  mov(rdi, rsi);  // arg0 = context
+  mov(rsi, rdx);  // arg1 = target PPC address
   mov(rax, reinterpret_cast<uint64_t>(&ResolveFunction));
   call(rax);
 
@@ -904,8 +928,6 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 
   add(rsp, stack_size);
   jmp(rax);
-#else
-  assert_always("Unknown platform ABI in resolve function!");
 #endif
 
   code_offsets.tail = getSize();
@@ -1610,7 +1632,7 @@ void X64HelperEmitter::EmitSaveVolatileRegs() {
   // mov(qword[rsp + offsetof(StackLayout::Thunk, r[0])], rax);
   mov(qword[rsp + offsetof(StackLayout::Thunk, r[1])], rcx);
   mov(qword[rsp + offsetof(StackLayout::Thunk, r[2])], rdx);
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
   mov(qword[rsp + offsetof(StackLayout::Thunk, r[3])], rsi);
   mov(qword[rsp + offsetof(StackLayout::Thunk, r[4])], rdi);
 #endif
@@ -1625,13 +1647,30 @@ void X64HelperEmitter::EmitSaveVolatileRegs() {
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm3);
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm4);
   vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm5);
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+  // System V xmm6-15 are caller-saved and allocatable, but only trace
+  // instrumentation injects guest→host calls the register allocator can't see,
+  // so preserve them only when tracing is compiled in.
+  if (GetTracingMode()) {
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[6])], xmm6);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[7])], xmm7);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[8])], xmm8);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[9])], xmm9);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[10])], xmm10);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[11])], xmm11);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[12])], xmm12);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[13])], xmm13);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[14])], xmm14);
+    vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[15])], xmm15);
+  }
+#endif
 }
 
 void X64HelperEmitter::EmitLoadVolatileRegs() {
   // mov(rax, qword[rsp + offsetof(StackLayout::Thunk, r[0])]);
   mov(rcx, qword[rsp + offsetof(StackLayout::Thunk, r[1])]);
   mov(rdx, qword[rsp + offsetof(StackLayout::Thunk, r[2])]);
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
   mov(rsi, qword[rsp + offsetof(StackLayout::Thunk, r[3])]);
   mov(rdi, qword[rsp + offsetof(StackLayout::Thunk, r[4])]);
 #endif
@@ -1646,6 +1685,21 @@ void X64HelperEmitter::EmitLoadVolatileRegs() {
   vmovups(xmm3, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
   vmovups(xmm4, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
   vmovups(xmm5, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+  // Mirror of the gated saves in EmitSaveVolatileRegs.
+  if (GetTracingMode()) {
+    vmovups(xmm6, qword[rsp + offsetof(StackLayout::Thunk, xmm[6])]);
+    vmovups(xmm7, qword[rsp + offsetof(StackLayout::Thunk, xmm[7])]);
+    vmovups(xmm8, qword[rsp + offsetof(StackLayout::Thunk, xmm[8])]);
+    vmovups(xmm9, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
+    vmovups(xmm10, qword[rsp + offsetof(StackLayout::Thunk, xmm[10])]);
+    vmovups(xmm11, qword[rsp + offsetof(StackLayout::Thunk, xmm[11])]);
+    vmovups(xmm12, qword[rsp + offsetof(StackLayout::Thunk, xmm[12])]);
+    vmovups(xmm13, qword[rsp + offsetof(StackLayout::Thunk, xmm[13])]);
+    vmovups(xmm14, qword[rsp + offsetof(StackLayout::Thunk, xmm[14])]);
+    vmovups(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[15])]);
+  }
+#endif
 }
 
 void X64HelperEmitter::EmitSaveNonvolatileRegs() {
@@ -1838,9 +1892,8 @@ uint32_t X64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
       GUEST_TRAMPOLINE_BASE +
       (static_cast<uint32_t>(new_index) * GUEST_TRAMPOLINE_MIN_LEN);
 
-  code_cache()->AddIndirection(
-      indirection_guest_addr,
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)));
+  code_cache()->AddIndirection64(indirection_guest_addr,
+                                 reinterpret_cast<uint64_t>(write_pos));
 
   return indirection_guest_addr;
 }
@@ -1851,6 +1904,22 @@ void X64Backend::FreeGuestTrampoline(uint32_t trampoline_addr) {
   size_t index =
       (trampoline_addr - GUEST_TRAMPOLINE_BASE) / GUEST_TRAMPOLINE_MIN_LEN;
   guest_trampoline_address_bitmap_.Release(index);
+}
+
+bool X64Backend::trace_instr_available() const { return IsTracingInstr(); }
+bool X64Backend::trace_data_available() const { return IsTracingData(); }
+bool X64Backend::trace_func_available() const { return IsTracingFunc(); }
+bool X64Backend::trace_instr_enabled() const { return GetTraceInstrEnabled(); }
+void X64Backend::set_trace_instr_enabled(bool value) {
+  SetTraceInstrEnabled(value);
+}
+bool X64Backend::trace_data_enabled() const { return GetTraceDataEnabled(); }
+void X64Backend::set_trace_data_enabled(bool value) {
+  SetTraceDataEnabled(value);
+}
+bool X64Backend::trace_func_enabled() const { return GetTraceFuncEnabled(); }
+void X64Backend::set_trace_func_enabled(bool value) {
+  SetTraceFuncEnabled(value);
 }
 }  // namespace x64
 }  // namespace backend

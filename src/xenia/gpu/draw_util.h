@@ -235,6 +235,22 @@ inline int32_t GetD3D10IntegerPolygonOffset(
   return polygon_offset < 0 ? -polygon_offset_int : polygon_offset_int;
 }
 
+struct HostDepthPolygonOffset {
+  float front_scale = 0.0f;
+  float front_offset = 0.0f;
+  float back_scale = 0.0f;
+  float back_offset = 0.0f;
+};
+
+// Detects a narrow type of coplanar redraws that tend to Z-fight when the depth
+// bias is applied via host fixed function polygon offset, like static decals in
+// UE3 and Halo engine titles. Host space offsets are computed so that the depth
+// bias is applied via shader depth output instead.
+bool GetHostDepthPolygonOffsetIfNeeded(
+    const RegisterFile& regs, bool primitive_polygonal,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, HostDepthPolygonOffset& polygon_offset_out);
+
 // For hosts not supporting separate front and back polygon offsets, returns the
 // polygon offset for the face which likely needs the offset the most (and that
 // will not be culled). The values returned will have the units of the original
@@ -516,6 +532,11 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Flag from gamma_decode_pwl_resolve in resolve shader. Some games appear
+    // overexposed unless full 8_8_8_8_GAMMA resolves decode PWL gamma to
+    // linear before MSAA averaging / conversion, then write gamma bytes again
+    // for gamma dests. Off keeps the old byte averaging.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };
@@ -593,20 +614,6 @@ enum class ResolveCopyShaderIndex {
 struct ResolveCopyShaderInfo {
   // Debug name of the pipeline state object with this shader.
   const char* debug_name;
-  // Whether the EDRAM source needs be bound as a raw buffer (ByteAddressBuffer
-  // in Direct3D) since it can load different numbers of 32-bit values at once
-  // on some hardware. If the host API doesn't support raw buffers, a typed
-  // buffer with source_bpe_log2-byte elements needs to be used instead.
-  bool source_is_raw;
-  // Log2 of bytes per element of the type of the EDRAM buffer bound to the
-  // shader (at least 2).
-  uint32_t source_bpe_log2;
-  // Log2 of bytes per element of the type of the destination buffer bound to
-  // the shader (at least 2 because of the 128 megatexel minimum requirement on
-  // Direct3D 10+ - D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP - that
-  // prevents binding the entire shared memory buffer with smaller element
-  // sizes).
-  uint32_t dest_bpe_log2;
   // Log2 of number of pixels in a single thread group along X and Y. 64 threads
   // per group preferred (GCN lane count).
   uint32_t group_size_x_log2, group_size_y_log2;
@@ -724,9 +731,19 @@ struct ResolveInfo {
     // Not doing -32...32 to -1...1 clamping here as a hack for k_16_16 and
     // k_16_16_16_16 blending emulation when using host render targets as it
     // would be inconsistent with the usual way of clearing with a depth quad.
-    // TODO(Triang3l): Check which 32-bit portion is in which register.
-    constants_out.rt_specific.clear_value[0] = rb_color_clear;
-    constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
+    if (color_edram_info.format_is_64bpp) {
+      // RB_COLOR_CLEAR_LO holds the lower 32 bits.
+      // Red | green << 16 for 16_16_16_16, red for 32_32_FLOAT.
+      // RB_COLOR_CLEAR holds the upper 32 bits.
+      // D3D builds the low dword as R | G << 16 and the high as B | A << 16,
+      // and writes to the _LO and base register respectively.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear_lo;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    } else {
+      // 32bpp clear values are only taken from RB_COLOR_CLEAR.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    }
     constants_out.rt_specific.edram_info = color_edram_info;
     constants_out.coordinate_info = coordinate_info;
   }

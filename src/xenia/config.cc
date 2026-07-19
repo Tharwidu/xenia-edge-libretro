@@ -55,9 +55,15 @@ std::filesystem::path GetBundledDataPath(const std::string& subdirectory) {
 }
 
 bool sortCvar(cvar::IConfigVar* a, cvar::IConfigVar* b) {
-  if (a->category() < b->category()) return true;
-  if (a->category() > b->category()) return false;
-  if (a->name() < b->name()) return true;
+  if (a->category() < b->category()) {
+    return true;
+  }
+  if (a->category() > b->category()) {
+    return false;
+  }
+  if (a->name() < b->name()) {
+    return true;
+  }
   return false;
 }
 
@@ -111,7 +117,9 @@ void MigrateLegacyCvars(const toml::table& config) {
   }
 
   for (const auto& [category_name, category_table] : config) {
-    if (!category_table.is_table()) continue;
+    if (!category_table.is_table()) {
+      continue;
+    }
 
     for (const auto& [key, value] : *category_table.as_table()) {
       std::string var_name = std::string(key);
@@ -120,6 +128,36 @@ void MigrateLegacyCvars(const toml::table& config) {
       if (var_value.length() >= 2 && var_value.front() == '"' &&
           var_value.back() == '"') {
         var_value = var_value.substr(1, var_value.length() - 2);
+      }
+
+      // Legacy: the removed "mute" bool now just means volume = 0.
+      if (var_name == "mute") {
+        if (value.value<bool>().value_or(var_value == "true")) {
+          auto volume_var = cvar::ConfigVars->find("volume");
+          if (volume_var != cvar::ConfigVars->end()) {
+            toml::value<int64_t> zero(0);
+            static_cast<cvar::IConfigVar*>(volume_var->second)
+                ->LoadConfigValue(&zero);
+          }
+        }
+        continue;
+      }
+
+      // String values for integer cvars presented as UI dropdowns
+      // (user_language, user_country, video_standard,
+      // internal_display_resolution) -> integer ids.
+      if (const auto* options = xe::ui::FindIntCvarEnumOptions(var_name)) {
+        for (const auto& option : *options) {
+          if (option.name == var_value) {
+            auto config_var = (*cvar::ConfigVars).find(var_name);
+            if (config_var != (*cvar::ConfigVars).end()) {
+              toml::value<int64_t> int_value(option.value);
+              static_cast<cvar::IConfigVar*>(config_var->second)
+                  ->LoadConfigValue(&int_value);
+            }
+            break;
+          }
+        }
       }
 
       for (const auto& alias : xe::ui::GetCvarAliases()) {
@@ -262,11 +300,17 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
   auto title_id_str = fmt::format("{:08X}", title_id);
   const auto game_config_path = GetGameConfigPath(title_id_str);
 
-  if (!std::filesystem::exists(game_config_path)) {
+  if (!cvar::ConfigVars) {
     return title_id;
   }
 
-  if (!cvar::ConfigVars) {
+  // Drop the previous title's overrides so cvars revert to base config + the
+  // new title's overrides only.
+  for (auto& it : *cvar::ConfigVars) {
+    static_cast<cvar::IConfigVar*>(it.second)->ClearGameConfigValue();
+  }
+
+  if (!std::filesystem::exists(game_config_path)) {
     return title_id;
   }
 
@@ -347,6 +391,27 @@ void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
 
 void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
                            const char* cvar_name, bool value) {
+  if (!emulator || !emulator->is_title_open()) {
+    return;
+  }
+
+  uint32_t title_id = emulator->title_id();
+  toml::table config_table = LoadGameConfig(title_id);
+
+  if (!config_table.contains(section)) {
+    config_table.insert(section, toml::table{});
+  }
+
+  auto* section_table = config_table[section].as_table();
+  if (section_table) {
+    section_table->insert_or_assign(cvar_name, value);
+  }
+
+  SaveGameConfig(title_id, config_table);
+}
+
+void SaveGameConfigSetting(xe::Emulator* emulator, const char* section,
+                           const char* cvar_name, int32_t value) {
   if (!emulator || !emulator->is_title_open()) {
     return;
   }
@@ -454,9 +519,15 @@ void SaveConfig() {
     }
   }
   std::sort(vars.begin(), vars.end(), [](auto a, auto b) {
-    if (a->category() < b->category()) return true;
-    if (a->category() > b->category()) return false;
-    if (a->name() < b->name()) return true;
+    if (a->category() < b->category()) {
+      return true;
+    }
+    if (a->category() > b->category()) {
+      return false;
+    }
+    if (a->name() < b->name()) {
+      return true;
+    }
     return false;
   });
 

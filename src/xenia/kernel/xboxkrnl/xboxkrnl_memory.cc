@@ -259,7 +259,7 @@ dword_result_t NtProtectVirtualMemory_entry(lpdword_t base_addr_ptr,
   }
 
   auto heap = kernel_memory()->LookupHeap(base_addr_ptr.value());
-  if (heap->heap_type() != HeapType::kGuestVirtual) {
+  if (!heap || heap->heap_type() != HeapType::kGuestVirtual) {
     return X_STATUS_INVALID_PARAMETER;
   }
   // Adjust the base downwards to the nearest page boundary.
@@ -303,22 +303,39 @@ dword_result_t NtFreeVirtualMemory_entry(lpdword_t base_addr_ptr,
   // _In_     ULONG FreeType
   // _In_     BOOLEAN DebugMemory
 
-  // Set to TRUE when freeing external devkit memory.
-  assert_true(debug_memory == 0);
+  // Set to TRUE when freeing external devkit memory. We don't support a
+  // separate devkit region, so just ignore the flag (matches the Alloc path).
+  if (debug_memory) {
+    XELOGW(
+        "NtFreeVirtualMemory: devkit debug flag set (base: {:08X}, "
+        "size: {:08X}). Ignoring.",
+        base_addr_value, region_size_value);
+  }
 
   if (!base_addr_value) {
     return X_STATUS_MEMORY_NOT_ALLOCATED;
   }
 
   auto heap = kernel_state()->memory()->LookupHeap(base_addr_value);
-  if (heap->heap_type() != HeapType::kGuestVirtual) {
+  if (!heap || heap->heap_type() != HeapType::kGuestVirtual) {
+    XELOGW(
+        "NtFreeVirtualMemory: address {:08X} does not fall in a guest virtual "
+        "heap; returning INVALID_PARAMETER.",
+        base_addr_value);
     return X_STATUS_INVALID_PARAMETER;
   }
   bool result = false;
   if (free_type == X_MEM_DECOMMIT) {
-    // If zero, we may need to query size (free whole region).
-    assert_not_zero(region_size_value);
-
+    if (!region_size_value) {
+      // Real NT decommits the whole region containing BaseAddress when
+      // RegionSize is zero. We don't implement that yet; refuse rather than
+      // silently dropping the call.
+      XELOGW(
+          "NtFreeVirtualMemory: MEM_DECOMMIT with RegionSize=0 (base: {:08X}) "
+          "is not implemented; returning INVALID_PARAMETER.",
+          base_addr_value);
+      return X_STATUS_INVALID_PARAMETER;
+    }
     region_size_value = xe::round_up(region_size_value, heap->page_size());
     result = heap->Decommit(base_addr_value, region_size_value);
   } else {
@@ -706,7 +723,7 @@ struct X_POOL_ALLOC_HEADER {
 };
 
 uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
-                                   uint32_t tag, uint32_t zero) {
+                                   uint32_t tag, uint32_t pool_selector) {
   if (size <= 0xFD8) {
     uint32_t adjusted_size = size + sizeof(X_POOL_ALLOC_HEADER);
 
@@ -724,9 +741,9 @@ uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
 }
 
 dword_result_t ExAllocatePoolTypeWithTag_entry(dword_t size, dword_t tag,
-                                               dword_t zero,
+                                               dword_t pool_selector,
                                                const ppc_context_t& context) {
-  return xeAllocatePoolTypeWithTag(context, size, tag, zero);
+  return xeAllocatePoolTypeWithTag(context, size, tag, pool_selector);
 }
 DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolTypeWithTag, kMemory, kImplemented);
 
@@ -777,6 +794,11 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
 
   if (image_heap->page_size() < 65536) {
     returned_value |= 0x40000000;
+
+    // TODO(Gliniak): Verify if 1 is set when page is marked as read-only. For
+    // now there is not enough data, but dashboard 14xxx and above requires that
+    // return from this call will have bit 0 set.
+    returned_value |= 1;
   }
 
   return returned_value & 0x400FFFFF;  // this is actually the mask it applies

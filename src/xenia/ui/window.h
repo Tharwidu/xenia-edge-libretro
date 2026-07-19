@@ -149,14 +149,12 @@ class Window {
     kVisible,
     // Temporarily revealed, hidden if not interacting with the mouse.
     kAutoHidden,
-    kHidden,
   };
 
   static std::unique_ptr<Window> Create(WindowedAppContext& app_context,
                                         const std::string_view title,
                                         uint32_t desired_logical_width,
-                                        uint32_t desired_logical_height,
-                                        bool is_game_process = false);
+                                        uint32_t desired_logical_height);
 
   virtual ~Window();
 
@@ -263,6 +261,10 @@ class Window {
   // user resizes a non-maximized window.
   uint32_t GetDesiredLogicalWidth() const { return desired_logical_width_; }
   uint32_t GetDesiredLogicalHeight() const { return desired_logical_height_; }
+  void SetDesiredLogicalSize(uint32_t width, uint32_t height) {
+    desired_logical_width_ = width;
+    desired_logical_height_ = height;
+  }
 
   // 0 width or height may be returned even in case of an open window with a
   // valid non-zero-area surface depending on the platform.
@@ -554,6 +556,8 @@ class Window {
   void OnDpiChanged(UISetupEvent& e,
                     WindowDestructionReceiver& destruction_receiver);
   void OnMonitorUpdate(MonitorUpdateEvent& e);
+  void OnUsbDeviceChanged(bool is_arrival,
+                          WindowDestructionReceiver& destruction_receiver);
   // For calling when the platform changes something in the non-maximized,
   // non-fullscreen size of the window.
   void OnDesiredLogicalSizeUpdate(uint32_t new_desired_logical_width,

@@ -10,7 +10,9 @@
 #ifndef XENIA_GPU_VULKAN_VULKAN_COMMAND_PROCESSOR_H_
 #define XENIA_GPU_VULKAN_VULKAN_COMMAND_PROCESSOR_H_
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -18,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -25,6 +28,7 @@
 #include "xenia/base/hash.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
@@ -35,6 +39,7 @@
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
+#include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
@@ -144,7 +149,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
-  void ClearReadbackBuffers() override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -154,11 +158,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
-  void PrepareForWait() override;
-  void ReturnFromWait() override;
-  bool SupportsGuestOcclusionQueries() const override {
-    return occlusion_query_resources_available_;
-  }
+  void PollCompletedSubmission() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(
@@ -177,7 +177,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }
-  uint64_t GetCompletedSubmission() const {
+  uint64_t GetCompletedSubmission() const override {
     return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
   }
 
@@ -216,6 +216,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
+
+  // If [base_bytes, base_bytes + size_bytes) holds memexport output (which
+  // under two-buffer routing lives in the host-imported buffer aliasing guest
+  // RAM), copies it into the device-local buffer so a following device-buffer
+  // read - a texture load - sees it. No-op for non-memexport ranges (already in
+  // the device buffer) and when the host buffer is unavailable. Called by the
+  // texture cache before loading a texture. Ends the render pass.
+  // Returns whether it copied, so an upload of the same range can be skipped.
+  bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
+                                          uint32_t size_bytes);
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -272,8 +282,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void SetViewport(const VkViewport& viewport);
   void SetScissor(const VkRect2D& scissor);
 
-  // Returns the text to display in the GPU backend name in the window title.
-  std::string GetWindowTitleText() const;
+  std::string GetTitleStateSuffix() const override;
 
   // Debug marker methods - public so subsystems can annotate their operations.
   void PushDebugMarker(const char* format, ...);
@@ -298,7 +307,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
 
-  Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+  Shader* LoadShader(xenos::ShaderType shader_type,
                      const uint32_t* host_address,
                      uint32_t dword_count) override;
 
@@ -306,9 +315,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
-
-  void IssueDraw_MemexportReadbackFullPath(uint32_t memexport_total_size);
-  void IssueDraw_MemexportReadbackFastPath(uint32_t memexport_total_size);
 
   void InitializeTrace() override;
 
@@ -448,15 +454,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce - such as when there are unfinished graphics
   // pipeline creation requests.
-  bool CanEndSubmissionImmediately();
+  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ &&
            GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
-
-  // Requests a readback buffer for CPU access to GPU data.
-  VkBuffer RequestReadbackBuffer(uint32_t size);
 
   void ClearTransientDescriptorPools();
 
@@ -464,31 +467,56 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void DestroyScratchBuffer();
 
-  void ProcessReadyOcclusionQueries(
-      uint64_t completed_submission_hint = UINT64_MAX);
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(uint32_t sample_count_address,
-                                 uint64_t samples);
+  // ZPD occlusion queries backend.
+  // vkCmdBeginQuery is only valid inside a render pass, so segments split at
+  // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
+  // segment_pending_begin waits for the next. Outside a render pass,
+  // DiscardZPDQuery defers the slot release until the submission completes.
+  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
+  // need to open before a pass begins or split an active pass around the clear.
+
+  void EnsureZPDQueryResources() override;
+  void ShutdownZPDQueryResources() override {
+    zpd_resolves_in_flight_.clear();
+    zpd_deferred_releases_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_fsi_ = false;
+    zpd_fsi_counter_index_force_update_ = true;
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsZPDQueryPoolReady() const override;
+  bool CanOpenZPDQuery() const override;
+
+  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
+                               bool can_close_submission) override;
+  bool CloseZPDQuery(ReportHandle report_handle,
+                     uint64_t& out_submission) override;
+  bool DiscardZPDQuery() override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle,
+                         uint64_t wait_for_submission) override;
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control,
                           uint32_t draw_resolution_scale_x,
-                          uint32_t draw_resolution_scale_y);
+                          uint32_t draw_resolution_scale_y,
+                          bool depth_bias_in_pixel_shader);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-      uint32_t normalized_color_mask);
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
   bool UpdateBindings(const VulkanShader* vertex_shader,
-                      const VulkanShader* pixel_shader);
+                      const VulkanShader* pixel_shader,
+                      bool interpreter_placeholder = false,
+                      bool placeholder_pixel_shader = false);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -506,6 +534,26 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   bool device_lost_ = false;
 
+  // Rolling per-submission summary for diagnosing VK_ERROR_DEVICE_LOST.
+  // Accumulated into submission_in_progress_ during a submission, snapshotted
+  // into submission_history_ on successful submit, dumped on device-loss.
+  struct SubmissionSummary {
+    uint64_t submission_index = 0;
+    uint64_t frame_index = 0;
+    uint32_t draw_count = 0;
+    uint32_t dispatch_count = 0;
+    uint32_t resolve_count = 0;
+    uint64_t last_vs_hash = 0;
+    uint64_t last_ps_hash = 0;
+    uint64_t last_render_pass_key = 0;
+  };
+  static constexpr size_t kSubmissionHistorySize = 16;
+  std::array<SubmissionSummary, kSubmissionHistorySize> submission_history_{};
+  size_t submission_history_next_ = 0;
+  SubmissionSummary submission_in_progress_{};
+
+  void LogRecentSubmissions(const char* context);
+
   bool cache_clear_requested_ = false;
 
   // Host shader types that guest shaders can be translated into - they can
@@ -515,6 +563,25 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VkShaderStageFlags guest_shader_vertex_stages_ = 0;
 
   std::vector<VkSemaphore> semaphores_free_;
+
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool uses_fsi_counter = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+  };
+  uint32_t zpd_active_query_index_ = UINT32_MAX;
+  uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_fsi_ = false;
+  bool zpd_fsi_counter_index_force_update_ = true;
+  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  // Fallback buffer for EDRAM descriptor binding 2.
+  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 2 buffer.
+  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
@@ -570,6 +637,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram_ =
       VK_NULL_HANDLE;
 
+  // Guards the layout maps below - GetPipelineLayout is called both from the
+  // draw thread and from pipeline creation threads (for deferred translation).
+  std::mutex pipeline_layouts_mutex_;
   // Descriptor set layouts are referenced by pipeline_layouts_.
   std::unordered_map<TextureDescriptorSetLayoutKey, VkDescriptorSetLayout,
                      TextureDescriptorSetLayoutKey::Hasher>
@@ -613,12 +683,34 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
+  std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
+
+  // Deferred query slot releases for discards that happen outside a render
+  // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the
+  // submission containing the stale BeginQuery completes on the GPU.
+  struct DeferredQueryRelease {
+    uint64_t submission;
+    uint32_t query_index;
+    uint32_t query_generation;
+  };
+  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
+
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
+  // Second set identical to the one above except binding 0 points at the
+  // host-imported shared-memory buffer (aliasing guest RAM). Bound instead of
+  // the device set for memexport-touching draws so their GPU-written geometry
+  // stays coherent with the CPU. VK_NULL_HANDLE when the host buffer is
+  // unavailable - routing is then disabled and every draw uses the device set.
+  VkDescriptorSet shared_memory_host_and_edram_descriptor_set_ = VK_NULL_HANDLE;
+  // Two-buffer memexport page tracking (data + methods), shared with the D3D12
+  // backend as a class-body fragment so each backend gets its own non-virtual,
+  // inlinable copy. Requires <array> and SharedMemory, both included above.
+#include "../command_processor_memexport.inc"
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
@@ -690,16 +782,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Resolve downscale compute shader for scaled resolution readback.
   // Downscales scaled resolve buffer data back to 1x resolution on the GPU,
   // avoiding expensive CPU-side downscaling and reducing transfer bandwidth.
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;              // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t scale_y;              // 1 to kMaxDrawResolutionScaleAlongAxis
-    uint32_t pixel_size_log2;      // 0=8bit, 1=16bit, 2=32bit, 3=64bit
-    uint32_t tile_count;           // Number of 32x32 tiles to process
-    uint32_t source_offset_bytes;  // Byte offset into source buffer
-    // When non-zero, apply half-pixel offset correction by sampling from
-    // (scale/2, scale/2) within each scaled block instead of (0, 0).
-    uint32_t half_pixel_offset;
-  };
   VkDescriptorSetLayout resolve_downscale_descriptor_set_layout_ =
       VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
@@ -835,76 +917,39 @@ class VulkanCommandProcessor final : public CommandProcessor {
       SpirvShaderTranslator::kDescriptorSetCount <=
           sizeof(current_graphics_descriptor_sets_bound_up_to_date_) * CHAR_BIT,
       "Bit fields storing descriptor set validity must be large enough");
+  // For reusing the texture/sampler descriptor sets across draws while their
+  // contents stay valid - the shaders and the samplers the currently valid
+  // texture descriptor sets were written for (texture image view changes are
+  // tracked separately via VulkanTextureCache::texture_bindings_changed).
+  const VulkanShader* current_textures_vertex_shader_ = nullptr;
+  const VulkanShader* current_textures_pixel_shader_ = nullptr;
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>
+      current_written_samplers_vertex_;
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>
+      current_written_samplers_pixel_;
 
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
   uint64_t current_float_constant_map_pixel_[4];
+  // True if the vertex float constant buffer holds the full unpacked 256 float
+  // constants for the ucode interpreter rather than a shader's packed subset.
+  // Used to invalidate the binding when switching interpreter <-> normal.
+  bool float_constants_vertex_are_full_ = false;
 
-  // Vertex buffer residency caching - avoids redundant RequestRange calls.
-  // Bit is set when the vertex buffer at that index has been validated and
-  // is resident in shared memory with the current address/size.
-  uint64_t vertex_buffers_in_sync_[2] =
-      {};  // 96 bits for 96 vertex fetch constants
-  // Cached address and size for each vertex fetch constant to detect changes.
-  struct VertexBufferState {
-    uint32_t address = 0;
-    uint32_t size = 0;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_ = {};
-
-  // System shader constants.
+  // System shader constants, including user clip planes and tessellation
+  // constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
-
-  // Clip plane constants.
-  SpirvShaderTranslator::ClipPlaneConstants clip_plane_constants_;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
 
-  // Per-resolve double-buffered readback for delayed sync
-  struct ReadbackBuffer {
-    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};  // Persistent mappings
-    uint32_t current_index = 0;
-    uint64_t last_used_frame = 0;
-  };
-
-  // Helper to evict old readback buffers from a cache map
-  void EvictOldReadbackBuffers(
-      std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
-
-  // Map: (written_address << 32 | written_length) -> ReadbackBuffer
-  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
-
-  // Simple single buffer for memexport (full mode - always syncs, no
-  // double-buffering)
-  VkBuffer memexport_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory memexport_readback_buffer_memory_ = VK_NULL_HANDLE;
-  uint32_t memexport_readback_buffer_size_ = 0;
-
-  // Per-memexport double-buffered readback for fast mode (delayed sync)
-  std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
-
-  // Occlusion query support.
-  VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
-  VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  uint8_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
-  struct PendingOcclusionQuery {
-    uint32_t host_index;
-    uint64_t submission;
-    uint32_t sample_count_address;
-  };
-  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
+  // Backend-agnostic resolve-to-guest-RAM copy decisions and read-watch
+  // consumption tracking, shared with the D3D12 backend.
+#include "../command_processor_resolve_readwatch.inc"
+  // Per-backend trampoline from the memory read callback into the shared
+  // MarkResolvePagesRead.
+  static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,
+                                       uint32_t length);
 
   // Debug marker support for RenderDoc/debug tools.
   bool debug_markers_enabled_ = false;

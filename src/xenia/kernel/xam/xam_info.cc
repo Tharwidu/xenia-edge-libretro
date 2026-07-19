@@ -9,9 +9,11 @@
 
 #include <thread>
 
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
@@ -24,7 +26,7 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
-#include "xenia/kernel/xboxkrnl/xboxkrnl_xconfig.h"
+#include "xenia/kernel/xconfig.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/windowed_app_context.h"
@@ -45,10 +47,6 @@ DEFINE_int32(avpack, 8,
              " 7 = TV PAL-60\n"
              " 8 = HDMI (default)",
              "Video");
-DECLARE_string(user_country);
-DECLARE_string(user_language);
-DECLARE_uint32(audio_flag);
-
 DEFINE_bool(staging_mode, 0,
             "Enables preview mode in dashboards to render debug information.",
             "Kernel");
@@ -65,8 +63,14 @@ namespace xam {
 // https://github.com/tpn/winsdk-10/blob/master/Include/10.0.14393.0/km/wdm.h#L15539
 typedef enum _MODE { KernelMode, UserMode, MaximumMode } MODE;
 
-dword_result_t XamFeatureEnabled_entry(dword_t app_id) { return 0; }
-DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kStub);
+dword_result_t XamFeatureEnabled_entry(qword_t feature_bit) {
+  const std::bitset<36> feature(0x40ffffffff);
+  if (feature.test(feature_bit)) {
+    return 1;
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kImplemented);
 
 dword_result_t XamGetStagingMode_entry() { return cvars::staging_mode; }
 DECLARE_XAM_EXPORT1(XamGetStagingMode, kNone, kStub);
@@ -95,40 +99,6 @@ dword_result_t XamGetOnlineSchema_entry() {
   return schema_guest;
 }
 DECLARE_XAM_EXPORT1(XamGetOnlineSchema, kNone, kImplemented);
-
-void XamFormatDateString_entry(dword_t locale_format, qword_t filetime,
-                               lpvoid_t output_buffer, dword_t output_count) {
-  output_buffer.Zero(output_count * sizeof(char16_t));
-
-  auto tp = xe::chrono::WinSystemClock::to_sys(
-      xe::chrono::WinSystemClock::from_file_time(filetime));
-  auto dp = date::floor<date::days>(tp);
-  auto year_month_day = date::year_month_day{dp};
-
-  auto str = fmt::format(u"{:02d}/{:02d}/{}",
-                         static_cast<unsigned>(year_month_day.month()),
-                         static_cast<unsigned>(year_month_day.day()),
-                         static_cast<int>(year_month_day.year()));
-  xe::string_util::copy_and_swap_truncating(output_buffer.as<char16_t*>(), str,
-                                            output_count);
-}
-DECLARE_XAM_EXPORT1(XamFormatDateString, kNone, kImplemented);
-
-void XamFormatTimeString_entry(dword_t user_index, qword_t filetime,
-                               lpvoid_t output_buffer, dword_t output_count) {
-  output_buffer.Zero(output_count * sizeof(char16_t));
-
-  auto tp = xe::chrono::WinSystemClock::to_sys(
-      xe::chrono::WinSystemClock::from_file_time(filetime));
-  auto dp = date::floor<date::days>(tp);
-  auto time = date::hh_mm_ss{date::floor<std::chrono::milliseconds>(tp - dp)};
-
-  auto str = fmt::format(u"{:02d}:{:02d}", time.hours().count(),
-                         time.minutes().count());
-  xe::string_util::copy_and_swap_truncating(output_buffer.as<char16_t*>(), str,
-                                            output_count);
-}
-DECLARE_XAM_EXPORT1(XamFormatTimeString, kNone, kImplemented);
 
 dword_result_t keXamBuildResourceLocator(uint64_t module,
                                          const std::u16string& container,
@@ -259,62 +229,6 @@ dword_result_t XGetAVPack_entry() {
 }
 DECLARE_XAM_EXPORT1(XGetAVPack, kNone, kStub);
 
-uint32_t xeXGetGameRegion() {
-  static uint32_t constexpr table[] = {
-      0xFFFFu, 0x03FFu, 0x02FEu, 0x02FEu, 0x03FFu, 0x02FEu, 0x0201u, 0x03FFu,
-      0x02FEu, 0x02FEu, 0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu, 0x02FEu, 0x03FFu,
-      0x00FFu, 0xFFFFu, 0x02FEu, 0x03FFu, 0x0102u, 0x03FFu, 0x03FFu, 0x02FEu,
-      0x02FEu, 0x02FEu, 0x03FFu, 0x03FFu, 0x03FFu, 0x02FEu, 0x03FFu, 0x02FEu,
-      0x02FEu, 0x02FEu, 0x02FEu, 0x02FEu, 0x02FEu, 0x02FEu, 0x03FFu, 0x03FFu,
-      0x03FFu, 0x02FEu, 0x02FEu, 0x03FFu, 0x02FEu, 0x02FEu, 0x03FFu, 0x03FFu,
-      0x03FFu, 0x02FEu, 0x02FEu, 0x03FFu, 0x03FFu, 0x0101u, 0x03FFu, 0x03FFu,
-      0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu, 0x02FEu, 0x02FEu, 0x02FEu, 0x02FEu,
-      0x03FFu, 0x03FFu, 0x02FEu, 0x02FEu, 0x03FFu, 0x0102u, 0x03FFu, 0x00FFu,
-      0x03FFu, 0x03FFu, 0x02FEu, 0x02FEu, 0x0201u, 0x03FFu, 0x03FFu, 0x03FFu,
-      0x03FFu, 0x03FFu, 0x02FEu, 0x03FFu, 0x02FEu, 0x03FFu, 0x03FFu, 0x02FEu,
-      0x02FEu, 0x03FFu, 0x02FEu, 0x03FFu, 0x02FEu, 0x02FEu, 0xFFFFu, 0x03FFu,
-      0x03FFu, 0x03FFu, 0x03FFu, 0x02FEu, 0x03FFu, 0x03FFu, 0x02FEu, 0x00FFu,
-      0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu, 0x03FFu};
-  auto country = static_cast<uint8_t>(xboxkrnl::GetUserCountryValue());
-  return country < xe::countof(table) ? table[country] : 0xFFFFu;
-}
-
-dword_result_t XGetGameRegion_entry() { return xeXGetGameRegion(); }
-DECLARE_XAM_EXPORT1(XGetGameRegion, kNone, kStub);
-
-XLanguage xeGetLanguage(bool extended_languages_support) {
-  auto desired_language =
-      static_cast<XLanguage>(xboxkrnl::GetUserLanguageValue());
-  uint32_t region = xeXGetGameRegion();
-  auto max_languages = extended_languages_support ? XLanguage::kMaxLanguages
-                                                  : XLanguage::kSChinese;
-  if (desired_language < max_languages) {
-    return desired_language;
-  }
-  if ((region & 0xff00) != 0x100) {
-    return XLanguage::kEnglish;
-  }
-  switch (region) {
-    case 0x101:  // NTSC-J (Japan)
-      return XLanguage::kJapanese;
-    case 0x102:  // NTSC-J (China)
-      return extended_languages_support ? XLanguage::kSChinese
-                                        : XLanguage::kEnglish;
-    default:
-      return XLanguage::kKorean;
-  }
-}
-
-dword_result_t XGetLanguage_entry() {
-  return static_cast<uint32_t>(xeGetLanguage(false));
-}
-DECLARE_XAM_EXPORT1(XGetLanguage, kNone, kImplemented);
-
-dword_result_t XamGetLanguage_entry() {
-  return static_cast<uint32_t>(xeGetLanguage(true));
-}
-DECLARE_XAM_EXPORT1(XamGetLanguage, kNone, kImplemented);
-
 dword_result_t XamGetCurrentTitleId_entry() {
   return kernel_state()->emulator()->title_id();
 }
@@ -359,7 +273,7 @@ dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
-  if (!loader_data.launch_data_present) {
+  if (loader_data.launch_data.empty()) {
     *size_ptr = 0;
     return X_ERROR_NOT_FOUND;
   }
@@ -390,109 +304,94 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   auto& loader_data = xam->loader_data();
   loader_data.launch_flags = flags;
 
-  // Translate the launch path to a full path.
-  if (raw_name_ptr) {
-    auto path = raw_name_ptr.value();
-    if (path.empty()) {
-      // Empty path means exit to dashboard
-      loader_data.launch_path = "game:\\default.xex";
-    } else {
-      // Non-empty path means launching another title
-      loader_data.launch_data_present = true;
+  // A null or empty path means exit to dashboard.
+  const std::string path = raw_name_ptr ? raw_name_ptr.value() : std::string();
+  if (!path.empty()) {
+    loader_data.launch_data_present = true;
 
-      // Normalize the paths
-      std::filesystem::path host_path = loader_data.host_path;
-      std::string launch_path = xe::path_to_utf8(path);
+    std::filesystem::path host_path = loader_data.host_path;
+    std::string launch_path = xe::path_to_utf8(path);
 
-      XELOGI("XamLoaderLaunchTitle: original host_path={}, launch_path={}",
-             loader_data.host_path, launch_path);
+    XELOGI("XamLoaderLaunchTitle: original host_path={}, launch_path={}",
+           loader_data.host_path, launch_path);
 
-      // Remove common guest path prefixes (case-insensitive since Xbox
-      // paths are case-insensitive, games may pass e.g. "GAME:\")
-      auto remove_prefix = [&launch_path](std::string_view prefix) {
-        if (xe::utf8::starts_with_case(launch_path, prefix)) {
-          launch_path = launch_path.substr(prefix.length());
-        }
-      };
-      remove_prefix("game:\\");
-      remove_prefix("d:\\");
-
-      // If host_path points to a .xex, combine with launch_path
-      if (host_path.extension() == ".xex") {
-        host_path.remove_filename();
-        host_path = host_path / launch_path;
-        launch_path = "";
+    // Remove common guest path prefixes (case-insensitive since Xbox
+    // paths are case-insensitive, games may pass e.g. "GAME:\")
+    auto remove_prefix = [&launch_path](std::string_view prefix) {
+      if (xe::utf8::starts_with_case(launch_path, prefix)) {
+        launch_path = launch_path.substr(prefix.length());
       }
+    };
+    remove_prefix("game:\\");
+    remove_prefix("d:\\");
 
-      XELOGI("XamLoaderLaunchTitle: normalized host_path={}, launch_path={}",
-             xe::path_to_utf8(host_path), launch_path);
-
-      // Handle title launch in-process via full Shutdown/Setup cycle.
-      // Disabled on Linux — pthread_cancel corrupts global mutex state and
-      // cooperative shutdown is not yet reliable. Windows uses TerminateThread.
-#if XE_PLATFORM_WIN32
-      if (cvars::in_process_title_relaunch) {
-        auto emulator = kernel_state()->emulator();
-
-        XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
-               xe::path_to_utf8(host_path));
-
-        auto new_host_path = xe::path_to_utf8(host_path);
-        auto new_launch_module = launch_path;
-        auto new_flags = loader_data.launch_flags;
-        auto new_data = loader_data.launch_data;
-        auto current_thread = XThread::GetCurrentThread();
-
-        // Must dispatch from a non-guest thread — RelaunchTitle terminates
-        // all guest threads including the caller.
-        std::thread([emulator, new_host_path = std::move(new_host_path),
-                     new_launch_module = std::move(new_launch_module),
-                     new_flags, new_data = std::move(new_data)]() mutable {
-          emulator->RelaunchTitle(new_host_path, new_launch_module, new_flags,
-                                  std::move(new_data));
-        }).detach();
-
-        current_thread->Suspend(nullptr);
-
-        // Unreachable — thread is terminated during relaunch.
-        assert_always();
-      }
-#endif  // XE_PLATFORM_WIN32
-
-      // Convert launch_data to hex string
-      std::string launch_data_hex;
-      for (uint8_t byte : loader_data.launch_data) {
-        launch_data_hex += fmt::format("{:02X}", byte);
-      }
-
-      // Call the callback to spawn the new process directly
-      auto on_launch_new_title =
-          kernel_state()->emulator()->on_launch_new_title();
-      if (on_launch_new_title) {
-        XELOGI("XamLoaderLaunchTitle: spawning new title process");
-        on_launch_new_title(xe::path_to_utf8(host_path), launch_path,
-                            loader_data.launch_flags, launch_data_hex);
-        // Callback calls quick_exit, so we don't reach here
-      }
-
-      // Terminate if callback wasn't set
-      XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
-      kernel_state()->TerminateTitle();
-      // This function does not return
+    if (host_path.extension() == ".xex") {
+      host_path.remove_filename();
+      host_path = host_path / launch_path;
+      launch_path = "";
     }
-  } else {
-    assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
+
+    XELOGI("XamLoaderLaunchTitle: normalized host_path={}, launch_path={}",
+           xe::path_to_utf8(host_path), launch_path);
+
+    // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
+    // on macOS — pthread_cancel there doesn't run C++ destructors, so
+    // force-terminated guest threads leak locks and deadlock teardown; spawn a
+    // fresh process instead.
+#if !XE_PLATFORM_MAC
+    if (cvars::in_process_title_relaunch) {
+      auto emulator = kernel_state()->emulator();
+
+      XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
+             xe::path_to_utf8(host_path));
+
+      auto new_host_path = xe::path_to_utf8(host_path);
+      auto new_launch_module = launch_path;
+      auto new_flags = loader_data.launch_flags;
+      auto new_data = loader_data.launch_data;
+      auto current_thread = XThread::GetCurrentThread();
+
+      // Must dispatch from a non-guest thread — RelaunchTitle terminates
+      // all guest threads including the caller.
+      std::thread([emulator, new_host_path = std::move(new_host_path),
+                   new_launch_module = std::move(new_launch_module), new_flags,
+                   new_data = std::move(new_data)]() mutable {
+        emulator->RelaunchTitle(new_host_path, new_launch_module, new_flags,
+                                std::move(new_data));
+      }).detach();
+
+      // Stop running guest code; RelaunchTitle terminates us. Suspend can
+      // return on POSIX, so park rather than fall through to spawn.
+      current_thread->Suspend(nullptr);
+      while (true) {
+        xe::threading::NanoSleep(int64_t(1'000'000'000));
+      }
+    }
+#endif  // !XE_PLATFORM_MAC
+
+    std::string launch_data_hex;
+    for (uint8_t byte : loader_data.launch_data) {
+      launch_data_hex += fmt::format("{:02X}", byte);
+    }
+
+    auto on_launch_new_title =
+        kernel_state()->emulator()->on_launch_new_title();
+    if (on_launch_new_title) {
+      XELOGI("XamLoaderLaunchTitle: spawning new title process");
+      on_launch_new_title(xe::path_to_utf8(host_path), launch_path,
+                          loader_data.launch_flags, launch_data_hex);
+    }
+
+    XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
+    kernel_state()->TerminateTitle();  // Does not return.
   }
 
-  // Exit to dashboard - this function does not return.
-  kernel_state()->TerminateTitle();
+  XELOGI("XamLoaderLaunchTitle: game requested exit to dashboard");
+  kernel_state()->ExitToDashboard();
 }
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
-void XamLoaderTerminateTitle_entry() {
-  // This function does not return.
-  kernel_state()->TerminateTitle();
-}
+void XamLoaderTerminateTitle_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
 
 uint32_t XamAllocImpl(uint32_t flags, uint32_t size,
@@ -609,6 +508,18 @@ DECLARE_XAM_EXPORT1(RtlSetLastNTError, kNone, kImplemented);
 
 dword_result_t RtlGetLastError_entry() { return XThread::GetLastError(); }
 DECLARE_XAM_EXPORT1(RtlGetLastError, kNone, kImplemented);
+
+dword_result_t XGetOverlappedExtendedError_entry(
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!overlapped_ptr) {
+    return XThread::GetLastError();
+  }
+  if (overlapped_ptr->result == X_ERROR_IO_PENDING) {
+    return X_ERROR_IO_INCOMPLETE;
+  }
+  return static_cast<uint32_t>(overlapped_ptr->extended_error);
+}
+DECLARE_XAM_EXPORT1(XGetOverlappedExtendedError, kNone, kImplemented);
 
 dword_result_t GetLastError_entry() { return RtlGetLastError_entry(); }
 DECLARE_XAM_EXPORT1(GetLastError, kNone, kImplemented);
@@ -756,11 +667,11 @@ dword_result_t XGetAudioFlags_entry() {
     return 2;
   }
 
-  if (!cvars::audio_flag) {
-    return 0x10000 | 0x1;
-  }
+  const auto audio_flags = kernel_state()->xconfig()->ReadSetting<uint32_t>(
+      XCONFIG_USER_CATEGORY,
+      XCONFIG_USER_CATEGORY_ENTRIES::XCONFIG_USER_AUDIO_FLAGS);
 
-  return cvars::audio_flag;
+  return audio_flags ? audio_flags : 0x10000 | 0x1;
 }
 DECLARE_XAM_EXPORT1(XGetAudioFlags, kNone, kImplemented);
 
@@ -888,6 +799,71 @@ DECLARE_XAM_EXPORT1(XamDoesOmniNeedConfiguration, kNone, kStub);
 
 dword_result_t XamFirstRunExperienceShouldRun_entry() { return 0; }
 DECLARE_XAM_EXPORT1(XamFirstRunExperienceShouldRun, kNone, kStub);
+
+dword_result_t QueryPerformanceFrequency_entry(lpqword_t query) {
+  uint64_t result = Clock::guest_tick_frequency();
+  *query = static_cast<uint32_t>(result);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(QueryPerformanceFrequency, kNone, kImplemented);
+
+void GetSystemTimeAsFileTime_entry(lpqword_t time_ptr,
+                                   const ppc_context_t& ctx) {
+  if (time_ptr) {
+    uint32_t ts_bundle = ctx->kernel_state->GetKeTimestampBundle();
+    uint64_t time = Clock::QueryGuestSystemTime();
+    ctx->TranslateVirtual<X_TIME_STAMP_BUNDLE*>(ts_bundle)->system_time =
+        xe::byte_swap(time);
+    *time_ptr = time;
+  }
+}
+DECLARE_XAM_EXPORT1(GetSystemTimeAsFileTime, kNone, kImplemented);
+
+dword_result_t XamIsIptvEnabled_entry() {
+  const bool iptv_enabled =
+      kernel_state()->xconfig()->ReadSetting<uint32_t>(
+          X_CONFIG_CATEGORY::XCONFIG_USER_CATEGORY, XCONFIG_USER_RETAIL_FLAGS) &
+      X_RETAIL_FLAGS::IPTVEnabled;
+
+  return !iptv_enabled ? X_E_FAIL : X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamIsIptvEnabled, kNone, kImplemented);
+
+dword_result_t XamIptvGetServiceName_entry(lpdword_t service_name_ptr) {
+  auto address = kernel_state()->xam_state()->GetIptvNameAddress();
+  auto buffer = kernel_state()->memory()->TranslateVirtual(address);
+  char16_t* data_ptr = reinterpret_cast<char16_t*>(buffer);
+  kernel_state()->xconfig()->ReadSetting(
+      X_CONFIG_CATEGORY::XCONFIG_IPTV_CATEGORY,
+      XCONFIG_IPTV_SERVICE_PROVIDER_NAME, data_ptr);
+  if (*data_ptr == u'\0') {
+    xe::string_util::copy_and_swap_truncating(data_ptr, u"Xenia TV", 9);
+  }
+  *service_name_ptr = address;
+
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamIptvGetServiceName, kNone, kImplemented);
+
+dword_result_t XamGetDvrStorage_entry(lpdword_t dvr_storage,
+                                      lpdword_t used_dvr_storage,
+                                      lpdword_t hdd_unused_space) {
+  *dvr_storage = 0;
+  *used_dvr_storage = 0;
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamGetDvrStorage, kNone, kStub);
+
+dword_result_t XamSetDvrStorage_entry(
+    dword_t dvr_storage_size, pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
+
+dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
 
 }  // namespace xam
 }  // namespace kernel

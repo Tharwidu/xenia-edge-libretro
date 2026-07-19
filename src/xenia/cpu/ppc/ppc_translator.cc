@@ -12,6 +12,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/reset_scope.h"
@@ -79,9 +80,13 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // Loops until no changes are made.
   auto sap = std::make_unique<passes::ConditionalGroupPass>();
   sap->AddPass(std::make_unique<passes::SimplificationPass>());
-  if (validate) sap->AddPass(std::make_unique<passes::ValidationPass>());
+  if (validate) {
+    sap->AddPass(std::make_unique<passes::ValidationPass>());
+  }
   sap->AddPass(std::make_unique<passes::ConstantPropagationPass>());
-  if (validate) sap->AddPass(std::make_unique<passes::ValidationPass>());
+  if (validate) {
+    sap->AddPass(std::make_unique<passes::ValidationPass>());
+  }
   compiler_->AddPass(std::move(sap));
 
   if (backend->machine_info()->supports_extended_load_store) {
@@ -89,16 +94,21 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
     // These will save us a lot of HIR opcodes.
     compiler_->AddPass(
         std::make_unique<passes::MemorySequenceCombinationPass>());
-    if (validate)
+    if (validate) {
       compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+    }
   }
   compiler_->AddPass(std::make_unique<passes::SimplificationPass>());
-  if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  if (validate) {
+    compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
-  if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  if (validate) {
+    compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
 
   //// Removes all unneeded variables. Try not to add new ones after this.
   // compiler_->AddPass(new passes::ValueReductionPass());
@@ -110,7 +120,9 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // registers are assigned and ready to be emitted.
   compiler_->AddPass(std::make_unique<passes::RegisterAllocationPass>(
       backend->machine_info()));
-  if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  if (validate) {
+    compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
 
   // Must come last. The HIR is not really HIR after this.
   compiler_->AddPass(std::make_unique<passes::FinalizationPass>());
@@ -133,42 +145,45 @@ class HirBuilderScope {
   }
 };
 void PPCTranslator::DumpHIR(GuestFunction* function, PPCHIRBuilder* builder) {
-  if (cvars::dump_translated_hir_functions) {
-    StringBuffer buffer{};
-    builder_->Dump(&buffer);
+  if (!cvars::dump_translated_hir_functions) {
+    return;
+  }
+  StringBuffer buffer{};
+  builder_->Dump(&buffer);
 
-    XexModule* mod = dynamic_cast<XexModule*>(function->module());
+  XexModule* mod = dynamic_cast<XexModule*>(function->module());
 
-    std::wstring folder_name = L"hirdump";
-
-    if (mod) {
-      xex2_opt_execution_info* opt_exec_info = nullptr;
-      if (mod->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &opt_exec_info)) {
-        folder_name =
-            L"hirdump_title_" + std::to_wstring(opt_exec_info->title_id);
-      }
+  std::string folder_name = "hirdump";
+  if (mod) {
+    xex2_opt_execution_info* opt_exec_info = nullptr;
+    if (mod->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &opt_exec_info)) {
+      folder_name = "hirdump_title_" + std::to_string(opt_exec_info->title_id);
     }
-    std::filesystem::path folder_path{folder_name};
+  }
 
-    if (!std::filesystem::exists(folder_path)) {
-      std::filesystem::create_directory(folder_path);
+  // Try the working directory first; if it isn't writable (e.g. launched from
+  // a macOS .app bundle, where CWD is "/"), fall back to the system temp dir.
+  std::filesystem::path folder_path = folder_name;
+  if (xe::filesystem::CreateFolder(folder_path)) {
+    std::error_code ec;
+    auto tmp = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+      return;
     }
+    folder_path = tmp / folder_name;
+    if (xe::filesystem::CreateFolder(folder_path)) {
+      return;
+    }
+  }
 
-    {
-      wchar_t tmpbuf[64];
-#ifdef XE_PLATFORM_WIN32
-      _snwprintf(tmpbuf, 64, L"%X", function->address());
-#else
-      swprintf(tmpbuf, 64, L"%X", function->address());
-#endif
-      folder_path.append(&tmpbuf[0]);
-    }
+  char tmpbuf[64];
+  std::snprintf(tmpbuf, sizeof(tmpbuf), "%X", function->address());
+  folder_path /= tmpbuf;
 
-    FILE* f = fopen(folder_path.string().c_str(), "w");
-    if (f) {
-      fputs(buffer.buffer(), f);
-      fclose(f);
-    }
+  FILE* f = xe::filesystem::OpenFile(folder_path, "w");
+  if (f) {
+    fputs(buffer.buffer(), f);
+    fclose(f);
   }
 }
 bool PPCTranslator::Translate(GuestFunction* function,
@@ -237,7 +252,11 @@ bool PPCTranslator::Translate(GuestFunction* function,
 
   // Emit function.
   uint32_t emit_flags = 0;
-  if (debug_info) {
+  // Instruction tracing (ITrace) logs the per-instruction disassembly that is
+  // emitted as HIR comments, so force comment emission when the backend was
+  // built with instruction tracing available, even without other debug info.
+  if (debug_info ||
+      frontend_->processor()->backend()->trace_instr_available()) {
     emit_flags |= PPCHIRBuilder::EMIT_DEBUG_COMMENTS;
   }
   if (!builder_->Emit(function, emit_flags)) {

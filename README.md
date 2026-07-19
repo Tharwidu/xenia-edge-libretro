@@ -6,64 +6,33 @@
 
 <h1 align="center">Xenia Edge - Xbox 360 Emulator</h1>
 
-Xenia Edge is yet another experimental fork of the Xenia emulator, mainly based on [Xenia Canary](https://github.com/xenia-canary/xenia-canary) but with the aim of
-quicker iteration and improvements to Vulkan backend and Linux platform in particular. Windows of course remains fully supported as well and will benefit from changes made here especially with its Vulkan backend.
+Xenia Edge is yet another experimental fork of the Xenia emulator, originally based on [Xenia Canary](https://github.com/xenia-canary/xenia-canary). The focus is
+on faster iteration, higher default game compatibility, usability and platform support.
 
 ## Status
 
-Buildbot | Status
--------- | ------
-Windows | [![CI](https://github.com/has207/xenia-edge/actions/workflows/Windows_build.yml/badge.svg?branch=edge)](https://github.com/has207/xenia-edge/actions/workflows/Windows_build.yml) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/has207/xenia-edge/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-Linux | [![CI](https://github.com/has207/xenia-edge/actions/workflows/Linux_build.yml/badge.svg?branch=edge)](https://github.com/has207/xenia-edge/actions/workflows/Linux_build.yml)
+Build (Windows / Linux / macOS arm64 / macOS x86_64): [![CI](https://github.com/has207/xenia-edge/actions/workflows/CI.yml/badge.svg?branch=edge)](https://github.com/has207/xenia-edge/actions/workflows/CI.yml) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/has207/xenia-edge/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 Releases
 --------
 [Latest](https://github.com/has207/xenia-edge/releases/latest) ◦ [All](https://github.com/has207/xenia-edge/releases)
 
-<h1 align="center">Inherited from Xenia Canary</h1>
+FAQ
+---
 
-## Quickstart
+- Q: Why is game X running slower on Xenia Edge than Xenia Canary?<br>
+  A: Edge defaults to accuracy over performance. You can tune this per-game by using the Guide button while in-game (PS or Xbox button in the middle of the controller) and going to Performance, then disabling various options there to reach the same performance as Canary.
 
-See the [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart) page.
+- Q: How to tell what options a particular game might need?<br>
+  A: Many games that are not running well by default require one or two simple config changes that make them (near) perfect. To find out, right-click the game in the game list and go to Compatibility. If there is an existing compatibility page there will be a link to Master, Caanary, or both. Prefer information on the Canary page, you will often find the answer there.
 
-## FAQ
+- Q: Why are translations into langauage X so bad?<br>
+  A: They're AI-generated, if you speak the language and want to help edit the relevant .po file in the assets directory and submit it. If you don't know how to use git then just open a bug and attach the fixed .po file. Best way to edit those is with a program called Poedit.
 
-See the [frequently asked questions](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page.
+- Q: Should I use Vulkan on Windows?<br>
+  A: Probably not, while vulkan is now on par with d3d12 in terms of graphical fidelity it's still less performant.
 
-## Game Compatibility
+- Q: Should I use the Windows build with wine/proton on Linux?<br>
+  A: While the answer has been "yes" for years it is no longer the case. The native build for Linux is quite competitive with Windows now and is recommened over wine/proton.
 
-See the [Game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
-for currently tracked games, and feel free to contribute your own updates,
-screenshots, and information there following the [existing conventions](https://github.com/xenia-canary/game-compatibility/blob/canary/README.md).
 
-## Building
-
-See [building.md](docs/building.md) for setup and information about the
-`xb` script. When writing code, check the [style guide](docs/style_guide.md)
-and be sure to run clang-format!
-
-## Contributors Wanted!
-
-Have some spare time, know advanced C++, and want to write an emulator?
-Contribute! There's a ton of work that needs to be done, a lot of which
-is wide open greenfield fun.
-
-**For general rules and guidelines please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).**
-
-Fixes and optimizations are always welcome (please!), but in addition to
-that there are some major work areas still untouched:
-
-* Help work through [missing functionality/bugs in games](https://github.com/xenia-canary/xenia-canary/labels/compat)
-* Reduce the size of Xenia's [huge log files](https://github.com/xenia-canary/xenia-canary/issues/1526)
-* Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-canary/xenia-canary/labels/platform-linux)
-
-See more projects [good for contributors](https://github.com/xenia-canary/xenia-canary/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
-something.
-
-## Disclaimer
-
-The goal of this project is to experiment, research, and educate on the topic
-of emulation of modern devices and operating systems. **It is not for enabling
-illegal activity**. All information is obtained via reverse engineering of
-legally purchased devices and games and information made public on the internet
-(you'd be surprised what's indexed on Google...).

@@ -12,17 +12,21 @@
 
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/ui/presenter.h"
@@ -35,24 +39,48 @@ namespace gpu {
 
 enum class GPUSetting {
   ClearMemoryPageState,
-  ReadbackMemexport,
-  ReadbackMemexportFast
+  MemexportAwaitFences,
 };
 
 enum class ReadbackResolveMode {
   kDisabled,  // No readback (none)
-  kSome,      // Delayed sync, skip copy on cache hit (some)
-  kFast,      // Delayed sync, copy every frame (fast)
-  kFull       // Immediate sync with GPU stall (full)
+  kFast,      // Copy only CPU-read resolves into guest RAM (fast)
+  kAll        // Copy every resolve into guest RAM (all)
+};
+// The readback_resolve_sync cvar makes fast/all copies stall for same-frame
+// coherency instead of running deferred, about a frame behind.
+
+// Occlusion queries - ZPD report mode.
+enum class ZPDMode {
+  kFake,     // Fake sample counts, no real GPU queries (fake)
+  kFast,     // Real queries with speculative cached writes (fast)
+  kFastAlt,  // Fast queries, but preserves cached zeroes (fast-alt)
+  kStrict,   // Real queries, waits before writeback. May hang. (strict)
 };
 
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
-// Occlusion query pool size for both D3D12 and Vulkan backends.
-// Queries complete synchronously with GPU stalls.
-// 512 slots = 4KB of readback buffer memory.
-constexpr uint32_t kMaxOcclusionQueries = 512;
+// Shared pool capacity for D3D12 and Vulkan.
+constexpr uint32_t kZPDQueryPoolCapacity = 8192;
+
+// Contiguous range of query indices for batched resolve/copy operations.
+struct ResolveRange {
+  uint32_t start;
+  uint32_t count;
+};
+
+// Backstop for strict mode. Abandon any pending retires after this many polls
+// so EVENT_WRITE_ZPD doesn't keep spinning on an unresolved report.
+constexpr uint32_t kStrictZPDRetireMaxStalls = 16;
+// Millisecond deadline for strict ZPD retire.
+constexpr uint64_t kStrictZPDRetireDeadlineMs = 2;
+
+// Cap for the fast-mode cached delta map.  Games reuse a small set of report
+// addresses so this should never be hit, but prevents unbounded growth if a
+// title cycles through unique addresses.  Clearing the cache has no
+// correctness impact — it only removes speculative writeback hints.
+constexpr size_t kFastZPDCacheMaxEntries = 1024;
 
 class GraphicsSystem;
 class Shader;
@@ -85,11 +113,18 @@ enum class GammaRampType {
 };
 
 class CommandProcessor {
+ public:
+  using ReportHandle = uint32_t;
+  static constexpr ReportHandle kInvalidReportHandle = 0;
+
  protected:
   RingBuffer
       reader_;  // chrispy: instead of having ringbuffer on stack, have it near
                 // the start of the class so we can access it via rel8. This
                 // also reduces the number of params we need to pass
+  // Converts the reader's host pointer (+ offset) to a guest physical address.
+  uint32_t GuestReadPtrOffset(int32_t offset = 0) const;
+
  public:
   enum class SwapPostEffect {
     kNone,
@@ -105,9 +140,14 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  uint32_t active_vertex_shader_ucode_address() const {
+    return active_vertex_shader_ucode_address_;
+  }
 
   virtual bool Initialize();
   virtual void Shutdown();
+
+  virtual std::string GetTitleStateSuffix() const { return {}; }
 
   void CallInThread(std::function<void()> fn);
 
@@ -122,6 +162,11 @@ class CommandProcessor {
 
   // Set readback resolve mode (updates both cvar and cached value)
   void SetReadbackResolveMode(ReadbackResolveMode mode);
+
+  // Get cached ZPD mode (avoids string parsing every frame).
+  ZPDMode GetZPDMode() const { return cached_zpd_mode_; }
+  // Set ZPD mode (updates both cvar and cached value).
+  void SetZPDMode(ZPDMode mode);
 
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect GetDesiredSwapPostEffect() const {
@@ -153,6 +198,12 @@ class CommandProcessor {
   virtual void EndTracing();
 
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
+
+  // Shadowed by backends that route memory export through guest RAM (see
+  // command_processor_memexport.inc). No-ops where export output never reaches
+  // the CPU, so there is nothing to wait for.
+  void AwaitMemexportForFence() {}
+  void AwaitMemexportForCoherency(uint32_t base_bytes, uint32_t size_bytes) {}
 
   void RestoreRegisters(uint32_t first_register,
                         const uint32_t* register_values,
@@ -190,10 +241,6 @@ class CommandProcessor {
 
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
 
-  // Eviction policy constants for readback buffer cache
-  static constexpr size_t kMaxReadbackBuffers = 256;
-  static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
-
   // Progressive alignment for readback buffers to avoid wasting memory
   static inline uint32_t AlignReadbackBufferSize(uint32_t size) {
     if (size < 1 * 1024 * 1024) {
@@ -210,6 +257,21 @@ class CommandProcessor {
                                                 uint32_t length) {
     return (uint64_t(address) << 32) | uint64_t(length);
   }
+
+  // Constants for the shared resolve-downscale compute shader (used by the
+  // D3D12 and Vulkan backends to downscale a scaled resolve back to 1x).
+  struct ResolveDownscaleConstants {
+    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
+    uint32_t tile_count;       // Number of 32x32 tiles to process
+    // Byte offset into the source buffer. On D3D12 this is 0 (the offset is
+    // baked into the source SRV); on Vulkan it is the real byte offset.
+    uint32_t source_offset_bytes;
+    // When non-zero, apply half-pixel offset correction by sampling from
+    // (scale/2, scale/2) within each scaled block instead of (0, 0).
+    uint32_t half_pixel_offset;
+  };
 
   void WorkerThreadMain();
   virtual bool SetupContext() = 0;
@@ -279,12 +341,161 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  virtual void PollCompletedSubmission() {}
+
+  // Used by strict ZPD to distinguish normal in flight latency from a
+  // genuinely stuck report.
+  virtual uint64_t GetCompletedSubmission() const { return 0; }
+
   virtual void OnPrimaryBufferEnd() {}
+
+  // TODO(boma): Add tracking for VIZ & EXT queries.
+  enum class QueryOpenResult {
+    kOpened,
+    kDeferred,
+    kPoolExhausted,
+    kFailed,
+  };
+
+  // One active guest report slot. May span multiple host query segments split
+  // across submissions or render passes, final value is the normalized sum.
+  struct ZPDReport {
+    // Raw host count across all segments, normalized at retirement.
+    uint64_t accumulated_samples = 0;
+    // Submission of the first closed segment.
+    uint64_t first_segment_end_submission = 0;
+    // Submission containing the most recently closed segment's resolve.
+    uint64_t last_segment_end_submission = 0;
+    uint64_t slot_sequence_id = 0;
+    uint32_t slot_base = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    // Snapshotted at BEGIN from zpd_slot_values_.
+    uint32_t begin_value = 0;
+    uint32_t pending_segments = 0;
+    // Last known delta. Carried forward on forced close so slot doesn't
+    // briefly look fully occluded. 0 is a valid delta for alternate fast path.
+    uint32_t cached_delta = 0;
+    // Distinguishes "we resolved to zero" from "we have no cached value yet".
+    bool has_cached_delta = false;
+    bool ended = false;
+  };
+
+  // TODO(boma): Replace with a map keyed by slot_base for concurrent slots.
+  struct ActiveZPDSegment {
+    ReportHandle report_handle = kInvalidReportHandle;
+    uint32_t slot_base = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    bool segment_active = false;
+    bool segment_pending_begin = false;
+    bool logical_active = false;
+  };
+
+  struct PendingZPDSlot {
+    ReportHandle report_handle = kInvalidReportHandle;
+    uint32_t cached_delta = 0;
+    bool has_cached_delta = false;
+  };
+
+  // Logged by the backend every 100 frames if ZPD logging cvar is true.
+  struct ZPDStats {
+    uint64_t logical_begun = 0;
+    uint64_t logical_ended = 0;
+    uint64_t segments_begun = 0;
+    uint64_t segments_ended = 0;
+    uint64_t pool_exhausted = 0;
+    uint64_t failed = 0;
+    uint64_t counter_wraps = 0;
+    uint64_t same_slot_reuse = 0;
+    uint64_t last_log_frame = 0;
+
+    void Reset(uint64_t current_frame) {
+      *this = {};
+      last_log_frame = current_frame;
+    }
+  };
+
+  virtual void EnsureZPDQueryResources() {}
+  virtual void ShutdownZPDQueryResources() {}
+
+  virtual bool IsZPDQueryPoolReady() const { return false; }
+  virtual bool CanOpenZPDQuery() const { return true; }
+
+  // Backend acquires a pool slot, records BeginQuery, tracks it internally.
+  virtual QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
+                                       bool can_close_submission) {
+    return QueryOpenResult::kFailed;
+  }
+  // Backend records EndQuery, queues a resolve for the active slot.
+  virtual bool CloseZPDQuery(ReportHandle report_handle,
+                             uint64_t& out_submission) {
+    return false;
+  }
+  // Backend discards the active query without resolving.
+  virtual bool DiscardZPDQuery() { return false; }
+
+  // Backend drains completed resolves and calls OnZPDQueryResolved for each.
+  virtual void PumpQueryResolves() {}
+  // Backend waits for all pending segments of report_handle to resolve.
+  virtual bool AwaitQueryResolve(ReportHandle report_handle,
+                                 uint64_t wait_for_submission) {
+    return false;
+  }
+
+  bool BeginZPDReport(uint32_t report_address);
+  bool EndZPDReport(uint32_t report_address, bool guest_forced_end);
+  // Opens a new host query segment when CanOpenZPDQuery is true.
+  void OpenQuerySegment(bool can_close_submission);
+  // Closes the current segment at a submission or render pass boundary.
+  // The logical report stays open and a new segment will open at the next
+  // opportunity.
+  void CloseQuerySegment();
+
+  // Called by backends when a host query resolve completes.  Accumulates
+  // the raw sample count, and if all segments are done, commits the report
+  // to guest memory.
+  void OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples);
+
+  // Writes guest report with begin_value read from guest memory.
+  // Orphan END path only when no controller snapshot is available.
+  void WriteZPDReport(uint32_t begin_record, uint32_t end_record,
+                      uint32_t begin_value, uint32_t delta_value,
+                      bool write_begin_record);
+
+  // Called from PrepareForWait so strict mode can retire before guest loops
+  // again. Gives up after kStrictZPDRetireMaxStalls.
+  void PumpPendingRetire();
+
+  // Divides host count by draw resolution scale.
+  uint32_t NormalizeSampleCount(uint64_t samples) const;
+
+  // Writes the final report to guest memory and advances the slot running
+  // total.  Called when a report fully resolves or is abandoned.
+  void CommitZPDReport(ZPDReport& report, uint32_t delta_value);
+  // Checks that the report's slot sequence is still current (not reused).
+  bool IsZPDReportCurrent(const ZPDReport& report) const;
+  PendingZPDSlot GetPendingZPDSlot(uint32_t slot_base,
+                                   uint32_t end_record) const;
+
+  void ResetZPDState() {
+    zpd_active_segment_ = {};
+    zpd_next_report_handle_ = 1;
+    zpd_slot_sequences_.clear();
+    zpd_slot_values_.clear();
+    logical_zpd_reports_.clear();
+    fast_zpd_report_cached_values_.clear();
+    fake_zpd_sample_count_ = 0;
+    querybatch_zpd_sample_count_ = UINT32_MAX;
+    zpd_pending_retire_handle_ = kInvalidReportHandle;
+    zpd_pending_retire_stalls_ = 0;
+    zpd_pending_retire_start_ms_ = 0;
+    zpd_force_fake_fallback_ = false;
+  }
 
 #include "pm4_command_processor_declare.h"
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type,
-                             uint32_t guest_address,
                              const uint32_t* host_address,
                              uint32_t dword_count) {
     return nullptr;
@@ -296,7 +507,6 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
-  virtual bool SupportsGuestOcclusionQueries() const { return false; }
 
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
   bool debug_markers_enabled() const { return false; }
@@ -316,6 +526,43 @@ class CommandProcessor {
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+
+  ReportHandle zpd_next_report_handle_ = 1;
+  std::unordered_map<uint32_t, uint64_t> zpd_slot_sequences_;
+  std::unordered_map<uint32_t, uint32_t> zpd_slot_values_;
+  std::unordered_map<ReportHandle, ZPDReport> logical_zpd_reports_;
+  ActiveZPDSegment zpd_active_segment_{};
+
+  // Cached delta per END.
+  // Fast mode uses this for speculative writeback and orphaned END replay.
+  std::unordered_map<uint32_t, uint32_t> fast_zpd_report_cached_values_;
+
+  uint32_t querybatch_zpd_sample_count_ = UINT32_MAX;
+
+  // Sticky after host pool init failure. Forces EVENT_WRITE_ZPD onto the fake
+  // path so guests don't stall waiting on a pending sentinel that will never
+  // be written. Cleared by ResetZPDState.
+  bool zpd_force_fake_fallback_ = false;
+
+  // Strict mode defers guest completion until the queued END has retired.
+  ReportHandle zpd_pending_retire_handle_ = kInvalidReportHandle;
+  uint32_t zpd_pending_retire_stalls_ = 0;
+  // Uptime in ms when zpd_pending_retire_handle_ was first set.
+  uint64_t zpd_pending_retire_start_ms_ = 0;
+
+  // Set by the backend when resolution scale changes.
+  uint32_t zpd_draw_resolution_scale_x_ = 1;
+  uint32_t zpd_draw_resolution_scale_y_ = 1;
+
+  uint32_t zpd_draw_resolution_scale_x() const {
+    return zpd_draw_resolution_scale_x_;
+  }
+  uint32_t zpd_draw_resolution_scale_y() const {
+    return zpd_draw_resolution_scale_y_;
+  }
+
+  uint32_t fake_zpd_sample_count_ = 0;
+  ZPDStats zpd_stats_;
 
   TraceWriter trace_writer_;
   enum class TraceState {
@@ -352,6 +599,10 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+  // Guest physical address the active vertex shader's ucode was loaded from,
+  // for reading it back from shared memory (the ucode interpreter placeholder).
+  // 0 if unknown (loaded immediately, embedded in the command buffer).
+  uint32_t active_vertex_shader_ucode_address_ = 0;
 
   bool paused_ = false;
 
@@ -363,6 +614,9 @@ class CommandProcessor {
   // Cached readback resolve mode (parsed once from string cvar)
   ReadbackResolveMode cached_readback_resolve_mode_ =
       ReadbackResolveMode::kFast;
+
+  // Cached ZPD occlusion query mode (defaults to fake)
+  ZPDMode cached_zpd_mode_ = ZPDMode::kFake;
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;

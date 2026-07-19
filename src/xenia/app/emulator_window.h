@@ -10,22 +10,21 @@
 #ifndef XENIA_APP_EMULATOR_WINDOW_H_
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 
-#include <QPointer>
-
-class QTimer;
-
+#include "xenia/app/game_library.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/ui/imgui_audio_dialog.h"
 #include "xenia/ui/imgui_confirm_dialog.h"
 #include "xenia/ui/imgui_context_menu.h"
+#include "xenia/ui/imgui_debug_dialog.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_performance_dialog.h"
 #include "xenia/ui/imgui_postprocessing_dialog.h"
-#include "xenia/ui/imgui_xmp_dialog.h"
 #include "xenia/ui/immediate_drawer.h"
 #include "xenia/ui/menu_item.h"
 #include "xenia/ui/presenter.h"
@@ -37,6 +36,9 @@ class QTimer;
 
 namespace xe {
 namespace app {
+
+class GameListPanel;
+struct WxToolbarState;
 
 class EmulatorWindow {
  public:
@@ -57,9 +59,10 @@ class EmulatorWindow {
 
   static std::unique_ptr<EmulatorWindow> Create(
       Emulator* emulator, ui::WindowedAppContext& app_context, uint32_t width,
-      uint32_t height, bool is_game_process = false);
+      uint32_t height);
 
   std::unique_ptr<xe::threading::Thread> Gamepad_HotKeys_Listener;
+  std::atomic<bool> hotkeys_listener_running_ = {false};
 
   static constexpr int64_t diff_in_ms(
       const steady_clock::time_point t1,
@@ -72,10 +75,10 @@ class EmulatorWindow {
   steady_clock::time_point last_mouse_down = steady_clock::now();
 
   Emulator* emulator() const { return emulator_; }
+  GameLibrary* game_library() const { return game_library_.get(); }
   ui::WindowedAppContext& app_context() const { return app_context_; }
   ui::Window* window() const { return window_.get(); }
   ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
-  bool is_game_process() const { return is_game_process_; }
 
   ui::Presenter* GetGraphicsSystemPresenter() const;
   void SetupGraphicsSystemPresenterPainting();
@@ -97,14 +100,15 @@ class EmulatorWindow {
                  const xe::ui::RawImage& image);
 
   void ToggleProfilesConfigDialog();
-  void ToggleXMPConfigDialog();
+  void ToggleAudioDialog();
   void ToggleConfigDialog();
   void OpenConfigDialog(const std::string& category = "");
   void ToggleControllerVibration();
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
   void FileOpen();
+  void FileAddGames();
 
-  // Helper methods for updating cvars from Qt dialogs (public for Qt dialogs)
+  // Helper methods for updating cvars from config dialogs.
   void UpdateAntiAliasingCvar(gpu::CommandProcessor::SwapPostEffect effect);
   void UpdateScalingAndSharpeningCvar(
       ui::Presenter::GuestOutputPaintConfig::Effect effect);
@@ -181,6 +185,7 @@ class EmulatorWindow {
     void OnMouseDown(ui::MouseEvent& e) override;
     void OnMouseUp(ui::MouseEvent& e) override;
     void OnMouseDoubleClick(ui::MouseEvent& e) override;
+    void OnUsbDeviceChanged(bool is_arrival) override;
 
    private:
     EmulatorWindow& emulator_window_;
@@ -188,9 +193,17 @@ class EmulatorWindow {
 
   explicit EmulatorWindow(Emulator* emulator,
                           ui::WindowedAppContext& app_context, uint32_t width,
-                          uint32_t height, bool is_game_process = false);
+                          uint32_t height);
 
   bool Initialize();
+
+  // Builds game_library_, running the one-time GPD->library migration if
+  // needed.
+  void InitializeGameLibrary();
+
+  // Registers a just-launched title in the library so games opened outside the
+  // import flow still appear in the list.
+  void AddLaunchedTitleToLibrary(uint32_t title_id, const std::string& name);
 
   void OnKeyDown(ui::KeyEvent& e);
   void OnMouseDown(const ui::MouseEvent& e);
@@ -198,9 +211,8 @@ class EmulatorWindow {
   void FileDrop(const std::filesystem::path& filename);
   void OnMouseUp(const ui::MouseEvent& e);
   void FileClose();
+  void UpdateAddGamesMenuState();
   void InstallContent();
-  void ExtractZarchive();
-  void CreateZarchive();
   void ShowContentDirectory();
   void CpuTimeScalarReset();
   void CpuTimeScalarSetHalf();
@@ -211,6 +223,7 @@ class EmulatorWindow {
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();
   void TogglePerformanceTuningDialog();
+  void ToggleDebugSettingsDialog();
   void ToggleContextMenu(bool use_cursor_position = true);
   void ShowCompatibility();
   void ShowFAQ();
@@ -232,23 +245,15 @@ class EmulatorWindow {
 
   void ClearDialogs();
 
-  // Timer callback for saving window size after resize is complete
-  void SaveWindowSizeConfig();
-
   Emulator* emulator_;
   ui::WindowedAppContext& app_context_;
-  bool is_game_process_;
   EmulatorWindowListener window_listener_;
-
-  // Timer for debouncing resize events (save config after resize is done)
-  std::unique_ptr<QTimer> resize_save_timer_;
-  uint32_t pending_resize_width_ = 0;
-  uint32_t pending_resize_height_ = 0;
 
   std::unique_ptr<ui::Window> window_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
   // Creation may fail, in this case immediate drawer UI must not be drawn.
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
+  ui::Presenter* presenter_painting_ = nullptr;
 
   bool emulator_initialized_ = false;
   std::atomic<bool> disable_hotkeys_ = false;
@@ -260,16 +265,61 @@ class EmulatorWindow {
 
   ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
   ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
-  QPointer<class GameListDialogQt> game_list_dialog_qt_;
+  ui::ImGuiDebugDialog* debug_dialog_ = nullptr;
   ProfileConfigDialog* profile_dialog_ = nullptr;
-  QPointer<class SimpleConfigDialogQt> simple_config_dialog_qt_;
-  QPointer<class ConfigDialogQt> config_dialog_qt_;
+  ui::ImGuiAudioDialog* audio_dialog_ = nullptr;
   ui::ImGuiContextMenu* context_menu_ = nullptr;
-  ui::ImGuiXmpDialog* xmp_dialog_ = nullptr;
 
-  // Menu items that need to be enabled/disabled based on child process state
-  ui::MenuItem* file_menu_ = nullptr;
-  ui::MenuItem* file_open_item_ = nullptr;
+  GameListPanel* game_list_panel_ = nullptr;
+  std::unique_ptr<GameLibrary> game_library_;
+  std::unique_ptr<WxToolbarState> wx_toolbar_state_;
+  // True when the app was started with --target and the title hasn't been
+  // explicitly stopped yet — keeps the render pane visible during the gap
+  // between the window appearing and on_launch firing.
+  bool target_pending_launch_ = false;
+  // Render dimensions captured at app start, restored after Stop.
+  uint32_t default_logical_width_ = 0;
+  uint32_t default_logical_height_ = 0;
+  ui::MenuItem* file_open_menu_item_ = nullptr;
+  ui::MenuItem* file_add_games_menu_item_ = nullptr;
+  ui::MenuItem* file_stop_menu_item_ = nullptr;
+  ui::MenuItem* profile_menu_ = nullptr;
+  ui::MenuItem* controllers_menu_ = nullptr;
+  ui::MenuItem* config_menu_ = nullptr;
+  ui::MenuItem* tools_menu_ = nullptr;
+  ui::MenuItem* audio_menu_ = nullptr;
+  // Dedupes audio-icon bucket updates (no-audio/low/mid/full).
+  int audio_icon_key_ = -1;
+  uint32_t pre_mute_volume_ = 100;
+  ui::MenuItem* view_show_toolbar_item_ = nullptr;
+  bool show_toolbar_ = true;
+  void RefreshProfileMenu();
+  void PopulateProfileMenu(ui::MenuItem* parent);
+  void RefreshControllersMenu();
+  void PopulateControllersMenu(ui::MenuItem* parent);
+  void RefreshControllerToolbar();
+  void ShowControllersPopupMenu();
+  // Native wx prompt for first-run (no profiles); shown before any render
+  // surface.
+  void ShowNoProfilePrompt();
+  void RefreshProfileIcon();
+  // Sync the toolbar's audio icon (bucket) and slider value from cvars::volume.
+  void RefreshAudioIcon();
+  void ToggleMute();
+  void ShowProfilePopupMenu();
+  // Show or hide the icon toolbar pane and persist the preference.
+  void SetToolbarVisible(bool visible);
+  // Show the quick-settings dialog (toolbar settings icon and Configuration >
+  // Main both route here).
+  void ShowQuickSettings();
+  // Reapply the "render visible iff title open or fullscreen, game list
+  // otherwise" invariant. Called on every relevant state change.
+  void ApplyContentVisibility();
+  // Tear down the running title on a non-guest thread and refresh the UI to
+  // show the game list. Skips the user prompt — caller is responsible for
+  // confirmation. Returns true if the title is being reset in-process, false
+  // if a process swap was scheduled (or no title is open).
+  bool StopTitleAndReturnToList();
 };
 
 }  // namespace app
