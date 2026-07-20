@@ -195,10 +195,20 @@ add_compile_definitions($<$<NOT:$<CONFIG:Checked>>:IMGUI_USE_STB_SPRINTF>)
 if(MSVC)
   # CRT runtime selection via CMP0091. Debug and Release use the release
   # CRT (/MD); Checked uses the debug CRT (/MDd) because it pairs /RTCsu
-  # with ASan.
-  set(CMAKE_MSVC_RUNTIME_LIBRARY
-      "MultiThreaded$<$<CONFIG:Checked>:Debug>DLL"
-      CACHE STRING "" FORCE)
+  # with ASan. XE_STATIC_CRT switches to the static CRT (/MT) so
+  # redistributable binaries (e.g. the libretro core) load on machines
+  # without the VC++ redistributable installed.
+  option(XE_STATIC_CRT
+         "Link the static MSVC runtime (/MT) instead of the DLL runtime" OFF)
+  if(XE_STATIC_CRT)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Checked>:Debug>"
+        CACHE STRING "" FORCE)
+  else()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY
+        "MultiThreaded$<$<CONFIG:Checked>:Debug>DLL"
+        CACHE STRING "" FORCE)
+  endif()
 
   # Patch the cached CMAKE_C/CXX_FLAGS_DEBUG so /MDd → /MD for Debug builds.
   # Required for vendored wxWidgets: its CMakeLists calls cmake_minimum_required

@@ -1,0 +1,130 @@
+name: libretro-release
+
+# Builds redistributable libretro core binaries:
+#   - Windows x64: clang-cl + static CRT (no VC++ redistributable needed)
+#   - Linux x64:   clang, bundles libSDL3.so.0 (resolved via $ORIGIN rpath)
+# On a v* tag push the zips are attached to a GitHub prerelease; a manual
+# workflow_dispatch run just uploads them as workflow artifacts.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build clang lld libvulkan-dev liblz4-dev \
+            libasound2-dev libpulse-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxfixes-dev libxrender-dev libx11-xcb-dev \
+            libxcb1-dev libgl-dev libfontconfig-dev
+
+      - name: Download Slang shader compiler
+        run: python3 xenia-build.py slang
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXENIA_BUILD_LIBRETRO=ON
+
+      - name: Build
+        run: cmake --build build-ci --target xenia-libretro
+
+      - name: Package
+        run: |
+          strip --strip-debug build-ci/bin/Linux/xenia_edge_libretro.so
+          mkdir dist
+          cp build-ci/bin/Linux/xenia_edge_libretro.so dist/
+          # Ship the real SDL3 library under its soname (not a symlink).
+          cp -L build-ci/bin/Linux/libSDL3.so.0 dist/
+          cp LICENSE dist/
+          cd dist
+          zip ../xenia_edge_libretro-linux-x64.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: xenia_edge_libretro-linux-x64.zip
+
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # MSVC environment: meson must detect cl for the spirv_to_dxil build,
+      # and clang-cl needs the MSVC headers/libs + Windows SDK.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build tools
+        run: pip install meson mako ninja
+
+      - name: Download Slang shader compiler
+        run: python xenia-build.py slang
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-cl
+          -DCMAKE_CXX_COMPILER=clang-cl
+          -DXENIA_BUILD_LIBRETRO=ON
+          -DXE_STATIC_CRT=ON
+
+      - name: Build
+        run: cmake --build build-ci --target xenia-libretro
+
+      - name: Verify static CRT
+        shell: pwsh
+        run: |
+          $imports = dumpbin /dependents build-ci/bin/Windows/xenia_edge_libretro.dll
+          $bad = $imports | Select-String -Pattern 'VCRUNTIME|MSVCP'
+          if ($bad) {
+            Write-Error "DLL still imports the dynamic CRT: $bad"
+            exit 1
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build-ci/bin/Windows/xenia_edge_libretro.dll dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath xenia_edge_libretro-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win64
+          path: xenia_edge_libretro-win64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux-x64, windows-x64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: '*.zip'

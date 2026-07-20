@@ -71,6 +71,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # The libretro VK presenter calls Vulkan entry points directly; xenia itself
   # only loads Vulkan dynamically.
   target_link_libraries(xenia-libretro PRIVATE vulkan)
+  # $ORIGIN lets a libSDL3.so.0 shipped next to the core resolve when the
+  # frontend dlopens the core from its cores directory (SDL3 is deliberately
+  # a shared library on Linux; see third_party/CMakeLists.txt).
+  set_target_properties(xenia-libretro PROPERTIES BUILD_RPATH "$ORIGIN")
   # Static libs resolve circular deps via a link group, mirroring the
   # executable flags set in the top-level CMakeLists. --no-undefined makes
   # missing symbols fail the link instead of surfacing at dlopen time.
