@@ -1528,9 +1528,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 
     // Pick graphics backend based on frontend's preferred HW context.
     unsigned preferred_hw = RETRO_HW_CONTEXT_NONE;
-    core_state.environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER,
-                          &preferred_hw);
+    bool have_preferred_hw = core_state.environ_cb(
+        RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred_hw);
     if (preferred_hw == RETRO_HW_CONTEXT_VULKAN) {
+        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                sizeof(core_state.graphics_backend) - 1);
+    } else if (!have_preferred_hw) {
+        // Frontend predates GET_PREFERRED_HW_RENDER (e.g. RetroArch 1.7.5 /
+        // EmuVR): no HW render negotiation is possible, so render internally
+        // with Vulkan and deliver software frames. The D3D12 backend would
+        // additionally require dxcompiler.dll and the DirectX 12 Agility SDK
+        // runtime next to the frontend executable.
         strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
                 sizeof(core_state.graphics_backend) - 1);
     } else {

@@ -158,7 +158,8 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "GPU Backend",
         "Backend",
         "Graphics backend for Xenia's internal rendering.\n"
-        "Auto: follow the frontend's preferred context (D3D12 when none).\n"
+        "Auto: follow the frontend's preferred context; Vulkan when the\n"
+        "frontend cannot express one (e.g. RetroArch 1.7.5 / EmuVR).\n"
         "Vulkan: best under Wine/Proton; no Agility SDK requirement.\n"
         "D3D12: Windows only; requires the DirectX 12 Agility runtime.",
         NULL,
