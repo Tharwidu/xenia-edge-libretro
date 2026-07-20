@@ -7,6 +7,7 @@
 #include "libretro_hid.h"
 
 #include <cstring>
+#include <string>
 
 #include "xenia/base/byte_order.h"
 
@@ -209,6 +210,24 @@ void LibretroInputDriver::UpdateFromLibretro(
   }
 }
 
+std::vector<InputDeviceInfo> LibretroInputDriver::EnumerateDevices() {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  std::vector<InputDeviceInfo> out;
+  for (size_t port = 0; port < kMaxPorts; ++port) {
+    if (!port_connected_[port]) continue;
+    InputDeviceInfo info;
+    info.driver_slot = static_cast<uint8_t>(port);
+    // Stable per-port id so the binding survives disconnect/reconnect.
+    info.stable_id = "libretro_port_" + std::to_string(port);
+    info.display_name = "RetroPad " + std::to_string(port + 1);
+    info.subtype = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
+    info.preferred_slot = static_cast<int8_t>(port);
+    info.auto_bind = true;
+    out.push_back(std::move(info));
+  }
+  return out;
+}
+
 void LibretroInputDriver::SetRumbleCallback(retro_set_rumble_state_t cb) {
   std::lock_guard<std::mutex> lock(state_mutex_);
   rumble_cb_ = cb;
@@ -216,14 +235,23 @@ void LibretroInputDriver::SetRumbleCallback(retro_set_rumble_state_t cb) {
 
 void LibretroInputDriver::SetPortDevice(unsigned port, unsigned device) {
   if (port >= kMaxPorts) return;
-  std::lock_guard<std::mutex> lock(state_mutex_);
-  // RETRO_DEVICE_NONE (0) = disconnected, other = connected.
-  port_connected_[port] = (device != RETRO_DEVICE_NONE);
-  states_[port].connected = port_connected_[port];
-  if (!port_connected_[port]) {
-    // Clear state for disconnected port
-    std::memset(&states_[port], 0, sizeof(states_[port]));
+  bool changed = false;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    // RETRO_DEVICE_NONE (0) = disconnected, other = connected.
+    const bool connected = (device != RETRO_DEVICE_NONE);
+    changed = (port_connected_[port] != connected);
+    port_connected_[port] = connected;
+    states_[port].connected = connected;
+    if (!connected) {
+      // Clear state for disconnected port
+      std::memset(&states_[port], 0, sizeof(states_[port]));
+    }
   }
+  // Connectivity changed: ask InputSystem to re-run its binding pass so the
+  // port attaches to (or vacates) a guest slot. Released outside the lock —
+  // the callback may reconcile on the caller's thread.
+  if (changed) NotifyDevicesChanged();
 }
 
 // ---- Factory --------------------------------------------------------------

@@ -61,6 +61,12 @@ class LibretroInputDriver final : public InputDriver {
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   InputType GetInputType() const override;
 
+  // Surface each connected libretro port as a device so InputSystem's binding
+  // table (has207/xenia-edge merge) actually binds us to a guest slot. Without
+  // this the base returns no devices, no slot binds, and GetState is never
+  // reached — the guest sees every controller as disconnected.
+  std::vector<InputDeviceInfo> EnumerateDevices() override;
+
   // Called from libretro frontend thread (retro_run) to update
   // the cached controller state for all ports.
   void UpdateFromLibretro(retro_input_state_t input_state_cb);
