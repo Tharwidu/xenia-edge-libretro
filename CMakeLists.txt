@@ -232,6 +232,9 @@ if(MSVC)
     # the clang warning disables from the Linux branch.
     add_compile_options(
       -Wno-unused-command-line-argument
+      # Some of the -Wno- set below only exists in newer clang; older
+      # clang-cl (e.g. GitHub runners) must not hard-error on the names.
+      -Wno-unknown-warning-option
       -Wno-character-conversion         # utfcpp third-party headers
       -Wno-deprecated-literal-operator  # tabulate/third-party
       -Wno-nontrivial-memcall

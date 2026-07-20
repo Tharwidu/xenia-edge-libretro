@@ -40,6 +40,13 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++
           -DXENIA_BUILD_LIBRETRO=ON
 
+      - name: Generate version.h
+        run: >
+          python3 -c "import importlib.util as u;
+          s = u.spec_from_file_location('xb', 'xenia-build.py');
+          m = u.module_from_spec(s); s.loader.exec_module(m);
+          m.generate_version_h('build-ci')"
+
       - name: Build
         run: cmake --build build-ci --target xenia-libretro
 
@@ -73,7 +80,7 @@ jobs:
           arch: x64
 
       - name: Install build tools
-        run: pip install meson mako ninja
+        run: pip install meson mako ninja pyyaml
 
       - name: Download Slang shader compiler
         run: python xenia-build.py slang
@@ -86,6 +93,13 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang-cl
           -DXENIA_BUILD_LIBRETRO=ON
           -DXE_STATIC_CRT=ON
+
+      - name: Generate version.h
+        run: >
+          python -c "import importlib.util as u;
+          s = u.spec_from_file_location('xb', 'xenia-build.py');
+          m = u.module_from_spec(s); s.loader.exec_module(m);
+          m.generate_version_h('build-ci')"
 
       - name: Build
         run: cmake --build build-ci --target xenia-libretro
