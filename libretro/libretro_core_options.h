@@ -534,12 +534,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
-            { "0",  "None" },
             { "1",  "Full" },
+            { "0",  "None" },
             { "-1", "All" },
             { NULL, NULL }
         },
-        "0"
+        "1"
     },
     {
         XENIA_OPT_BOOT_SPLASH,
