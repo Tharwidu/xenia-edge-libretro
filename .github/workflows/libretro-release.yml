@@ -27,7 +27,8 @@ jobs:
             libasound2-dev libpulse-dev libudev-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
             libxi-dev libxfixes-dev libxrender-dev libx11-xcb-dev \
-            libxcb1-dev libgl-dev libfontconfig-dev
+            libxcb1-dev libgl-dev libfontconfig-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev
 
       - name: Download Slang shader compiler
         run: python3 xenia-build.py slang
@@ -81,6 +82,45 @@ jobs:
 
       - name: Install build tools
         run: pip install meson mako ninja pyyaml
+
+      # The runner has no Vulkan SDK; the core only needs an import library
+      # for the loader (headers come from third_party/Vulkan-Headers).
+      # Synthesize vulkan-1.lib from the entry points the presenter links.
+      - name: Create vulkan-1 import library
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force vulkan-stub/Lib | Out-Null
+          @'
+          LIBRARY vulkan-1.dll
+          EXPORTS
+          vkAllocateCommandBuffers
+          vkAllocateMemory
+          vkBeginCommandBuffer
+          vkBindBufferMemory
+          vkBindImageMemory
+          vkCmdCopyBufferToImage
+          vkCmdPipelineBarrier
+          vkCreateBuffer
+          vkCreateCommandPool
+          vkCreateImage
+          vkCreateImageView
+          vkDestroyBuffer
+          vkDestroyCommandPool
+          vkDestroyImage
+          vkDestroyImageView
+          vkDeviceWaitIdle
+          vkEndCommandBuffer
+          vkFreeMemory
+          vkGetBufferMemoryRequirements
+          vkGetImageMemoryRequirements
+          vkGetPhysicalDeviceMemoryProperties
+          vkMapMemory
+          vkQueueSubmit
+          vkResetCommandBuffer
+          vkUnmapMemory
+          '@ | Set-Content vulkan-stub/vulkan-1.def
+          lib /nologo /def:vulkan-stub/vulkan-1.def /machine:x64 /out:vulkan-stub/Lib/vulkan-1.lib
+          "VULKAN_SDK=$PWD\vulkan-stub" >> $env:GITHUB_ENV
 
       - name: Download Slang shader compiler
         run: python xenia-build.py slang

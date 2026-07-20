@@ -1403,13 +1403,20 @@ cpp_link_args = ['/libpath:${XWIN_ROOT}/crt/lib/x64', '/libpath:${XWIN_ROOT}/sdk
   # Wipe then setup keeps the configure step idempotent across reconfigures.
   # /wd4189 overrides mesa's /we4189: Release strips asserts, leaving assert-only
   # locals that would otherwise trip the promoted warning as an error.
+  # The meson CRT must match ours or the final link fails with /failifmismatch
+  # RuntimeLibrary errors.
+  if(XE_STATIC_CRT)
+    set(_xe_s2d_vscrt mt)
+  else()
+    set(_xe_s2d_vscrt md)
+  endif()
   ExternalProject_Add(mesa_spirv_to_dxil
     SOURCE_DIR "${_xe_mesa_dir}"
     CONFIGURE_COMMAND
       "${CMAKE_COMMAND}" -E rm -rf "${_xe_s2d_build}"
       COMMAND "${XE_MESON_EXECUTABLE}" setup "${_xe_s2d_build}" "${_xe_mesa_dir}"
         ${_xe_meson_cross_args}
-        --default-library=static --buildtype=release -Db_vscrt=md
+        --default-library=static --buildtype=release -Db_vscrt=${_xe_s2d_vscrt}
         -Dc_args=/wd4189 -Dcpp_args=/wd4189
         -Dspirv-to-dxil=true
         -Dgallium-drivers= -Dvulkan-drivers= -Dplatforms=
