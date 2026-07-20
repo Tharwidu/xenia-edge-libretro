@@ -736,6 +736,9 @@ set(SDL_HIDAPI_LIBUSB OFF CACHE INTERNAL "")
 # Windows 11 when the core is loaded by a frontend. Nothing consumes SDL
 # joysticks in the libretro core (input arrives via the libretro API), and
 # SDL's other Windows joystick backends remain for standalone xenia use.
+# NOTE: SDL_XINPUT is a dep_option — a cache-only set gets clobbered on
+# reconfigure; the normal variable is what wins under CMP0077.
+set(SDL_XINPUT OFF)
 set(SDL_XINPUT OFF CACHE INTERNAL "")
 
 # We never create an SDL window, so the video backends are dead weight.

@@ -268,8 +268,11 @@ if(MSVC)
     /ignore:4006  # duplicate symbols in static libs
     /ignore:4221  # empty obj files
   )
+  # xinput is deliberately absent: a static XINPUT1_4.dll import makes the
+  # DLL fail-fast (0xC0000409) inside XInput1_4's initializer at LoadLibrary
+  # time on Windows 11. Anything that needs XInput must load it dynamically.
   link_libraries(
-    ntdll wsock32 ws2_32 xinput comctl32 shcore shlwapi dxguid bcrypt
+    ntdll wsock32 ws2_32 comctl32 shcore shlwapi dxguid bcrypt
   )
 
   # Checked: /RTCsu + ASan + debug symbols. /RTC1 from CMake's default
