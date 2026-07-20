@@ -58,6 +58,7 @@ jobs:
           cp build-ci/bin/Linux/xenia_edge_libretro.so dist/
           # Ship the real SDL3 library under its soname (not a symlink).
           cp -L build-ci/bin/Linux/libSDL3.so.0 dist/
+          cp libretro/xenia_edge_libretro.info dist/
           cp LICENSE dist/
           cd dist
           zip ../xenia_edge_libretro-linux-x64.zip *
@@ -159,6 +160,7 @@ jobs:
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item build-ci/bin/Windows/xenia_edge_libretro.dll dist/
+          Copy-Item libretro/xenia_edge_libretro.info dist/
           Copy-Item LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath xenia_edge_libretro-win64.zip
 
