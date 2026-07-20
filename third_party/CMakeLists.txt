@@ -731,6 +731,12 @@ set(SDL_GPU OFF CACHE INTERNAL "")
 set(SDL_RENDER OFF CACHE INTERNAL "")
 set(SDL_SENSOR OFF CACHE INTERNAL "")
 set(SDL_HIDAPI_LIBUSB OFF CACHE INTERNAL "")
+# SDL's XInput joystick path creates a static XINPUT1_4.dll import that
+# fail-fasts (0xC0000409) at DLL load inside XInput1_4's initializer on
+# Windows 11 when the core is loaded by a frontend. Nothing consumes SDL
+# joysticks in the libretro core (input arrives via the libretro API), and
+# SDL's other Windows joystick backends remain for standalone xenia use.
+set(SDL_XINPUT OFF CACHE INTERNAL "")
 
 # We never create an SDL window, so the video backends are dead weight.
 # SDL_VIDEO and SDL_X11 must stay on: system_gnulinux.cc dlopens
