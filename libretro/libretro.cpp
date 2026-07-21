@@ -72,6 +72,7 @@ DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(disable_context_promotion);
 #ifdef _WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/ui/d3d12/d3d12_provider.h"
 #endif
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/ui/presenter.h"
@@ -1609,17 +1610,29 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         }
     }
 #ifdef _WIN32
-    // Safety net: D3D12 without its Agility runtime can't initialize the
-    // graphics subsystem (fails outright, black screen). Fall back to the
-    // self-contained Vulkan backend so the core still works.
-    if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0 &&
-        !d3d12_runtime_available()) {
-        xenia_log(RETRO_LOG_WARN,
-                  "D3D12 selected but D3D12/D3D12Core.dll was not found next to "
-                  "the frontend; falling back to Vulkan\n");
-        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
-                sizeof(core_state.graphics_backend) - 1);
-        preferred_hw = RETRO_HW_CONTEXT_NONE;
+    // Safety net: D3D12 needs its Agility runtime next to the frontend AND an
+    // OS/driver combination that actually delivers Shader Model 6.6. Probe the
+    // full provider initialization once here; on any failure fall back to the
+    // self-contained Vulkan backend so the core still works instead of dying
+    // with a fatal error dialog.
+    if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0) {
+        const char* d3d12_fail_reason = nullptr;
+        if (!d3d12_runtime_available()) {
+            d3d12_fail_reason = "D3D12/D3D12Core.dll was not found next to the "
+                                "frontend";
+        } else if (!xe::ui::d3d12::D3D12Provider::Create(
+                       /*fatal_on_failure=*/false)) {
+            d3d12_fail_reason = "the Direct3D 12 graphics subsystem failed to "
+                                "initialize (see the xenia log for details)";
+        }
+        if (d3d12_fail_reason) {
+            xenia_log(RETRO_LOG_WARN,
+                      "D3D12 selected but %s; falling back to Vulkan\n",
+                      d3d12_fail_reason);
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                    sizeof(core_state.graphics_backend) - 1);
+            preferred_hw = RETRO_HW_CONTEXT_NONE;
+        }
     }
 #endif
     // Also update the gpu cvar so internal Xenia code stays consistent

@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 #include "xenia/base/threading.h"
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/kernel_state.h"
@@ -92,6 +94,53 @@ static void NotifyUiShownBriefly() {
 dword_result_t XamIsUIActive_entry() { return 0; }
 DECLARE_XAM_EXPORT2(XamIsUIActive, kUI, kImplemented, kHighFrequency);
 
+// True if the lowercase haystack contains any of the needles.
+static bool ContainsAnyOf(const std::string& haystack_lower,
+                          std::initializer_list<const char*> needles) {
+  for (const char* needle : needles) {
+    if (haystack_lower.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Games with online features ask "connect to Xbox LIVE or play offline?" at
+// boot. The game's default button is the connect/sign-in path, which leads
+// into profile-configuration UI we can't display, so the title waits forever.
+// Returns the index of a button that declines the online path, or -1 if this
+// doesn't look like such a prompt (or no button matches).
+static int32_t FindOfflineButton(const std::string& title_lower,
+                                 const std::string& text_lower,
+                                 const std::vector<std::string>& buttons_lower) {
+  if (buttons_lower.size() < 2) {
+    return -1;
+  }
+  if (!ContainsAnyOf(title_lower + " " + text_lower,
+                     {"xbox live", "sign in", "sign-in", "signin", "online",
+                      "network", "internet", "multiplayer", "connect"})) {
+    return -1;
+  }
+  // Strongest match first: an explicitly "offline"-worded button, then the
+  // usual decline wordings.
+  for (size_t i = 0; i < buttons_lower.size(); ++i) {
+    if (ContainsAnyOf(buttons_lower[i], {"offline", "hors ligne", "sin conex",
+                                         "senza connessione"})) {
+      return static_cast<int32_t>(i);
+    }
+  }
+  for (size_t i = 0; i < buttons_lower.size(); ++i) {
+    const std::string& label = buttons_lower[i];
+    if (label == "no" || label == "non" || label == "nein" ||
+        ContainsAnyOf(label,
+                      {"continue", "don't", "do not", "without", "later",
+                       "skip", "cancel", "not now"})) {
+      return static_cast<int32_t>(i);
+    }
+  }
+  return -1;
+}
+
 static dword_result_t ShowMessageBoxUi(
     dword_t user_index, lpu16string_t title_ptr, lpu16string_t text_ptr,
     dword_t button_count, lpdword_t button_ptrs, dword_t active_button,
@@ -101,10 +150,13 @@ static dword_result_t ShowMessageBoxUi(
   std::string title = title_ptr ? xe::to_utf8(title_ptr.value()) : "";
   std::string text = text_ptr ? xe::to_utf8(text_ptr.value()) : "";
   std::string buttons;
+  std::vector<std::string> buttons_lower;
   for (uint32_t i = 0; i < button_count; ++i) {
     auto b = xe::load_and_swap<std::u16string>(
         kernel_state()->memory()->TranslateVirtual(button_ptrs[i]));
-    buttons += (i ? " | " : "") + xe::to_utf8(b);
+    std::string label = xe::to_utf8(b);
+    buttons += (i ? " | " : "") + label;
+    buttons_lower.push_back(xe::utf8::lower_ascii(label));
   }
 
   // Default to the game's focused button; a per-game override lets the user
@@ -113,6 +165,16 @@ static dword_result_t ShowMessageBoxUi(
   if (cvars::headless_messagebox_button >= 0 &&
       cvars::headless_messagebox_button < static_cast<int32_t>(button_count)) {
     chosen = static_cast<uint32_t>(cvars::headless_messagebox_button);
+  } else {
+    // In auto mode, steer Xbox LIVE / online prompts to the offline choice -
+    // the game's own default is the sign-in path, which hangs in
+    // profile-configuration UI that headless can't show.
+    int32_t offline_button = FindOfflineButton(
+        xe::utf8::lower_ascii(title), xe::utf8::lower_ascii(text),
+        buttons_lower);
+    if (offline_button >= 0) {
+      chosen = static_cast<uint32_t>(offline_button);
+    }
   }
   XELOGI(
       "Headless message box: title='{}' text='{}' buttons=[{}] active={} -> "

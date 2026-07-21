@@ -50,6 +50,18 @@ namespace xe {
 namespace ui {
 namespace d3d12 {
 
+// Must match the D3D12Core.dll shipped in the D3D12 directory (Agility SDK
+// 1.619.3) and the D3D12SDKVersion export in windowed_app_main_win.cc.
+static constexpr UINT kAgilitySdkVersion = 619;
+
+// CLSID_D3D12SDKConfiguration from d3d12.h, defined locally because the
+// Windows SDK dxguid.lib predates the Agility SDK CLSIDs.
+static constexpr GUID kD3D12SdkConfigurationClsid = {
+    0x7cda6aca,
+    0xa03e,
+    0x49c8,
+    {0x94, 0x58, 0x03, 0x34, 0xd2, 0x0e, 0x07, 0xce}};
+
 bool D3D12Provider::IsD3D12APIAvailable() {
   HMODULE library_d3d12 = LoadLibraryW(L"D3D12.dll");
   if (!library_d3d12) {
@@ -133,17 +145,22 @@ bool D3D12Provider::IsIntelArcGpu() const {
          adapter_description_.starts_with("Intel(R) Graphics");
 }
 
-std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
+std::unique_ptr<D3D12Provider> D3D12Provider::Create(bool fatal_on_failure) {
   std::unique_ptr<D3D12Provider> provider(new D3D12Provider);
   if (!provider->Initialize()) {
-    xe::FatalError(
-        "Unable to initialize Direct3D 12 graphics subsystem.\n"
-        "\n"
-        "Ensure that you have the latest drivers for your GPU and it supports "
-        "Direct3D 12 with the feature level of at least 11_0.\n"
-        "\n"
-        "See https://xenia.jp/faq/ for more information and a list of "
-        "supported GPUs.");
+    if (fatal_on_failure) {
+      xe::FatalError(
+          "Unable to initialize Direct3D 12 graphics subsystem.\n"
+          "\n"
+          "Ensure that you have the latest drivers for your GPU and it "
+          "supports Direct3D 12 with the feature level of at least 11_0, and "
+          "that Windows is fully updated (Shader Model 6.6 needs Windows 11, "
+          "or Windows 10 1909+ with the bundled D3D12 folder next to the "
+          "executable).\n"
+          "\n"
+          "See https://xenia.jp/faq/ for more information and a list of "
+          "supported GPUs.");
+    }
     return nullptr;
   }
 
@@ -159,6 +176,9 @@ D3D12Provider::~D3D12Provider() {
   }
   if (device_ != nullptr) {
     device_->Release();
+  }
+  if (device_factory_ != nullptr) {
+    device_factory_->Release();
   }
   if (dxgi_factory_ != nullptr) {
     dxgi_factory_->Release();
@@ -335,6 +355,46 @@ bool D3D12Provider::Initialize() {
     }
   }
 
+  // The D3D12SDKVersion/D3D12SDKPath exports only work when they are on the
+  // process executable - in the libretro core the host is retroarch.exe, which
+  // doesn't carry them, so d3d12.dll would silently stay on the in-box runtime
+  // (no Shader Model 6.6 before Windows 11). Side-load the bundled Agility
+  // runtime through a device factory instead; this needs no developer mode and
+  // works from a DLL. The path is resolved relative to the process executable,
+  // same as the export.
+  device_factory_ = nullptr;
+  PFN_D3D12_GET_INTERFACE pfn_d3d12_get_interface = PFN_D3D12_GET_INTERFACE(
+      GetProcAddress(library_d3d12_, "D3D12GetInterface"));
+  if (pfn_d3d12_get_interface) {
+    ID3D12SDKConfiguration1* sdk_configuration;
+    if (SUCCEEDED(pfn_d3d12_get_interface(kD3D12SdkConfigurationClsid,
+                                          IID_PPV_ARGS(&sdk_configuration)))) {
+      if (SUCCEEDED(sdk_configuration->CreateDeviceFactory(
+              kAgilitySdkVersion, ".\\D3D12\\",
+              IID_PPV_ARGS(&device_factory_)))) {
+        XELOGI(
+            "Side-loaded the Direct3D 12 Agility SDK runtime {} from the "
+            "D3D12 directory",
+            kAgilitySdkVersion);
+      } else {
+        device_factory_ = nullptr;
+        XELOGW(
+            "Failed to create a device factory for the Agility SDK runtime "
+            "{} in the D3D12 directory, using the OS Direct3D 12 runtime",
+            kAgilitySdkVersion);
+      }
+      sdk_configuration->Release();
+    } else {
+      XELOGW(
+          "ID3D12SDKConfiguration1 is not available (Windows too old for "
+          "Agility SDK side-loading), using the OS Direct3D 12 runtime");
+    }
+  } else {
+    XELOGW(
+        "D3D12GetInterface is not available (Windows too old for Agility SDK "
+        "side-loading), using the OS Direct3D 12 runtime");
+  }
+
   // Configure the DXGI debug info queue.
   if (cvars::d3d12_break_on_error || cvars::d3d12_break_on_warning) {
     IDXGIInfoQueue* dxgi_info_queue;
@@ -467,9 +527,21 @@ bool D3D12Provider::Initialize() {
     }
   }
 
-  // Create the Direct3D 12 device.
-  ID3D12Device* device;
-  if (FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+  // Create the Direct3D 12 device, through the side-loaded Agility runtime
+  // when it's present so its Shader Model 6.6 support is actually used.
+  ID3D12Device* device = nullptr;
+  if (device_factory_ &&
+      FAILED(device_factory_->CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0,
+                                           IID_PPV_ARGS(&device)))) {
+    XELOGW(
+        "Failed to create a device via the Agility SDK runtime, retrying with "
+        "the OS Direct3D 12 runtime");
+    device_factory_->Release();
+    device_factory_ = nullptr;
+    device = nullptr;
+  }
+  if (!device_factory_ &&
+      FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
                                       IID_PPV_ARGS(&device)))) {
     XELOGE("Failed to create a Direct3D 12 feature level 11_0 device");
     adapter->Release();
@@ -491,7 +563,9 @@ bool D3D12Provider::Initialize() {
       dxgi_factory->Release();
       XELOGE(
           "The Direct3D 12 runtime lacks Shader Model 6.6 required for DXIL "
-          "shaders");
+          "shaders - the in-box runtime provides it only on Windows 11, older "
+          "Windows needs the Agility SDK runtime side-loaded from the D3D12 "
+          "directory (see the messages above for why that didn't happen)");
       return false;
     }
   }

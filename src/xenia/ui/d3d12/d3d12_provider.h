@@ -31,7 +31,10 @@ class D3D12Provider : public GraphicsProvider {
 
   static bool IsD3D12APIAvailable();
 
-  static std::unique_ptr<D3D12Provider> Create();
+  // fatal_on_failure shows the blocking error dialog on initialization
+  // failure; pass false to probe availability (e.g. to pick a fallback
+  // backend) with only log output.
+  static std::unique_ptr<D3D12Provider> Create(bool fatal_on_failure = true);
 
   std::unique_ptr<Presenter> CreatePresenter(
       Presenter::HostGpuLossCallback host_gpu_loss_callback =
@@ -206,6 +209,12 @@ class D3D12Provider : public GraphicsProvider {
   // resolves to the copy in the D3D12 folder. May be nullptr (system-wide
   // dxil.dll, if any, still resolves on dxcompiler's own).
   HMODULE library_dxil_ = nullptr;
+
+  // Non-null when the bundled Agility SDK runtime was side-loaded from the
+  // D3D12 directory; devices must then be created through it so they use that
+  // runtime instead of the in-box one (which lacks Shader Model 6.6 before
+  // Windows 11).
+  ID3D12DeviceFactory* device_factory_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
   ID3D12Device* device_ = nullptr;

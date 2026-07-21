@@ -586,18 +586,21 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
     },
     {
         XENIA_OPT_MSGBOX_BUTTON,
-        "Save Prompt Response",
-        "Save Prompt",
+        "Message Box Response",
+        "Message Box",
         "How the headless core answers a game's message-box prompt (e.g. the "
-        "'no save data - save / don't save / select device' window some games "
-        "show, which a desktop emulator would let you click).\n"
-        "Auto: the game's own default/focused button.\n"
+        "'no save data - save / don't save / select device' window or the "
+        "'connect to Xbox LIVE / play offline' question some games show, "
+        "which a desktop emulator would let you click).\n"
+        "Auto: the game's own default/focused button, except Xbox LIVE / "
+        "online prompts, where the offline choice is picked automatically "
+        "(the online path leads to a sign-in screen that cannot be shown).\n"
         "Button 0..3: force that choice (0-based) - use to steer a title that "
         "stalls on the default (try the 'continue/don't save' option).",
         NULL,
         "Emulation",
         {
-            { "-1", "Auto (game default)" },
+            { "-1", "Auto (recommended)" },
             { "0",  "Button 0" },
             { "1",  "Button 1" },
             { "2",  "Button 2" },
