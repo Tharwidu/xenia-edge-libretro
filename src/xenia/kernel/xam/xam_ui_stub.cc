@@ -28,6 +28,8 @@
 #include <thread>
 #include <vector>
 
+#include "xenia/base/byte_order.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_util.h"
@@ -37,7 +39,17 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/memory.h"
 #include "xenia/xbox.h"
+
+// Headless: games (e.g. Sonic Unleashed) pop a "no save data - save / don't
+// save / select device" message box that a windowed Xenia shows and waits on.
+// We must answer it blind; -1 uses the game's own default/focused button, or
+// set a 0-based index to force a specific choice per game.
+DEFINE_int32(headless_messagebox_button, -1,
+             "Which message-box button the headless (libretro) core auto-picks "
+             "(-1 = the game's default focused button).",
+             "HID");
 
 namespace xe {
 namespace kernel {
@@ -85,10 +97,31 @@ static dword_result_t ShowMessageBoxUi(
     dword_t button_count, lpdword_t button_ptrs, dword_t active_button,
     dword_t flags, pointer_t<MESSAGEBOX_RESULT> result_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped) {
-  // Auto-pick the focused button, exactly like the headless path upstream.
+  // Log what the title is asking, since headless we answer it blind.
+  std::string title = title_ptr ? xe::to_utf8(title_ptr.value()) : "";
+  std::string text = text_ptr ? xe::to_utf8(text_ptr.value()) : "";
+  std::string buttons;
+  for (uint32_t i = 0; i < button_count; ++i) {
+    auto b = xe::load_and_swap<std::u16string>(
+        kernel_state()->memory()->TranslateVirtual(button_ptrs[i]));
+    buttons += (i ? " | " : "") + xe::to_utf8(b);
+  }
+
+  // Default to the game's focused button; a per-game override lets the user
+  // steer prompts that need a specific choice (e.g. "continue without saving").
+  uint32_t chosen = static_cast<uint32_t>(active_button);
+  if (cvars::headless_messagebox_button >= 0 &&
+      cvars::headless_messagebox_button < static_cast<int32_t>(button_count)) {
+    chosen = static_cast<uint32_t>(cvars::headless_messagebox_button);
+  }
+  XELOGI(
+      "Headless message box: title='{}' text='{}' buttons=[{}] active={} -> "
+      "answering button {}",
+      title, text, buttons, uint32_t(active_button), chosen);
+
   return DispatchHeadless(
-      [result_ptr, active_button]() -> X_RESULT {
-        result_ptr->ButtonPressed = static_cast<uint32_t>(active_button);
+      [result_ptr, chosen]() -> X_RESULT {
+        result_ptr->ButtonPressed = chosen;
         return X_ERROR_SUCCESS;
       },
       overlapped);

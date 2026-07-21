@@ -38,6 +38,8 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
 
+#include "xenia/base/filesystem.h"
+
 // CVars declared in .cc files - DECLARE for direct assignment.
 DECLARE_bool(use_50Hz_mode);
 DECLARE_bool(apply_title_update);
@@ -62,6 +64,7 @@ DECLARE_bool(enable_xmp);
 DECLARE_int32(xmp_default_volume);
 DECLARE_bool(apply_patches);
 DECLARE_int32(license_mask);
+DECLARE_int32(headless_messagebox_button);
 DECLARE_int32(user_language);
 DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
@@ -509,6 +512,19 @@ static const char *opt_get(const char *key) {
     return nullptr;
 }
 
+#ifdef _WIN32
+// The D3D12 backend needs the Agility runtime (D3D12Core.dll) shipped in a
+// D3D12/ folder next to the frontend executable. Detect it so we can prefer
+// D3D12 (faster on demanding titles) when it's present and fall back to the
+// self-contained Vulkan backend when it isn't, instead of failing to init.
+static bool d3d12_runtime_available() {
+    std::error_code ec;
+    auto core_dll = xe::filesystem::GetExecutablePath().parent_path() /
+                    "D3D12" / "D3D12Core.dll";
+    return std::filesystem::exists(core_dll, ec);
+}
+#endif
+
 static void apply_core_options(void) {
     const char *v;
 
@@ -665,6 +681,11 @@ static void apply_core_options(void) {
     // License mask (0=None, 1=Full, -1=All)
     if ((v = opt_get(XENIA_OPT_LICENSE_MASK))) {
         cvars::license_mask = atoi(v);
+    }
+
+    // Headless message-box response (which button to auto-pick; -1 = default)
+    if ((v = opt_get(XENIA_OPT_MSGBOX_BUTTON))) {
+        cvars::headless_messagebox_button = atoi(v);
     }
 
     // User language (upstream now uses numeric XConfig language IDs)
@@ -1554,12 +1575,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                 sizeof(core_state.graphics_backend) - 1);
     } else if (!have_preferred_hw) {
         // Frontend predates GET_PREFERRED_HW_RENDER (e.g. RetroArch 1.7.5 /
-        // EmuVR): no HW render negotiation is possible, so render internally
-        // with Vulkan and deliver software frames. The D3D12 backend would
-        // additionally require dxcompiler.dll and the DirectX 12 Agility SDK
-        // runtime next to the frontend executable.
-        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
-                sizeof(core_state.graphics_backend) - 1);
+        // EmuVR): no HW render negotiation is possible. Prefer the D3D12
+        // backend (markedly faster on demanding titles) when its Agility
+        // runtime is shipped alongside the frontend; otherwise use the
+        // self-contained Vulkan backend (no extra DLLs, works under Wine too).
+#ifdef _WIN32
+        if (d3d12_runtime_available()) {
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
+                    sizeof(core_state.graphics_backend) - 1);
+        } else
+#endif
+        {
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                    sizeof(core_state.graphics_backend) - 1);
+        }
     } else {
         // D3D12, D3D11, OpenGL, or anything else ??? use D3D12 backend
         strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
@@ -1579,6 +1608,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                 preferred_hw = RETRO_HW_CONTEXT_NONE;
         }
     }
+#ifdef _WIN32
+    // Safety net: D3D12 without its Agility runtime can't initialize the
+    // graphics subsystem (fails outright, black screen). Fall back to the
+    // self-contained Vulkan backend so the core still works.
+    if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0 &&
+        !d3d12_runtime_available()) {
+        xenia_log(RETRO_LOG_WARN,
+                  "D3D12 selected but D3D12/D3D12Core.dll was not found next to "
+                  "the frontend; falling back to Vulkan\n");
+        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                sizeof(core_state.graphics_backend) - 1);
+        preferred_hw = RETRO_HW_CONTEXT_NONE;
+    }
+#endif
     // Also update the gpu cvar so internal Xenia code stays consistent
     cvars::gpu = core_state.graphics_backend;
     xenia_log(RETRO_LOG_INFO,

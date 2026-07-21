@@ -158,10 +158,31 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item build-ci/bin/Windows/xenia_edge_libretro.dll dist/
           Copy-Item libretro/xenia_edge_libretro.info dist/
           Copy-Item LICENSE dist/
+          # Bundle the DirectX 12 runtime so the (faster) D3D12 backend works
+          # out of the box. Pinned versions must match the D3D12SDKVersion (619)
+          # the code expects; the core auto-falls back to Vulkan if absent.
+          New-Item -ItemType Directory dist/D3D12 | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/dxc_2026_05_27.zip" -OutFile dxc.zip
+          Expand-Archive dxc.zip -DestinationPath dxc
+          Copy-Item dxc/bin/x64/dxcompiler.dll dist/D3D12/
+          Copy-Item dxc/bin/x64/dxil.dll dist/D3D12/
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.619.3" -OutFile agility.zip
+          Expand-Archive agility.zip -DestinationPath agility
+          Copy-Item agility/build/native/bin/x64/D3D12Core.dll dist/D3D12/
+          @'
+          xenia_edge_libretro.dll  -> RetroArch\cores\
+          xenia_edge_libretro.info -> RetroArch\info\
+          D3D12\ (folder)          -> next to retroarch.exe (RetroArch root)
+
+          The D3D12 folder enables the faster Direct3D 12 backend and is used
+          automatically when present. Without it, the core falls back to the
+          self-contained Vulkan backend on its own.
+          '@ | Set-Content dist/README-install.txt -Encoding utf8
           Compress-Archive -Path dist/* -DestinationPath xenia_edge_libretro-win64.zip
 
       - uses: actions/upload-artifact@v4

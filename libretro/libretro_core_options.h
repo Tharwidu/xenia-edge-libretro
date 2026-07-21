@@ -23,6 +23,7 @@ struct xenia_core_state;
 #define XENIA_OPT_READBACK_RESOLVE      "xenia_readback_resolve"
 #define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
 #define XENIA_OPT_AUTO_PROFILE          "xenia_auto_profile"
+#define XENIA_OPT_MSGBOX_BUTTON         "xenia_messagebox_button"
 #define XENIA_OPT_BOOT_SPLASH           "xenia_boot_splash"
 #define XENIA_OPT_STORE_SHADERS         "xenia_store_shaders"
 #define XENIA_OPT_HALF_PIXEL_OFFSET     "xenia_half_pixel_offset"
@@ -582,6 +583,28 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "enabled"
+    },
+    {
+        XENIA_OPT_MSGBOX_BUTTON,
+        "Save Prompt Response",
+        "Save Prompt",
+        "How the headless core answers a game's message-box prompt (e.g. the "
+        "'no save data - save / don't save / select device' window some games "
+        "show, which a desktop emulator would let you click).\n"
+        "Auto: the game's own default/focused button.\n"
+        "Button 0..3: force that choice (0-based) - use to steer a title that "
+        "stalls on the default (try the 'continue/don't save' option).",
+        NULL,
+        "Emulation",
+        {
+            { "-1", "Auto (game default)" },
+            { "0",  "Button 0" },
+            { "1",  "Button 1" },
+            { "2",  "Button 2" },
+            { "3",  "Button 3" },
+            { NULL, NULL }
+        },
+        "-1"
     },
     {
         XENIA_OPT_USER_LANGUAGE,
