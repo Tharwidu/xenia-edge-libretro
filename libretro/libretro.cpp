@@ -142,6 +142,9 @@ static bool game_loaded = false;
 
 // Software frame capture buffer (fallback path)
 static xe::ui::RawImage captured_frame;
+// Reusable XRGB8888 buffer for the software present path so no allocation
+// happens per frame.
+static std::vector<uint32_t> sw_frame_buf;
 
 /* ================================================================== */
 /*  Vulkan HW render state                                             */
@@ -857,9 +860,13 @@ static bool splash_run_frame(void) {
 
     plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
 
-    // Feed splash audio decoded up to this frame's timestamp.
+    // Feed splash audio, keeping a lead ahead of the video position. The
+    // per-frame video pacing below blocks retro_run for ~1 frame, during which
+    // the frontend's audio buffer would otherwise drain to empty and crackle;
+    // decoding ~100 ms ahead keeps a cushion buffered across the sleep.
     if (splash_audio_ok) {
         static int16_t s16[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
+        constexpr double kAudioLeadSeconds = 0.10;
         while (true) {
             plm_samples_t* s = plm_decode_audio(splash_plm);
             if (!s) break;
@@ -871,7 +878,7 @@ static bool splash_run_frame(void) {
             }
             if (core_state.audio_batch_cb)
                 core_state.audio_batch_cb(s16, s->count);
-            if (s->time >= frame->time) break;
+            if (s->time >= frame->time + kAudioLeadSeconds) break;
         }
     }
 
@@ -916,35 +923,47 @@ static void pace_software_frame(void) {
 }
 
 static void update_video(void) {
-    // Capture frame using presenter's CaptureGuestOutput.
+    // Capture the guest frame with the presenter's persistent-resource GPU
+    // blit (the same path the HW-render present uses). The old
+    // CaptureGuestOutput allocated a Vulkan readback buffer + command pool and
+    // did a synchronous GPU wait EVERY frame, which serialized the GPU and
+    // collapsed throughput on demanding titles (single-digit fps). The blit
+    // path reuses resources across frames and returns a mapped R8G8B8A8 buffer.
+    const void* blit_data = nullptr;
+    uint32_t w = 0, h = 0;
+    bool got = false;
     if (lr_graphics && lr_graphics->presenter()) {
-        if (lr_graphics->presenter()->CaptureGuestOutput(captured_frame)) {
-            if (captured_frame.width > 0 && captured_frame.height > 0 &&
-                !captured_frame.data.empty()) {
-                // RawImage is R8G8B8X8 byte order; RETRO_PIXEL_FORMAT_XRGB8888
-                // is little-endian 0x00RRGGBB (B first in memory) - swap R/B.
-                // The buffer is rewritten by every capture, so in-place is fine.
-                uint32_t* px = reinterpret_cast<uint32_t*>(
-                    captured_frame.data.data());
-                size_t count =
-                    (captured_frame.stride / 4) * captured_frame.height;
-                for (size_t i = 0; i < count; i++) {
-                    uint32_t v = px[i];
-                    px[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
-                            ((v & 0x000000FFu) << 16);
-                }
-                core_state.video_cb(captured_frame.data.data(),
-                                    captured_frame.width,
-                                    captured_frame.height,
-                                    (unsigned)captured_frame.stride);
-                return;
-            }
+        if (strcmp(core_state.graphics_backend, "vulkan") == 0) {
+            got = libretro_vk_capture_gpu_blit(lr_graphics->presenter(),
+                                               blit_data, w, h);
         }
+#ifdef _WIN32
+        else {
+            got = libretro_d3d12_capture_gpu_blit(lr_graphics->presenter(),
+                                                  blit_data, w, h);
+        }
+#endif
+    }
+
+    if (got && blit_data && w > 0 && h > 0) {
+        // R8G8B8A8 -> XRGB8888 (little-endian 0x00RRGGBB, B first): swap R/B
+        // into the reusable output buffer.
+        size_t count = static_cast<size_t>(w) * h;
+        if (sw_frame_buf.size() < count) sw_frame_buf.resize(count);
+        const uint32_t* src = static_cast<const uint32_t*>(blit_data);
+        uint32_t* dst = sw_frame_buf.data();
+        for (size_t i = 0; i < count; i++) {
+            uint32_t v = src[i];
+            dst[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
+                     ((v & 0x000000FFu) << 16);
+        }
+        core_state.video_cb(dst, w, h, w * 4);
+        return;
     }
 
     // Fallback: blank frame to prevent RetroArch hang.
-    uint32_t w = 1280, h = 720;
-    core_state.video_cb(nullptr, w, h, w * 4);
+    uint32_t bw = 1280, bh = 720;
+    core_state.video_cb(nullptr, bw, bh, bw * 4);
 }
 
 static void update_video_vulkan(void) {
