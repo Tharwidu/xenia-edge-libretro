@@ -19,6 +19,7 @@
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/vfs/devices/host_path_device.h"
+#include "xenia/vfs/devices/xcontent_container_device.h"
 
 DECLARE_int32(license_mask);
 
@@ -43,9 +44,23 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device =
-      std::make_unique<vfs::HostPathDevice>(device_path_, package_path, false);
-  device->Initialize();
+  // Content stored as an extracted folder mounts as a host directory; content
+  // stored as a raw STFS/XContent package file (how a real console stores it,
+  // and how downloadable content packs are distributed) mounts as a container
+  // so its inner files are exposed - same as the game-launch path.
+  std::unique_ptr<vfs::Device> device;
+  if (std::filesystem::is_directory(package_path)) {
+    device =
+        std::make_unique<vfs::HostPathDevice>(device_path_, package_path, false);
+  } else {
+    device = vfs::XContentContainerDevice::CreateContentDevice(device_path_,
+                                                               package_path);
+  }
+  if (!device || !device->Initialize()) {
+    XELOGE("ContentPackage: failed to mount content at {}",
+           xe::path_to_utf8(package_path));
+    return;
+  }
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
 }
@@ -216,17 +231,21 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
     auto file_infos = xe::filesystem::ListFiles(package_root);
 
     for (const auto& file_info : file_infos) {
-      if (file_info.type != xe::filesystem::FileInfo::Type::kDirectory) {
-        // Directories only.
-        continue;
-      }
+      const bool is_directory =
+          file_info.type == xe::filesystem::FileInfo::Type::kDirectory;
 
       XCONTENT_AGGREGATE_DATA content_data;
-      if (XSUCCEEDED(ReadContentHeaderFile(xe::path_to_utf8(file_info.name),
+      // Extracted content is a directory with a matching .header sidecar.
+      if (is_directory &&
+          XSUCCEEDED(ReadContentHeaderFile(xe::path_to_utf8(file_info.name),
                                            xuid, title_id, content_type,
                                            content_data))) {
         result.emplace_back(std::move(content_data));
       } else {
+        // Either an extracted folder without a header, or a raw STFS/XContent
+        // package file (real-console layout / distributed content packs).
+        // Either form is resolvable by file name and mountable by
+        // ContentPackage.
         content_data.device_id = device_id;
         content_data.content_type = content_type;
         content_data.set_display_name(xe::path_to_utf16(file_info.name));
