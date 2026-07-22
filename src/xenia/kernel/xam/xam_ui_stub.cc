@@ -105,37 +105,74 @@ static bool ContainsAnyOf(const std::string& haystack_lower,
   return false;
 }
 
-// Games with online features ask "connect to Xbox LIVE or play offline?" at
-// boot. The game's default button is the connect/sign-in path, which leads
-// into profile-configuration UI we can't display, so the title waits forever.
-// Returns the index of a button that declines the online path, or -1 if this
-// doesn't look like such a prompt (or no button matches).
-static int32_t FindOfflineButton(const std::string& title_lower,
-                                 const std::string& text_lower,
-                                 const std::vector<std::string>& buttons_lower) {
+// The two boot-prompt families that hang headless when answered with the
+// game's default button:
+// - Save/storage prompts (e.g. Sonic Unleashed's "no save data" box, buttons
+//   [Storage device select | Save | Don't save]): the default opens a nested
+//   storage-device selector that dead-ends invisibly; "Save" proceeds (the
+//   device selector auto-picks a device headless).
+// - Xbox LIVE / online prompts ("connect to Xbox LIVE or play offline?"):
+//   the default is the sign-in path, which walks into profile-configuration
+//   UI that can't be shown.
+// Returns the index of the button that keeps the game moving, or -1 when the
+// prompt isn't recognized (caller keeps the game's default button).
+static int32_t FindAutoButton(const std::string& title_lower,
+                              const std::string& text_lower,
+                              const std::vector<std::string>& buttons_lower) {
   if (buttons_lower.size() < 2) {
     return -1;
   }
-  if (!ContainsAnyOf(title_lower + " " + text_lower,
-                     {"xbox live", "sign in", "sign-in", "signin", "online",
-                      "network", "internet", "multiplayer", "connect"})) {
-    return -1;
-  }
-  // Strongest match first: an explicitly "offline"-worded button, then the
-  // usual decline wordings.
-  for (size_t i = 0; i < buttons_lower.size(); ++i) {
-    if (ContainsAnyOf(buttons_lower[i], {"offline", "hors ligne", "sin conex",
-                                         "senza connessione"})) {
-      return static_cast<int32_t>(i);
+  const std::string context = title_lower + " " + text_lower;
+
+  if (ContainsAnyOf(context, {"save", "storage", "memory unit"})) {
+    // An affirmative "save" button, skipping negated ("don't save") and
+    // selector ("storage device select") wordings. Exact/leading "save"
+    // outranks phrases that merely mention saving.
+    for (size_t i = 0; i < buttons_lower.size(); ++i) {
+      const std::string& label = buttons_lower[i];
+      if (label.rfind("save", 0) == 0 &&
+          !ContainsAnyOf(label, {"select", "choose", "change"})) {
+        return static_cast<int32_t>(i);
+      }
     }
+    for (size_t i = 0; i < buttons_lower.size(); ++i) {
+      const std::string& label = buttons_lower[i];
+      if (label.find("save") != std::string::npos &&
+          !ContainsAnyOf(label, {"don't", "do not", "not save", "select",
+                                 "choose", "change"})) {
+        return static_cast<int32_t>(i);
+      }
+    }
+    for (size_t i = 0; i < buttons_lower.size(); ++i) {
+      const std::string& label = buttons_lower[i];
+      if (label == "yes" || ContainsAnyOf(label, {"continue", "proceed"})) {
+        return static_cast<int32_t>(i);
+      }
+    }
+    // Not conclusive; a prompt can mention both saving and online, so fall
+    // through to the online check.
   }
-  for (size_t i = 0; i < buttons_lower.size(); ++i) {
-    const std::string& label = buttons_lower[i];
-    if (label == "no" || label == "non" || label == "nein" ||
-        ContainsAnyOf(label,
-                      {"continue", "don't", "do not", "without", "later",
-                       "skip", "cancel", "not now"})) {
-      return static_cast<int32_t>(i);
+
+  if (ContainsAnyOf(context, {"xbox live", "sign in", "sign-in", "signin",
+                              "online", "network", "internet",
+                              "multiplayer"})) {
+    // Strongest match first: an explicitly "offline"-worded button, then the
+    // usual decline wordings.
+    for (size_t i = 0; i < buttons_lower.size(); ++i) {
+      if (ContainsAnyOf(buttons_lower[i],
+                        {"offline", "hors ligne", "sin conex",
+                         "senza connessione"})) {
+        return static_cast<int32_t>(i);
+      }
+    }
+    for (size_t i = 0; i < buttons_lower.size(); ++i) {
+      const std::string& label = buttons_lower[i];
+      if (label == "no" || label == "non" || label == "nein" ||
+          ContainsAnyOf(label,
+                        {"continue", "don't", "do not", "without", "later",
+                         "skip", "cancel", "not now"})) {
+        return static_cast<int32_t>(i);
+      }
     }
   }
   return -1;
@@ -166,14 +203,14 @@ static dword_result_t ShowMessageBoxUi(
       cvars::headless_messagebox_button < static_cast<int32_t>(button_count)) {
     chosen = static_cast<uint32_t>(cvars::headless_messagebox_button);
   } else {
-    // In auto mode, steer Xbox LIVE / online prompts to the offline choice -
-    // the game's own default is the sign-in path, which hangs in
-    // profile-configuration UI that headless can't show.
-    int32_t offline_button = FindOfflineButton(
-        xe::utf8::lower_ascii(title), xe::utf8::lower_ascii(text),
-        buttons_lower);
-    if (offline_button >= 0) {
-      chosen = static_cast<uint32_t>(offline_button);
+    // In auto mode, steer recognized save/storage and Xbox LIVE / online
+    // prompts to a choice that keeps the game moving - the game's own
+    // default on both leads into UI that headless can't show.
+    int32_t auto_button = FindAutoButton(xe::utf8::lower_ascii(title),
+                                         xe::utf8::lower_ascii(text),
+                                         buttons_lower);
+    if (auto_button >= 0) {
+      chosen = static_cast<uint32_t>(auto_button);
     }
   }
   XELOGI(

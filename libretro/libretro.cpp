@@ -790,8 +790,12 @@ static plm_t* splash_plm = nullptr;
 static std::vector<uint8_t> splash_frame_buf;
 static int splash_w = 0, splash_h = 0;
 static bool splash_audio_ok = false;
-static std::chrono::steady_clock::time_point splash_next_frame;
+static std::chrono::steady_clock::time_point splash_next_tick;
+static std::chrono::steady_clock::time_point splash_t0;
 static bool splash_pacing_init = false;
+static double splash_audio_time = 0.0;  // seconds of audio delivered so far
+static bool splash_audio_done = false;
+static double splash_video_time = -1.0;  // PTS of the frame currently shown
 // "Before Boot" splash mode: the game launch is deferred until the video
 // ends (or is skipped), then performed from retro_run.
 static bool launch_pending = false;
@@ -868,30 +872,52 @@ static bool splash_run_frame(void) {
         return false;
     }
 
+    // Playback is clocked to wall time, not to the video framerate: each
+    // retro_run is one tick at the core's nominal rate (~60 Hz), audio is
+    // delivered at exactly real-time rate with a small cushion, and a new
+    // video frame is decoded only when its timestamp comes due. The previous
+    // scheme (block retro_run for a full video frame, burst-feed audio 100 ms
+    // ahead) crackled under EmuVR: with the frontend's audio sync disabled,
+    // RetroArch drops whatever overflows its ~64 ms buffer, and the long
+    // sleeps drained it in between.
     using clock = std::chrono::steady_clock;
     if (!splash_pacing_init) {
-        splash_next_frame = clock::now();
         splash_pacing_init = true;
+        splash_t0 = clock::now();
+        splash_next_tick = splash_t0;
+        splash_audio_time = 0.0;
+        splash_audio_done = !splash_audio_ok;
+        splash_video_time = -1.0;
+    }
+    double elapsed =
+        std::chrono::duration<double>(clock::now() - splash_t0).count();
+
+    // Decode video up to the current playback position (typically 0 or 1
+    // frames per tick; late frames are caught up by decoding through them).
+    while (splash_video_time < elapsed) {
+        plm_frame_t* frame = plm_decode_video(splash_plm);
+        if (!frame) {
+            splash_stop();
+            return false;
+        }
+        splash_video_time = frame->time;
+        plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
     }
 
-    plm_frame_t* frame = plm_decode_video(splash_plm);
-    if (!frame) {
-        splash_stop();
-        return false;
-    }
-
-    plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
-
-    // Feed splash audio, keeping a lead ahead of the video position. The
-    // per-frame video pacing below blocks retro_run for ~1 frame, during which
-    // the frontend's audio buffer would otherwise drain to empty and crackle;
-    // decoding ~100 ms ahead keeps a cushion buffered across the sleep.
-    if (splash_audio_ok) {
+    // Feed audio up to the playback position plus a cushion, in even
+    // MP2-frame-sized chunks. Cushion + one MP2 frame (~26 ms) must stay
+    // under the frontend's audio buffer (RetroArch default 64 ms) or the
+    // overflow gets dropped; the cushion alone must outlast one tick's sleep
+    // (~17 ms) or the buffer underruns.
+    if (!splash_audio_done) {
         static int16_t s16[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
-        constexpr double kAudioLeadSeconds = 0.10;
-        while (true) {
+        constexpr double kAudioCushionSeconds = 0.03;
+        while (splash_audio_time < elapsed + kAudioCushionSeconds) {
             plm_samples_t* s = plm_decode_audio(splash_plm);
-            if (!s) break;
+            if (!s) {
+                splash_audio_done = true;
+                break;
+            }
             for (unsigned i = 0; i < s->count * 2; i++) {
                 float f = s->interleaved[i] * 32767.0f;
                 if (f > 32767.0f) f = 32767.0f;
@@ -900,7 +926,8 @@ static bool splash_run_frame(void) {
             }
             if (core_state.audio_batch_cb)
                 core_state.audio_batch_cb(s16, s->count);
-            if (s->time >= frame->time + kAudioLeadSeconds) break;
+            splash_audio_time =
+                s->time + (double)s->count / core_state.audio_sample_rate;
         }
     }
 
@@ -911,15 +938,15 @@ static bool splash_run_frame(void) {
         }
     }
 
-    // Pace to the video's own framerate.
+    // One tick at the core's nominal output rate.
     auto now = clock::now();
-    if (now < splash_next_frame) {
-        std::this_thread::sleep_until(splash_next_frame);
+    if (now < splash_next_tick) {
+        std::this_thread::sleep_until(splash_next_tick);
     }
-    splash_next_frame += std::chrono::nanoseconds(
-        (int64_t)(1e9 / plm_get_framerate(splash_plm)));
-    if (splash_next_frame < clock::now() - std::chrono::milliseconds(200))
-        splash_next_frame = clock::now();
+    splash_next_tick += std::chrono::nanoseconds(
+        core_state.pal_mode ? 20000000 : 16683350);  // 50 / 59.94 Hz
+    if (splash_next_tick < clock::now() - std::chrono::milliseconds(200))
+        splash_next_tick = clock::now();
 
     core_state.video_cb(splash_frame_buf.data(), splash_w, splash_h,
                         splash_w * 4);
