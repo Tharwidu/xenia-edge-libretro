@@ -525,6 +525,31 @@ static bool d3d12_runtime_available() {
                     "D3D12" / "D3D12Core.dll";
     return std::filesystem::exists(core_dll, ec);
 }
+
+// True if the primary GPU is AMD. Xenia's D3D12 backend currently fails on
+// AMD (the same breakage standalone xenia has), so AMD users default to the
+// Vulkan backend instead; they can force d3d12 via the core option if it is
+// ever fixed. Uses DXGI directly (already linked) so no device is created.
+static bool primary_gpu_is_amd() {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+    bool is_amd = false;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            is_amd = (desc.VendorId == 0x1002);  // AMD/ATI PCI vendor ID
+            adapter->Release();
+            break;  // first hardware adapter is the primary
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return is_amd;
+}
 #endif
 
 static void apply_core_options(void) {
@@ -1733,7 +1758,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         // runtime is shipped alongside the frontend; otherwise use the
         // self-contained Vulkan backend (no extra DLLs, works under Wine too).
 #ifdef _WIN32
-        if (d3d12_runtime_available()) {
+        if (d3d12_runtime_available() && !primary_gpu_is_amd()) {
             strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
                     sizeof(core_state.graphics_backend) - 1);
         } else
@@ -1743,9 +1768,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                     sizeof(core_state.graphics_backend) - 1);
         }
     } else {
-        // D3D12, D3D11, OpenGL, or anything else ??? use D3D12 backend
-        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
-                sizeof(core_state.graphics_backend) - 1);
+        // D3D12, D3D11, OpenGL, or anything else -> use D3D12 backend, except
+        // on AMD where the D3D12 backend is currently broken (use Vulkan).
+#ifdef _WIN32
+        if (primary_gpu_is_amd()) {
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                    sizeof(core_state.graphics_backend) - 1);
+        } else
+#endif
+        {
+            strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
+                    sizeof(core_state.graphics_backend) - 1);
+        }
     }
     // Explicit backend option overrides the frontend-derived choice. The
     // frontend's HW render interface is only negotiated when its preferred
