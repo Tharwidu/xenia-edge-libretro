@@ -24,4 +24,6 @@ load_subsystem = "false"
 database = "Microsoft Xbox 360"
 hw_render = "true"
 
-description = "Experimental Xbox 360 core based on Xenia Edge. Set the GPU Backend core option to Vulkan when running under Wine/Proton. GOD-format games launch via the extension-less package header file; disable 'Filter by supported extensions' to browse them."
+description = "Experimental Xbox 360 core based on Xenia Edge. AMD GPUs default to the Vulkan backend (D3D12 is currently broken on AMD); others default to D3D12. Set the GPU Backend core option to Vulkan when running under Wine/Proton. GOD-format games launch via the extension-less package header file; disable 'Filter by supported extensions' to browse them."
+
+notes = "No bundled system files are required; Xbox 360 games load directly.|(EmuVR input) EmuVR maps the left stick onto the d-pad globally (analog_dpad_mode=1), so in some games stick movement also fires the d-pad. To separate them, add input_player1_analog_dpad_mode = \"0\" (and player2..4) to config/Xenia Edge/Xenia Edge.cfg. This is a RetroArch input setting the core cannot change, and it is only needed under EmuVR.|(Optional, faster) Present via Vulkan: add video_driver = \"vulkan\" to that same config file. Keyboard analog-stick binds and the menu hotkey are global RetroArch settings, not core-settable."
