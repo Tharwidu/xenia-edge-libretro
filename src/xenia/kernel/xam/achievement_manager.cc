@@ -152,6 +152,13 @@ void AchievementManager::ShowAchievementEarnedNotification(
                   xe::to_utf8(achievement->achievement_name));
 
   const Emulator* emulator = kernel_state()->emulator();
+  // Headless (libretro) build: no display window / imgui drawer exists. The
+  // unlock itself is already persisted by the backend; skip only the toast
+  // instead of dereferencing null and killing the frontend.
+  if (!emulator->display_window() || !emulator->imgui_drawer()) {
+    XELOGI("Achievement unlocked: {}", description);
+    return;
+  }
   ui::WindowedAppContext& app_context =
       emulator->display_window()->app_context();
   ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
