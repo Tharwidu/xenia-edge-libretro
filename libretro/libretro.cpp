@@ -21,6 +21,7 @@
 #include "libretro_vulkan.h"
 #ifdef _WIN32
 #include "libretro_d3d12.h"
+#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod (link: winmm)
 #endif
 #include "libretro_core_options.h"
 
@@ -872,14 +873,15 @@ static bool splash_run_frame(void) {
         return false;
     }
 
-    // Playback is clocked to wall time, not to the video framerate: each
-    // retro_run is one tick at the core's nominal rate (~60 Hz), audio is
-    // delivered at exactly real-time rate with a small cushion, and a new
-    // video frame is decoded only when its timestamp comes due. The previous
-    // scheme (block retro_run for a full video frame, burst-feed audio 100 ms
-    // ahead) crackled under EmuVR: with the frontend's audio sync disabled,
-    // RetroArch drops whatever overflows its ~64 ms buffer, and the long
-    // sleeps drained it in between.
+    // Playback clock: EmuVR's RetroArch config (and the RA default) keeps
+    // audio_sync ON, meaning audio_batch_cb BLOCKS when the frontend's ~64 ms
+    // buffer is full - it never drops. So the splash is clocked to audio: keep
+    // the decode target far enough ahead of wall time (kAudioCushionSeconds >
+    // buffer size) that the blocking write itself paces retro_run with the
+    // buffer pinned near full, making underruns (the crackle) impossible.
+    // A new video frame is decoded only when its timestamp comes due, and the
+    // tick sleep below is a fallback for audio-less splashes - after a
+    // blocking audio write the deadline has usually already passed.
     using clock = std::chrono::steady_clock;
     if (!splash_pacing_init) {
         splash_pacing_init = true;
@@ -904,14 +906,16 @@ static bool splash_run_frame(void) {
         plm_frame_to_bgra(frame, splash_frame_buf.data(), splash_w * 4);
     }
 
-    // Feed audio up to the playback position plus a cushion, in even
-    // MP2-frame-sized chunks. Cushion + one MP2 frame (~26 ms) must stay
-    // under the frontend's audio buffer (RetroArch default 64 ms) or the
-    // overflow gets dropped; the cushion alone must outlast one tick's sleep
-    // (~17 ms) or the buffer underruns.
+    // Feed audio in MP2-frame-sized chunks up to well past the wall-clock
+    // position. With audio_sync on the frontend accepts ~64 ms and then
+    // blocks the write until the DAC drains - that block IS the pacing, and
+    // the buffer stays near full across whatever sleep/decode jitter follows
+    // (Windows timers are 15.6 ms coarse). A frontend running audio_sync off
+    // instead drops the overflow, but such a config free-runs everything and
+    // has already accepted broken audio timing.
     if (!splash_audio_done) {
         static int16_t s16[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
-        constexpr double kAudioCushionSeconds = 0.03;
+        constexpr double kAudioCushionSeconds = 0.10;
         while (splash_audio_time < elapsed + kAudioCushionSeconds) {
             plm_samples_t* s = plm_decode_audio(splash_plm);
             if (!s) {
@@ -953,9 +957,10 @@ static bool splash_run_frame(void) {
     return true;
 }
 
-// Pace software-mode retro_run to content rate. Frontends that disable both
-// vsync and audio sync (EmuVR's config does) call retro_run in a free spin,
-// which turns the per-frame CaptureGuestOutput readback into a GPU flood.
+// Pace software-mode retro_run to content rate. EmuVR's config turns vsync
+// off, and audio sync only throttles while the core is actually delivering
+// audio - during loads/silence retro_run free-spins, which turns the
+// per-frame CaptureGuestOutput readback into a GPU flood.
 // Under a normally throttled frontend the deadline is already past and this
 // is a no-op.
 static void pace_software_frame(void) {
@@ -1488,6 +1493,13 @@ RETRO_API void retro_set_input_poll(retro_input_poll_t cb)            { core_sta
 RETRO_API void retro_set_input_state(retro_input_state_t cb)          { core_state.input_state_cb = cb; }
 
 RETRO_API void retro_init(void) {
+#ifdef _WIN32
+    // The splash and software-present pacing sleep in ~17 ms ticks; without
+    // this the Windows default 15.6 ms timer granularity makes each sleep
+    // overshoot by up to a full tick. Per-process since Windows 10 2004, so
+    // the frontend's own resolution is unaffected.
+    timeBeginPeriod(1);
+#endif
     core_state.audio_sample_rate  = 48000.0;
     core_state.audio_buffer_size  = 4096;   // int16 values (2048 stereo frames)
     core_state.audio_buffer       = static_cast<int16_t *>(
@@ -1505,6 +1517,9 @@ RETRO_API void retro_deinit(void) {
     free(core_state.audio_buffer);
     core_state.audio_buffer = nullptr;
 
+#ifdef _WIN32
+    timeEndPeriod(1);
+#endif
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {

@@ -62,7 +62,7 @@ endif()
 if(WIN32)
   target_link_libraries(xenia-libretro PRIVATE
     xenia-gpu-d3d12 xenia-ui-d3d12
-    d3d12 dxgi d3dcompiler vulkan-1)
+    d3d12 dxgi d3dcompiler vulkan-1 winmm)
   if(DEFINED ENV{VULKAN_SDK})
     target_include_directories(xenia-libretro PRIVATE "$ENV{VULKAN_SDK}/Include")
     target_link_directories(xenia-libretro PRIVATE "$ENV{VULKAN_SDK}/Lib")
