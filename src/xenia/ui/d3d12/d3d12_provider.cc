@@ -177,6 +177,9 @@ D3D12Provider::~D3D12Provider() {
   if (device_ != nullptr) {
     device_->Release();
   }
+  if (device_configuration_ != nullptr) {
+    device_configuration_->Release();
+  }
   if (device_factory_ != nullptr) {
     device_factory_->Release();
   }
@@ -549,6 +552,24 @@ bool D3D12Provider::Initialize() {
     return false;
   }
   adapter->Release();
+
+  // Route root-signature serialization to the device's own runtime (the
+  // D3D12SerializeRootSignature export always uses the in-box one, which on
+  // Windows 10 rejects the SM 6.6 bindless root signature flags).
+  device_configuration_ = nullptr;
+  if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device_configuration_)))) {
+    XELOGI(
+        "Root signatures will be serialized by the device's Direct3D 12 "
+        "runtime");
+  } else {
+    device_configuration_ = nullptr;
+    if (device_factory_) {
+      XELOGW(
+          "ID3D12DeviceConfiguration unavailable on the side-loaded runtime, "
+          "root-signature serialization falls back to the OS export and may "
+          "reject Shader Model 6.6 bindless flags");
+    }
+  }
 
   // Safety net: the Agility runtime should provide Shader Model 6.6 for DXIL.
   {
