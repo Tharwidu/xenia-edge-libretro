@@ -1753,6 +1753,22 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                 resolved = std::filesystem::path(core_state.game_path)
                                .parent_path() / resolved;
             }
+            // Verify the target before handing it to the emulator. Pointer
+            // files routinely hold absolute paths, so moving or renaming a
+            // library silently breaks them; without this check the launch
+            // fails deep inside LaunchPath as a bare 0xC00000BB
+            // (STATUS_NOT_SUPPORTED) that says nothing about the real cause.
+            if (!std::filesystem::exists(resolved, ptr_ec)) {
+                xenia_log(RETRO_LOG_ERROR,
+                          "Pointer file %s targets a path that does not "
+                          "exist: %s\n",
+                          core_state.game_path, resolved.string().c_str());
+                xenia_log(RETRO_LOG_ERROR,
+                          "Update the pointer file to the content's current "
+                          "location. A path relative to the pointer file "
+                          "survives moving the library.\n");
+                return false;
+            }
             snprintf(core_state.game_path, sizeof(core_state.game_path), "%s",
                      resolved.string().c_str());
             xenia_log(RETRO_LOG_INFO, "Pointer file resolved to: %s\n",
