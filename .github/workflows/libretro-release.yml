@@ -11,6 +11,11 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Route sccache at the Actions cache. Needed by the compile steps, not just
+# the configure step, so it is set for every job.
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   linux-x64:
     runs-on: ubuntu-24.04
@@ -33,12 +38,19 @@ jobs:
       - name: Download Slang shader compiler
         run: python3 xenia-build.py slang
 
+      # Compiler cache. Most runs change a handful of files, so the bulk of
+      # the tree can be reused from the previous run instead of recompiled.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Configure
         run: >
           cmake -S . -B build-ci -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=clang
           -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DXENIA_BUILD_LIBRETRO=ON
 
       - name: Generate version.h
@@ -126,12 +138,19 @@ jobs:
       - name: Download Slang shader compiler
         run: python xenia-build.py slang
 
+      # Compiler cache. Most runs change a handful of files, so the bulk of
+      # the tree can be reused from the previous run instead of recompiled.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Configure
         run: >
           cmake -S . -B build-ci -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=clang-cl
           -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           -DXENIA_BUILD_LIBRETRO=ON
           -DXE_STATIC_CRT=ON
 
