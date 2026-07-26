@@ -1764,9 +1764,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                           "exist: %s\n",
                           core_state.game_path, resolved.string().c_str());
                 xenia_log(RETRO_LOG_ERROR,
-                          "Update the pointer file to the content's current "
-                          "location. A path relative to the pointer file "
-                          "survives moving the library.\n");
+                          "Edit the pointer file so it contains the full path "
+                          "to the content's current location.\n");
                 return false;
             }
             snprintf(core_state.game_path, sizeof(core_state.game_path), "%s",
