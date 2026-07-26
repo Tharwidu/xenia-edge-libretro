@@ -1793,12 +1793,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         if (primary_gpu_is_amd()) {
             strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
                     sizeof(core_state.graphics_backend) - 1);
-        } else
-#endif
-        {
+        } else {
             strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
                     sizeof(core_state.graphics_backend) - 1);
         }
+#else
+        // Vulkan is the only backend that exists off Windows - there is no
+        // D3D12 to fall back to. A frontend preferring OpenGL (RetroArch's
+        // usual Linux default) must not steer us into a backend that cannot
+        // be built here.
+        strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
+                sizeof(core_state.graphics_backend) - 1);
+#endif
     }
     // Explicit backend option overrides the frontend-derived choice. The
     // frontend's HW render interface is only negotiated when its preferred
@@ -1807,6 +1813,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     // avoids the D3D12 Agility SDK requirement entirely).
     {
         const char* bopt = opt_get(XENIA_OPT_GPU_BACKEND);
+#ifndef _WIN32
+        // The d3d12 value is not offered in the option list off Windows, but a
+        // stale options file (copied from a Windows install, or a frontend
+        // core-override) can still carry it. There is no D3D12 here and the
+        // safety net below is Windows-only, so refuse it rather than fail hard.
+        if (bopt && strcmp(bopt, XENIA_GRAPHICS_D3D12) == 0) {
+            xenia_log(RETRO_LOG_WARN,
+                      "GPU Backend 'd3d12' is not available on this platform; "
+                      "using Vulkan\n");
+            bopt = XENIA_GRAPHICS_VULKAN;
+        }
+#endif
         if (bopt && strcmp(bopt, "auto") != 0) {
             strncpy(core_state.graphics_backend, bopt,
                     sizeof(core_state.graphics_backend) - 1);
