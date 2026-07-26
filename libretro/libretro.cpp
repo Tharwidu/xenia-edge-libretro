@@ -1620,19 +1620,16 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     };
     cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)descs);
 
-    // Name the device type so the Controls menu shows "Xbox 360 Controller"
-    // on every port instead of a bare "RetroPad".
-    static const struct retro_controller_description port_devices[] = {
-        { "Xbox 360 Controller", RETRO_DEVICE_JOYPAD },
-    };
-    static const struct retro_controller_info ports[] = {
-        { port_devices, 1 },
-        { port_devices, 1 },
-        { port_devices, 1 },
-        { port_devices, 1 },
-        { NULL, 0 },
-    };
-    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
+    // NOTE: deliberately no SET_CONTROLLER_INFO here. Declaring N controller
+    // ports makes the frontend call retro_set_controller_port_device() for
+    // each one, which LibretroInputDriver::SetPortDevice turns into
+    // port_connected_ = true. That presents four live 360 pads to the title
+    // while only profile slot 0 is signed in (see retro_load_game), and the
+    // guest crashes during launch. Dolphin can declare four ports because it
+    // genuinely emulates four; until this core handles multiple pads (and
+    // offers a RETRO_DEVICE_NONE option per port, as PCSX2 does), one implicit
+    // port is correct. The input descriptors above are labels only and carry
+    // no connection semantics, so they stay.
 
     const char *dir = nullptr;
     if (cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
