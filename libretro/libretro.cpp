@@ -1805,12 +1805,33 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         // settings unreachable - and core options cannot fill the gap because
         // RetroArch 1.7.5 has no per-game core options, so anything set there
         // applies to every 360 title at once.
+        // Report this through the core's own logger rather than relying on
+        // xenia's. This runs before the emulator exists, so xenia's logging is
+        // not up yet and its XELOGI lines about the config are dropped. Note
+        // LoadGameConfigForFile returns the title id even when no config file
+        // was found, so the return value alone says nothing about whether any
+        // override was applied - check for the file explicitly.
         uint32_t cfg_title_id =
             config::LoadGameConfigForFile(core_state.game_path);
-        if (cfg_title_id) {
+        if (!cfg_title_id) {
             xenia_log(RETRO_LOG_INFO,
-                      "Loaded per-title config overrides for %08X\n",
-                      cfg_title_id);
+                      "No title id for %s; per-title config skipped\n",
+                      core_state.game_path);
+        } else {
+            char tid[16];
+            snprintf(tid, sizeof(tid), "%08X", cfg_title_id);
+            std::filesystem::path per_title =
+                cfg_dir / "config" / (std::string(tid) + ".config.toml");
+            std::error_code pt_ec;
+            if (std::filesystem::exists(per_title, pt_ec)) {
+                xenia_log(RETRO_LOG_INFO,
+                          "Applied per-title config for %s: %s\n", tid,
+                          per_title.string().c_str());
+            } else {
+                xenia_log(RETRO_LOG_INFO,
+                          "Title %s has no per-title config (looked for %s)\n",
+                          tid, per_title.string().c_str());
+            }
         }
     }
 
