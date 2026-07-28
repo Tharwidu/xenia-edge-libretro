@@ -2051,13 +2051,41 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     // with a fatal error dialog.
     if (strcmp(core_state.graphics_backend, XENIA_GRAPHICS_D3D12) == 0) {
         const char* d3d12_fail_reason = nullptr;
+        std::unique_ptr<xe::ui::d3d12::D3D12Provider> d3d12_probe;
         if (!d3d12_runtime_available()) {
             d3d12_fail_reason = "D3D12/D3D12Core.dll was not found next to the "
                                 "frontend";
-        } else if (!xe::ui::d3d12::D3D12Provider::Create(
-                       /*fatal_on_failure=*/false)) {
-            d3d12_fail_reason = "the Direct3D 12 graphics subsystem failed to "
-                                "initialize (see the xenia log for details)";
+        } else {
+            d3d12_probe =
+                xe::ui::d3d12::D3D12Provider::Create(/*fatal_on_failure=*/false);
+            if (!d3d12_probe) {
+                d3d12_fail_reason =
+                    "the Direct3D 12 graphics subsystem failed to "
+                    "initialize (see the xenia log for details)";
+            } else {
+                // Report the capabilities the provider actually came back with.
+                // Initialization succeeding tells us very little on its own -
+                // under Proton it succeeds and the title still dies at launch.
+                // These are the properties xenia's D3D12 backend depends on, so
+                // comparing this line between native Windows and vkd3d-proton
+                // localises the difference instead of guessing at it.
+                const uint16_t sm = d3d12_probe->GetHighestShaderModel();
+                xenia_log(RETRO_LOG_INFO,
+                          "D3D12 probe OK: %s, shader model %u.%u%s\n",
+                          d3d12_probe->GetAdapterDescription().c_str(),
+                          unsigned(sm >> 4), unsigned(sm & 0xF),
+                          sm >= 0x66 ? "" : " (below the 6.6 xenia wants)");
+                xenia_log(RETRO_LOG_INFO,
+                          "D3D12 caps: ROV=%s, PS stencil ref=%s, "
+                          "barycentrics=%s, tiled tier=%d, binding tier=%d\n",
+                          d3d12_probe->AreRasterizerOrderedViewsSupported()
+                              ? "yes" : "no",
+                          d3d12_probe->IsPSSpecifiedStencilReferenceSupported()
+                              ? "yes" : "no",
+                          d3d12_probe->AreBarycentricsSupported() ? "yes" : "no",
+                          int(d3d12_probe->GetTiledResourcesTier()),
+                          int(d3d12_probe->GetResourceBindingTier()));
+            }
         }
         if (d3d12_fail_reason) {
             xenia_log(RETRO_LOG_WARN,
