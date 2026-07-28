@@ -71,6 +71,15 @@ DECLARE_int32(user_language);
 DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
 DECLARE_bool(clear_memory_page_state);
+// Declared for the effective-settings report only - these are not exposed as
+// core options, so a config file is the only way to set them and the log is
+// the only way to confirm one took.
+DECLARE_uint32(texture_cache_memory_limit_render_to_texture);
+DECLARE_bool(elide_e0_check);
+DECLARE_bool(inline_loadclock);
+DECLARE_uint32(align_all_basic_blocks);
+DECLARE_bool(enable_rmw_context_merging);
+DECLARE_bool(ignore_thread_priorities);
 DECLARE_bool(disable_context_promotion);
 #ifdef _WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
@@ -1915,6 +1924,49 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 
     // Apply any options set before load
     apply_core_options();
+
+    // Report what the settings actually resolved to.
+    //
+    // Three layers feed these: xenia's built-in defaults, the config files
+    // (base then per-title), and core options - and only the last of those is
+    // visible in the frontend log. That has repeatedly cost real time: a config
+    // value silently overwritten by a core option looks identical to a config
+    // that was never read, and a setting that changed nothing looks identical
+    // to one that was ignored. Printing the resolved values once removes the
+    // guesswork from every future "did that take effect?".
+    // The graphics backend is deliberately absent here: it is not chosen until
+    // after this point, and is logged by the selection code itself.
+    xenia_log(RETRO_LOG_INFO, "Effective settings:\n");
+    xenia_log(RETRO_LOG_INFO, "  render_target_path = %s\n",
+              cvars::render_target_path.c_str());
+    xenia_log(RETRO_LOG_INFO, "  readback_resolve = %s\n",
+              cvars::readback_resolve.c_str());
+    xenia_log(RETRO_LOG_INFO, "  draw_resolution_scale = %dx%d\n",
+              cvars::draw_resolution_scale_x, cvars::draw_resolution_scale_y);
+    xenia_log(RETRO_LOG_INFO, "  texture_cache_rt_limit = %u MB\n",
+              cvars::texture_cache_memory_limit_render_to_texture);
+    xenia_log(RETRO_LOG_INFO,
+              "  async_shaders = %s, store_shaders = %s, "
+              "clear_memory_page_state = %s\n",
+              cvars::async_shader_compilation ? "on" : "off",
+              cvars::store_shaders ? "on" : "off",
+              cvars::clear_memory_page_state ? "on" : "off");
+    xenia_log(RETRO_LOG_INFO,
+              "  half_pixel_offset = %s, invalid_fetch = %s, "
+              "fuzzy_alpha = %s\n",
+              cvars::half_pixel_offset ? "on" : "off",
+              cvars::gpu_allow_invalid_fetch_constants ? "on" : "off",
+              cvars::use_fuzzy_alpha_epsilon ? "on" : "off");
+    xenia_log(RETRO_LOG_INFO,
+              "  cpu: elide_e0=%s inline_loadclock=%s rmw_merge=%s "
+              "align_blocks=%u ignore_thread_prio=%s\n",
+              cvars::elide_e0_check ? "on" : "off",
+              cvars::inline_loadclock ? "on" : "off",
+              cvars::enable_rmw_context_merging ? "on" : "off",
+              cvars::align_all_basic_blocks,
+              cvars::ignore_thread_priorities ? "on" : "off");
+    xenia_log(RETRO_LOG_INFO, "  apply_patches = %s, framerate_limit = %u\n",
+              cvars::apply_patches ? "on" : "off", cvars::framerate_limit);
 
     // Describe the graphics environment before choosing a backend, so a failed
     // choice can be diagnosed from the log rather than by bisecting settings.
