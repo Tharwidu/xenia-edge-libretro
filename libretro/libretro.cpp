@@ -27,6 +27,7 @@
 
 // Xenia headers
 #include "xenia/xbox.h"
+#include "xenia/config.h"
 #include "xenia/emulator.h"
 #include "xenia/memory.h"
 #include "xenia/base/clock.h"
@@ -1773,6 +1774,28 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
             xenia_log(RETRO_LOG_INFO, "Pointer file resolved to: %s\n",
                       core_state.game_path);
         }
+    }
+
+    // Load xenia's own config file, if the user has one, BEFORE core options.
+    // Only a few dozen of xenia's cvars are exposed as core options; everything
+    // else - the targeted EDRAM/accuracy knobs, per-title workarounds, the
+    // settings community configs are built around - was previously unreachable
+    // from this core. Reading the config here makes all of them available while
+    // keeping core options authoritative for the subset we do expose, since
+    // apply_core_options() runs immediately after and overwrites them.
+    //
+    // SetupConfig() also writes the file back (config.cc SaveConfig), which
+    // gives the user a fully self-documenting config to edit - the same
+    // behaviour as standalone xenia. SaveConfig is a no-op until this call, so
+    // this is the point where that becomes live.
+    {
+        std::error_code cfg_ec;
+        std::filesystem::path cfg_dir =
+            std::filesystem::path(core_state.system_dir) / "xenia";
+        std::filesystem::create_directories(cfg_dir, cfg_ec);
+        config::SetupConfig(cfg_dir);
+        xenia_log(RETRO_LOG_INFO, "Config folder: %s\n",
+                  cfg_dir.string().c_str());
     }
 
     // Apply any options set before load
