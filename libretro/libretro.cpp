@@ -1796,6 +1796,22 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         config::SetupConfig(cfg_dir);
         xenia_log(RETRO_LOG_INFO, "Config folder: %s\n",
                   cfg_dir.string().c_str());
+
+        // Then layer this title's own config on top, if one exists. xenia
+        // stores these as <config folder>/config/<TITLEID>.config.toml and
+        // clears the previous title's overrides first, so each game gets
+        // base config + its own settings and nothing leaks between titles.
+        // The desktop app does this; the core never did, which left per-game
+        // settings unreachable - and core options cannot fill the gap because
+        // RetroArch 1.7.5 has no per-game core options, so anything set there
+        // applies to every 360 title at once.
+        uint32_t cfg_title_id =
+            config::LoadGameConfigForFile(core_state.game_path);
+        if (cfg_title_id) {
+            xenia_log(RETRO_LOG_INFO,
+                      "Loaded per-title config overrides for %08X\n",
+                      cfg_title_id);
+        }
     }
 
     // Apply any options set before load
