@@ -2039,7 +2039,70 @@ RETRO_API size_t retro_get_memory_size(unsigned id) {
 RETRO_API void retro_reset(void) {
 }
 
+// Frame pacing report.
+//
+// This core had no performance signal of any kind - not a frame time, not an
+// fps figure - which made "it feels sluggish" impossible to act on and left
+// tuning to guesswork. retro_run is called once per presented frontend frame,
+// so the interval between calls is the real end-to-end frame time.
+//
+// Summarised every 5s rather than per frame to keep the log usable. Frames
+// slower than 1.5x the target are counted separately, because an average can
+// look healthy while regular hitches make it feel bad.
+static void report_frame_pacing(void) {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point last_frame{};
+    static clock::time_point window_start{};
+    static double total_ms = 0.0;
+    static double worst_ms = 0.0;
+    static uint32_t frames = 0;
+    static uint32_t slow_frames = 0;
+
+    const clock::time_point now = clock::now();
+    if (last_frame.time_since_epoch().count() == 0) {
+        last_frame = window_start = now;
+        return;
+    }
+
+    const double ms =
+        std::chrono::duration<double, std::milli>(now - last_frame).count();
+    last_frame = now;
+
+    // A gap this large is a load, a pause or the frontend stalling, not a
+    // rendered frame - it would swamp the averages, so restart the window.
+    if (ms > 1000.0) {
+        window_start = now;
+        total_ms = worst_ms = 0.0;
+        frames = slow_frames = 0;
+        return;
+    }
+
+    const double target_fps = core_state.pal_mode ? 50.0 : 60.0;
+    const double target_ms = 1000.0 / target_fps;
+
+    total_ms += ms;
+    frames++;
+    if (ms > worst_ms) worst_ms = ms;
+    if (ms > target_ms * 1.5) slow_frames++;
+
+    const double window_s =
+        std::chrono::duration<double>(now - window_start).count();
+    if (window_s >= 5.0 && frames > 0) {
+        const double avg_ms = total_ms / frames;
+        xenia_log(RETRO_LOG_INFO,
+                  "Frame pacing: %.1f fps avg (%.1f ms), worst %.1f ms, "
+                  "%u of %u frames missed %.0f fps\n",
+                  1000.0 / avg_ms, avg_ms, worst_ms, slow_frames, frames,
+                  target_fps);
+        window_start = now;
+        total_ms = worst_ms = 0.0;
+        frames = slow_frames = 0;
+    }
+}
+
 RETRO_API void retro_run(void) {
+    report_frame_pacing();
+
     // Poll input from the frontend
     if (core_state.input_poll_cb) core_state.input_poll_cb();
 

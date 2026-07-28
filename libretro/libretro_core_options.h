@@ -179,18 +179,18 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_READBACK_RESOLVE,
         "Readback Resolve",
         "Readback",
-        "Controls CPU readback of render-to-texture resolve results.\n"
-        "Fast: read from previous frame (default).\n"
-        "Some: selective readback.\n"
-        "Full: immediate GPU sync (slow).\n"
-        "None: disable readback (some games render better without it).",
+        "Controls which render-to-texture resolves are copied back into "
+        "guest RAM.\n"
+        "Fast: copy only resolves the CPU reads back (default).\n"
+        "All: copy every resolve - slower, needed by a few titles.\n"
+        "None: disable readback completely - fastest, but some titles "
+        "render incorrectly without it.",
         NULL,
         "Graphics",
         {
             { "fast", "Fast (Default)" },
-            { "some", "Some" },
-            { "full", "Full (Slow)" },
-            { "none", "None" },
+            { "all",  "All (Slower)" },
+            { "none", "None (Fastest)" },
             { NULL, NULL }
         },
         "fast"
