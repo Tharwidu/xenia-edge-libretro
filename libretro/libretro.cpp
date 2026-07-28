@@ -2085,15 +2085,31 @@ static void report_frame_pacing(void) {
     if (ms > worst_ms) worst_ms = ms;
     if (ms > target_ms * 1.5) slow_frames++;
 
+    // Guest present count, so the game's own rate can be told apart from the
+    // host's. A 30 Hz title presenting 30 while the host paints 60 is correct
+    // and healthy; the same title presenting 18 is the emulator falling behind.
+    // Without both numbers "sluggish" is unattributable.
+    static uint64_t last_guest_count = 0;
+    uint64_t guest_count = 0;
+    if (lr_graphics && lr_graphics->presenter()) {
+        guest_count = lr_graphics->presenter()->guest_output_refresh_count();
+    }
+
     const double window_s =
         std::chrono::duration<double>(now - window_start).count();
     if (window_s >= 5.0 && frames > 0) {
         const double avg_ms = total_ms / frames;
-        xenia_log(RETRO_LOG_INFO,
-                  "Frame pacing: %.1f fps avg (%.1f ms), worst %.1f ms, "
-                  "%u of %u frames missed %.0f fps\n",
-                  1000.0 / avg_ms, avg_ms, worst_ms, slow_frames, frames,
-                  target_fps);
+        const double host_fps = 1000.0 / avg_ms;
+        if (guest_count >= last_guest_count) {
+            const double guest_fps =
+                double(guest_count - last_guest_count) / window_s;
+            xenia_log(RETRO_LOG_INFO,
+                      "Frame pacing: host %.1f fps (%.1f ms avg, worst %.1f "
+                      "ms) | guest %.1f fps | %u of %u host frames late\n",
+                      host_fps, avg_ms, worst_ms, guest_fps, slow_frames,
+                      frames);
+        }
+        last_guest_count = guest_count;
         window_start = now;
         total_ms = worst_ms = 0.0;
         frames = slow_frames = 0;

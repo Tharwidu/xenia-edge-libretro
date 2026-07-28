@@ -320,6 +320,15 @@ class Presenter {
       uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
       std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Number of guest output refreshes that actually happened - in other words,
+  // how many frames the guest has presented. Distinct from the host's present
+  // rate: a 30 Hz title refreshes this half as often as a 60 Hz host display
+  // is painted, which is normal. Sampling this over time is the only way to
+  // tell "the game runs at 30" apart from "the emulator is managing 30".
+  // Incremented from the GPU thread, read from anywhere.
+  uint64_t guest_output_refresh_count() const {
+    return guest_output_refresh_count_.load(std::memory_order_relaxed);
+  }
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
