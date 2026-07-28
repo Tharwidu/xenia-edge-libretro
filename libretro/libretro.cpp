@@ -515,7 +515,26 @@ static const char *opt_get(const char *key) {
     return nullptr;
 }
 
+// True when an option is set to "auto", meaning: do not write the cvar, leave
+// whatever the config decided.
+//
+// The frontend always hands back a value - its own default if the user never
+// touched the option - so an unconditional assignment here overwrites the
+// config every single launch. That made every cvar we expose impossible to set
+// per title, and a perfectly valid config line for one of them would silently
+// do nothing. RetroArch 1.7.5 has no per-game core options, so the config is
+// the only per-title mechanism available and it must be able to win.
+static bool opt_is_auto(const char *v) {
+    return v && strcmp(v, "auto") == 0;
+}
+
 #ifdef _WIN32
+// Win32 API surface for the environment report below (GetModuleHandleA,
+// GetProcAddress, WideCharToMultiByte). It arrives transitively via dxgi.h
+// today, but through xenia's wrapper rather than raw windows.h so the
+// project's NOMINMAX / lean-and-mean defines apply.
+#include "xenia/base/platform_win.h"
+
 // The D3D12 backend needs the Agility runtime (D3D12Core.dll) shipped in a
 // D3D12/ folder next to the frontend executable. Detect it so we can prefer
 // D3D12 (faster on demanding titles) when it's present and fall back to the
@@ -525,6 +544,62 @@ static bool d3d12_runtime_available() {
     auto core_dll = xe::filesystem::GetExecutablePath().parent_path() /
                     "D3D12" / "D3D12Core.dll";
     return std::filesystem::exists(core_dll, ec);
+}
+
+// Report the graphics environment once, before a backend is chosen.
+//
+// When D3D12 failed under Proton the core logged a single line naming the
+// backend and nothing else - not the adapter, not whether we were even running
+// under Wine - so the failure was undiagnosable and the only way forward was to
+// route around it onto Vulkan. Everything here is read-only: adapter properties
+// come from DXGI without creating a device, and Wine is detected by looking for
+// an export that only exists there.
+static void log_graphics_environment(void) {
+    // wine_get_version is exported by Wine's ntdll and by nothing else, so its
+    // presence is the standard way to tell we are not on real Windows. Under
+    // Proton, D3D12 is vkd3d-proton rather than Microsoft's implementation,
+    // which is exactly the case where xenia's D3D12 backend has been failing.
+    const char* host = "Windows";
+    if (HMODULE ntdll = GetModuleHandleA("ntdll.dll")) {
+        typedef const char*(CDECL * wine_get_version_t)(void);
+        auto wine_get_version = reinterpret_cast<wine_get_version_t>(
+            reinterpret_cast<void*>(GetProcAddress(ntdll, "wine_get_version")));
+        if (wine_get_version) {
+            const char* ver = wine_get_version();
+            xenia_log(RETRO_LOG_INFO, "Host: Wine/Proton %s\n",
+                      ver ? ver : "(unknown version)");
+            host = "Wine";
+        }
+    }
+    if (strcmp(host, "Windows") == 0) {
+        xenia_log(RETRO_LOG_INFO, "Host: native Windows\n");
+    }
+
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        xenia_log(RETRO_LOG_WARN, "DXGI unavailable; no adapter info\n");
+        return;
+    }
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            char name[128] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name,
+                                sizeof(name) - 1, nullptr, nullptr);
+            xenia_log(RETRO_LOG_INFO,
+                      "GPU %u: %s (vendor %04X, device %04X, %llu MB%s)\n", i,
+                      name, desc.VendorId, desc.DeviceId,
+                      (unsigned long long)(desc.DedicatedVideoMemory >> 20),
+                      (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? ", software"
+                                                                : "");
+        }
+        adapter->Release();
+    }
+    factory->Release();
+
+    xenia_log(RETRO_LOG_INFO, "D3D12 Agility runtime present: %s\n",
+              d3d12_runtime_available() ? "yes" : "no");
 }
 
 // True if the primary GPU is AMD. Xenia's D3D12 backend currently fails on
@@ -560,8 +635,9 @@ static void apply_core_options(void) {
     // Graphics
     // =================================================================
 
-    // Render target path
-    if ((v = opt_get(XENIA_OPT_RENDER_TARGET_PATH))) {
+    // Render target path. "auto" leaves the cvar alone so the base config and
+    // any per-title config decide - see opt_is_auto().
+    if ((v = opt_get(XENIA_OPT_RENDER_TARGET_PATH)) && !opt_is_auto(v)) {
         cvars::render_target_path = v;
     }
 
@@ -584,8 +660,10 @@ static void apply_core_options(void) {
         cvars::async_shader_compilation = (strcmp(v, "enabled") == 0);
     }
 
-    // Readback resolve
-    if ((v = opt_get(XENIA_OPT_READBACK_RESOLVE))) {
+    // Readback resolve. "auto" defers to the config, which is how a single
+    // title can run "none" (much faster where it works - Fable II went from
+    // 22 to 30 guest fps) while others keep the safer default.
+    if ((v = opt_get(XENIA_OPT_READBACK_RESOLVE)) && !opt_is_auto(v)) {
         cvars::readback_resolve = v;
     }
 
@@ -1837,6 +1915,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 
     // Apply any options set before load
     apply_core_options();
+
+    // Describe the graphics environment before choosing a backend, so a failed
+    // choice can be diagnosed from the log rather than by bisecting settings.
+#ifdef _WIN32
+    log_graphics_environment();
+#endif
 
     // Pick graphics backend based on frontend's preferred HW context.
     unsigned preferred_hw = RETRO_HW_CONTEXT_NONE;

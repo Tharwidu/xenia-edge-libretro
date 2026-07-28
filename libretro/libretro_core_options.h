@@ -88,16 +88,18 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Render Target Path",
         "RT Path",
         "Select render target emulation mode.\n"
+        "Auto: use the config file, so a per-title config can set this.\n"
         "Performance: host render targets with fixed-function blending.\n"
         "Accuracy: pixel shader interlock / rasterizer-ordered views.",
         NULL,
         "Graphics",
         {
+            { "auto",        "Auto (from config)" },
             { "performance", "Performance" },
             { "accuracy",    "Accuracy" },
             { NULL, NULL }
         },
-        "performance"
+        "auto"
     },
     {
         XENIA_OPT_DRAW_RESOLUTION_SCALE,
@@ -181,19 +183,21 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Readback",
         "Controls which render-to-texture resolves are copied back into "
         "guest RAM.\n"
-        "Fast: copy only resolves the CPU reads back (default).\n"
+        "Auto: use the config file, so a per-title config can set this.\n"
+        "Fast: copy only resolves the CPU reads back (xenia's default).\n"
         "All: copy every resolve - slower, needed by a few titles.\n"
-        "None: disable readback completely - fastest, but some titles "
-        "render incorrectly without it.",
+        "None: disable readback completely - much faster where it works, "
+        "but some titles render incorrectly without it.",
         NULL,
         "Graphics",
         {
-            { "fast", "Fast (Default)" },
+            { "auto", "Auto (from config)" },
+            { "fast", "Fast" },
             { "all",  "All (Slower)" },
             { "none", "None (Fastest)" },
             { NULL, NULL }
         },
-        "fast"
+        "auto"
     },
     {
         XENIA_OPT_STORE_SHADERS,
