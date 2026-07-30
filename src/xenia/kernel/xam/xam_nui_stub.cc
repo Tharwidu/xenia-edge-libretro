@@ -9,9 +9,9 @@
 
 // Stub file for libretro build - provides empty implementations of NUI exports
 
-#include "xenia/kernel/xam/xam_private.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/xam_private.h"
 
 namespace xe {
 namespace kernel {

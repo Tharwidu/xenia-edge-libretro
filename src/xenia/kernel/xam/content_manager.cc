@@ -50,8 +50,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
   // so its inner files are exposed - same as the game-launch path.
   std::unique_ptr<vfs::Device> device;
   if (std::filesystem::is_directory(package_path)) {
-    device =
-        std::make_unique<vfs::HostPathDevice>(device_path_, package_path, false);
+    device = std::make_unique<vfs::HostPathDevice>(device_path_, package_path,
+                                                   false);
   } else {
     device = vfs::XContentContainerDevice::CreateContentDevice(device_path_,
                                                                package_path);
@@ -236,10 +236,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
 
       XCONTENT_AGGREGATE_DATA content_data;
       // Extracted content is a directory with a matching .header sidecar.
-      if (is_directory &&
-          XSUCCEEDED(ReadContentHeaderFile(xe::path_to_utf8(file_info.name),
-                                           xuid, title_id, content_type,
-                                           content_data))) {
+      if (is_directory && XSUCCEEDED(ReadContentHeaderFile(
+                              xe::path_to_utf8(file_info.name), xuid, title_id,
+                              content_type, content_data))) {
         result.emplace_back(std::move(content_data));
       } else {
         // Either an extracted folder without a header, or a raw STFS/XContent

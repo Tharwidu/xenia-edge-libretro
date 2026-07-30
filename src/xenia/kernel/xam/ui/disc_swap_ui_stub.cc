@@ -20,8 +20,8 @@ namespace ui {
 DiscSwapUI::DiscSwapUI(xe::ui::ImGuiDrawer* imgui_drawer,
                        const std::string& message,
                        const std::vector<DiscInfo>& discs, bool show_error)
-    : XamDialog(imgui_drawer), 
-      discs_(discs), 
+    : XamDialog(imgui_drawer),
+      discs_(discs),
       show_error_(show_error),
       result_(DiscSwapResult::kCancelled) {
   // Stub implementation - always cancelled

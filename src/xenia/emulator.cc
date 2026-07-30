@@ -423,8 +423,7 @@ X_STATUS Emulator::SetupSubsystems() {
     XELOGI("{}: Starting graphics_system...", __func__);
     result = graphics_system_->Setup(
         processor_.get(), kernel_state_.get(),
-        display_window_ ? &display_window_->app_context() : nullptr,
-        true);
+        display_window_ ? &display_window_->app_context() : nullptr, true);
     if (result) {
       XELOGE("{}: Failed to setup graphics_system!", __func__);
       return result;

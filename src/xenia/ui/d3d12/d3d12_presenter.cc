@@ -108,9 +108,8 @@ bool D3D12Presenter::CreateGPUBlitResources(
 
   // Command list
   if (FAILED(device->CreateCommandList(
-          0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-          gpu_blit_.command_allocator.Get(), nullptr,
-          IID_PPV_ARGS(&gpu_blit_.command_list)))) {
+          0, D3D12_COMMAND_LIST_TYPE_DIRECT, gpu_blit_.command_allocator.Get(),
+          nullptr, IID_PPV_ARGS(&gpu_blit_.command_list)))) {
     XELOGE("D3D12Presenter: Failed to create GPU blit command list");
     return false;
   }
@@ -118,7 +117,7 @@ bool D3D12Presenter::CreateGPUBlitResources(
 
   // Fence
   if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                  IID_PPV_ARGS(&gpu_blit_.fence)))) {
+                                 IID_PPV_ARGS(&gpu_blit_.fence)))) {
     XELOGE("D3D12Presenter: Failed to create GPU blit fence");
     return false;
   }
@@ -148,9 +147,9 @@ bool D3D12Presenter::CreateGPUBlitResources(
 }
 
 bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
-                                                uint32_t& width_out,
-                                                uint32_t& height_out,
-                                                bool& is_bgra_out) {
+                                               uint32_t& width_out,
+                                               uint32_t& height_out,
+                                               bool& is_bgra_out) {
   is_bgra_out = true;
   // Acquire guest output resource
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
@@ -170,7 +169,9 @@ bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
   D3D12_RESOURCE_DESC texture_desc = guest_output_resource->GetDesc();
   uint32_t w = uint32_t(texture_desc.Width);
   uint32_t h = uint32_t(texture_desc.Height);
-  if (w == 0 || h == 0) return false;
+  if (w == 0 || h == 0) {
+    return false;
+  }
 
   // Ensure persistent resources match current dimensions
   if (gpu_blit_.width != w || gpu_blit_.height != h) {
@@ -199,8 +200,7 @@ bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   barrier.Transition.StateBefore = kGuestOutputInternalState;
   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  if constexpr (kGuestOutputInternalState !=
-                D3D12_RESOURCE_STATE_COPY_SOURCE) {
+  if constexpr (kGuestOutputInternalState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
     gpu_blit_.command_list->ResourceBarrier(1, &barrier);
   }
 
@@ -216,8 +216,7 @@ bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
   gpu_blit_.command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source,
                                             nullptr);
 
-  if constexpr (kGuestOutputInternalState !=
-                D3D12_RESOURCE_STATE_COPY_SOURCE) {
+  if constexpr (kGuestOutputInternalState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     gpu_blit_.command_list->ResourceBarrier(1, &barrier);
   }
@@ -232,13 +231,13 @@ bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
   ID3D12CommandList* execute_list = gpu_blit_.command_list.Get();
   direct_queue->ExecuteCommandLists(1, &execute_list);
   gpu_blit_.fence_value++;
-  if (FAILED(direct_queue->Signal(gpu_blit_.fence.Get(),
-                                   gpu_blit_.fence_value))) {
+  if (FAILED(
+          direct_queue->Signal(gpu_blit_.fence.Get(), gpu_blit_.fence_value))) {
     XELOGE("D3D12Presenter: Failed to signal GPU blit fence");
     return false;
   }
   if (FAILED(gpu_blit_.fence->SetEventOnCompletion(gpu_blit_.fence_value,
-                                                     nullptr))) {
+                                                   nullptr))) {
     XELOGE("D3D12Presenter: Failed to await GPU blit fence");
     return false;
   }

@@ -14,7 +14,8 @@
 // window) does not create. That left every XAM UI export unregistered, so any
 // title that opened a message box, storage-device selector, keyboard, or
 // sign-in dialog hit an "undefined extern call" and soft-locked (e.g. Sonic
-// Unleashed stalls after Start on XamShowDeviceSelectorUI / XamShowMessageBoxUI).
+// Unleashed stalls after Start on XamShowDeviceSelectorUI /
+// XamShowMessageBoxUI).
 //
 // These implementations mirror the `cvars::headless` branches of the real
 // xam_ui.cc: auto-complete each dialog with a sensible default and drive the
@@ -34,8 +35,8 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_util.h"
-#include "xenia/base/utf8.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -153,24 +154,22 @@ static int32_t FindAutoButton(const std::string& title_lower,
     // through to the online check.
   }
 
-  if (ContainsAnyOf(context, {"xbox live", "sign in", "sign-in", "signin",
-                              "online", "network", "internet",
-                              "multiplayer"})) {
+  if (ContainsAnyOf(context,
+                    {"xbox live", "sign in", "sign-in", "signin", "online",
+                     "network", "internet", "multiplayer"})) {
     // Strongest match first: an explicitly "offline"-worded button, then the
     // usual decline wordings.
     for (size_t i = 0; i < buttons_lower.size(); ++i) {
-      if (ContainsAnyOf(buttons_lower[i],
-                        {"offline", "hors ligne", "sin conex",
-                         "senza connessione"})) {
+      if (ContainsAnyOf(buttons_lower[i], {"offline", "hors ligne", "sin conex",
+                                           "senza connessione"})) {
         return static_cast<int32_t>(i);
       }
     }
     for (size_t i = 0; i < buttons_lower.size(); ++i) {
       const std::string& label = buttons_lower[i];
       if (label == "no" || label == "non" || label == "nein" ||
-          ContainsAnyOf(label,
-                        {"continue", "don't", "do not", "without", "later",
-                         "skip", "cancel", "not now"})) {
+          ContainsAnyOf(label, {"continue", "don't", "do not", "without",
+                                "later", "skip", "cancel", "not now"})) {
         return static_cast<int32_t>(i);
       }
     }
@@ -206,9 +205,9 @@ static dword_result_t ShowMessageBoxUi(
     // In auto mode, steer recognized save/storage and Xbox LIVE / online
     // prompts to a choice that keeps the game moving - the game's own
     // default on both leads into UI that headless can't show.
-    int32_t auto_button = FindAutoButton(xe::utf8::lower_ascii(title),
-                                         xe::utf8::lower_ascii(text),
-                                         buttons_lower);
+    int32_t auto_button =
+        FindAutoButton(xe::utf8::lower_ascii(title),
+                       xe::utf8::lower_ascii(text), buttons_lower);
     if (auto_button >= 0) {
       chosen = static_cast<uint32_t>(auto_button);
     }
@@ -276,7 +275,7 @@ dword_result_t XamShowKeyboardUI_entry(
           std::memset(buffer, 0, buffer_size);
         } else {
           string_util::copy_and_swap_truncating(buffer, default_text.value(),
-                                                 buffer_length);
+                                                buffer_length);
         }
         return X_ERROR_SUCCESS;
       },
@@ -342,7 +341,8 @@ dword_result_t XamGetDashContext_entry(const ppc_context_t& ctx) {
 DECLARE_XAM_EXPORT1(XamGetDashContext, kNone, kImplemented);
 
 dword_result_t XamShowMarketplaceUIEx_entry(dword_t user_index, dword_t ui_type,
-                                            qword_t offer_id, dword_t offer_type,
+                                            qword_t offer_id,
+                                            dword_t offer_type,
                                             dword_t content_category,
                                             unknown_t unk6, unknown_t unk7,
                                             dword_t title_id) {
