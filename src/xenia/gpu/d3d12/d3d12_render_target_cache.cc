@@ -195,9 +195,12 @@ bool D3D12RenderTargetCache::Initialize() {
   // the pixel shader interlock path doesn't use them).
   if (FAILED(provider.DxbcConverterCreateInstance(
           CLSID_DxbcConverter, IID_PPV_ARGS(&dxbc_to_dxil_converter_)))) {
+    dxbc_to_dxil_converter_ = nullptr;
     XELOGE(
         "Failed to create the DXBC to DXIL converter for transfer pixel "
-        "shaders. Place dxilconv.dll next to the executable.");
+        "shaders (dxilconv.dll is missing or unusable - it is an in-box "
+        "Windows component, absent under Wine/Proton). Place dxilconv.dll "
+        "next to the executable.");
   }
 
   if (cvars::render_target_path == "performance") {
@@ -236,6 +239,18 @@ bool D3D12RenderTargetCache::Initialize() {
   if (path_ == Path::kPixelShaderInterlock &&
       !provider.AreRasterizerOrderedViewsSupported()) {
     path_ = Path::kHostRenderTargets;
+  }
+
+  // Say plainly, once, whether the combination that just got selected can
+  // actually run. Previously the converter failure was one XELOGE far above
+  // this decision and the title simply died at its first draws with nothing
+  // connecting the two - the log read as if initialization had succeeded.
+  if (path_ == Path::kHostRenderTargets && !dxbc_to_dxil_converter_) {
+    XELOGE(
+        "The host render target path is selected but its transfer pixel "
+        "shaders cannot be built without dxilconv - rendering will fail. Set "
+        "render_target_path=accuracy (pixel shader interlock, needs ROV) or "
+        "use the Vulkan backend.");
   }
 
   // Create the buffer for reinterpreting EDRAM contents.

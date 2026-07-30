@@ -167,6 +167,12 @@ class D3D12Provider : public GraphicsProvider {
     return pfn_d3d_disassemble_(src_data, src_data_size, flags, comments,
                                 disassembly_out);
   }
+  // Whether dxilconv.dll gave us a usable DXBC to DXIL converter. The host
+  // render target path cannot build its transfer pixel shaders without one, so
+  // callers that can still choose a path want to know before committing.
+  bool IsDxbcConverterAvailable() const {
+    return pfn_dxilconv_dxc_create_instance_ != nullptr;
+  }
   HRESULT DxbcConverterCreateInstance(const CLSID& rclsid, const IID& riid,
                                       void** ppv) const {
     if (!pfn_dxilconv_dxc_create_instance_) {

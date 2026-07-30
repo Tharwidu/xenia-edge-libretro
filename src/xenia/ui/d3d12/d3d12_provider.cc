@@ -54,6 +54,20 @@ namespace d3d12 {
 // 1.619.3) and the D3D12SDKVersion export in windowed_app_main_win.cc.
 static constexpr UINT kAgilitySdkVersion = 619;
 
+// True when running under Wine/Proton, where "Direct3D 12" is vkd3d-proton
+// rather than Microsoft's runtime. Only used to keep the log honest: several
+// messages here describe what Microsoft's D3D12 would be doing, and reading
+// them at face value on a Proton log sent an entire debugging session down the
+// wrong path. wine_get_version is exported by Wine's ntdll and nothing else.
+static bool IsRunningUnderWine() {
+  static int cached = -1;
+  if (cached < 0) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    cached = ntdll && GetProcAddress(ntdll, "wine_get_version") ? 1 : 0;
+  }
+  return cached != 0;
+}
+
 // CLSID_D3D12SDKConfiguration from d3d12.h, defined locally because the
 // Windows SDK dxguid.lib predates the Agility SDK CLSIDs.
 static constexpr GUID kD3D12SdkConfigurationClsid = {
@@ -282,21 +296,36 @@ bool D3D12Provider::Initialize() {
         "will be unavailable");
   }
 
-  // Load optional dxilconv.dll.
+  // Load dxilconv.dll. Despite the "optional" it used to be labelled with,
+  // this is load-bearing: D3D12RenderTargetCache::Initialize needs the DXBC to
+  // DXIL converter for the transfer pixel shaders of the host render target
+  // path, which is what render_target_path=performance selects (and what most
+  // per-title configs ask for). Without it those titles die at their first
+  // real draws. dxilconv is an in-box Windows component and is NOT present
+  // under Wine/Proton, where this is the difference between a working run and
+  // a silent death - so log it loudly enough to be found. It is also not
+  // redistributable through the DXC release or a NuGet package, which is why
+  // the libretro core defaults to Vulkan under Wine instead of shipping it.
   pfn_dxilconv_dxc_create_instance_ = nullptr;
   library_dxilconv_ = LoadLibraryW(L"dxilconv.dll");
   if (library_dxilconv_) {
     pfn_dxilconv_dxc_create_instance_ = DxcCreateInstanceProc(
         GetProcAddress(library_dxilconv_, "DxcCreateInstance"));
     if (pfn_dxilconv_dxc_create_instance_ == nullptr) {
-      XELOGD(
-          "Failed to get DxcCreateInstance from dxilconv.dll, converted DXIL "
-          "disassembly for debugging will be unavailable");
+      XELOGW(
+          "dxilconv.dll has no DxcCreateInstance - the DXBC to DXIL converter "
+          "is unavailable, so the host render target path "
+          "(render_target_path=performance) will fail. Use "
+          "render_target_path=accuracy, which does not need it.");
     }
   } else {
-    XELOGD(
-        "Failed to load dxilconv.dll, converted DXIL disassembly for debugging "
-        "will be unavailable - DXIL may be unsupported by your OS version");
+    XELOGW(
+        "Failed to load dxilconv.dll - the DXBC to DXIL converter is "
+        "unavailable, so the host render target path "
+        "(render_target_path=performance) will fail. It is an in-box Windows "
+        "component and is absent under Wine/Proton. Use "
+        "render_target_path=accuracy, which does not need it, or the Vulkan "
+        "backend.");
   }
 
   // Load the required DXIL shader compiler runtime (dxcompiler.dll + dxil.dll)
@@ -375,10 +404,23 @@ bool D3D12Provider::Initialize() {
       if (SUCCEEDED(sdk_configuration->CreateDeviceFactory(
               kAgilitySdkVersion, ".\\D3D12\\",
               IID_PPV_ARGS(&device_factory_)))) {
-        XELOGI(
-            "Side-loaded the Direct3D 12 Agility SDK runtime {} from the "
-            "D3D12 directory",
-            kAgilitySdkVersion);
+        if (IsRunningUnderWine()) {
+          // The call can succeed here, but nothing Microsoft ships is being
+          // loaded - the implementation behind it is vkd3d-proton, whatever
+          // D3D12Core.dll sits in the D3D12 directory. Claiming a successful
+          // Agility side-load on Proton is how the bundled-runtime theory
+          // survived far longer than it should have.
+          XELOGI(
+              "Created a device factory for Agility SDK runtime {}, but this "
+              "is Wine/Proton - the implementation is vkd3d-proton, not the "
+              "bundled Microsoft D3D12Core.dll",
+              kAgilitySdkVersion);
+        } else {
+          XELOGI(
+              "Side-loaded the Direct3D 12 Agility SDK runtime {} from the "
+              "D3D12 directory",
+              kAgilitySdkVersion);
+        }
       } else {
         device_factory_ = nullptr;
         XELOGW(

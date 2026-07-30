@@ -555,6 +555,32 @@ static bool d3d12_runtime_available() {
     return std::filesystem::exists(core_dll, ec);
 }
 
+// True when this process is running under Wine/Proton rather than real Windows.
+// wine_get_version is exported by Wine's ntdll and by nothing else, so its
+// presence is the standard way to tell. Cached because the answer cannot
+// change, and because the backend policy below asks more than once. The Wine
+// version string, when there is one, comes back through *version_out.
+static bool running_under_wine(const char** version_out = nullptr) {
+    static bool checked = false;
+    static bool is_wine = false;
+    static const char* version = nullptr;
+    if (!checked) {
+        checked = true;
+        if (HMODULE ntdll = GetModuleHandleA("ntdll.dll")) {
+            typedef const char*(CDECL * wine_get_version_t)(void);
+            auto wine_get_version = reinterpret_cast<wine_get_version_t>(
+                reinterpret_cast<void*>(
+                    GetProcAddress(ntdll, "wine_get_version")));
+            if (wine_get_version) {
+                is_wine = true;
+                version = wine_get_version();
+            }
+        }
+    }
+    if (version_out) *version_out = version;
+    return is_wine;
+}
+
 // Report the graphics environment once, before a backend is chosen.
 //
 // When D3D12 failed under Proton the core logged a single line naming the
@@ -564,23 +590,14 @@ static bool d3d12_runtime_available() {
 // come from DXGI without creating a device, and Wine is detected by looking for
 // an export that only exists there.
 static void log_graphics_environment(void) {
-    // wine_get_version is exported by Wine's ntdll and by nothing else, so its
-    // presence is the standard way to tell we are not on real Windows. Under
-    // Proton, D3D12 is vkd3d-proton rather than Microsoft's implementation,
-    // which is exactly the case where xenia's D3D12 backend has been failing.
-    const char* host = "Windows";
-    if (HMODULE ntdll = GetModuleHandleA("ntdll.dll")) {
-        typedef const char*(CDECL * wine_get_version_t)(void);
-        auto wine_get_version = reinterpret_cast<wine_get_version_t>(
-            reinterpret_cast<void*>(GetProcAddress(ntdll, "wine_get_version")));
-        if (wine_get_version) {
-            const char* ver = wine_get_version();
-            xenia_log(RETRO_LOG_INFO, "Host: Wine/Proton %s\n",
-                      ver ? ver : "(unknown version)");
-            host = "Wine";
-        }
-    }
-    if (strcmp(host, "Windows") == 0) {
+    // Under Proton, D3D12 is vkd3d-proton rather than Microsoft's
+    // implementation, which is exactly the case where xenia's D3D12 backend
+    // has been failing.
+    const char* wine_version = nullptr;
+    if (running_under_wine(&wine_version)) {
+        xenia_log(RETRO_LOG_INFO, "Host: Wine/Proton %s\n",
+                  wine_version ? wine_version : "(unknown version)");
+    } else {
         xenia_log(RETRO_LOG_INFO, "Host: native Windows\n");
     }
 
@@ -634,6 +651,31 @@ static bool primary_gpu_is_amd() {
     }
     factory->Release();
     return is_amd;
+}
+
+// Why the automatic backend choice must steer away from D3D12 on this host, or
+// nullptr when it needn't. Both cases are defects in the host's D3D12
+// implementation rather than in xenia, both were established by A/B against a
+// working run on the same build, and both are routed around the same way: pick
+// the self-contained Vulkan backend, and say in the log why. An explicit
+// xenia_gpu_backend=d3d12 still overrides this - it is a default, not a ban.
+static const char* d3d12_auto_unusable_reason() {
+    if (primary_gpu_is_amd()) {
+        return "xenia's D3D12 backend is broken on AMD (standalone xenia has "
+               "the same breakage)";
+    }
+    if (running_under_wine()) {
+        // Confirmed 2026-07-30 by running the same build natively and under
+        // Proton on one machine: vkd3d-proton has no dxilconv.dll (an in-box
+        // Windows component), so D3D12RenderTargetCache cannot build the
+        // transfer pixel shaders the host render target path needs, and the
+        // title dies at its first real draws. It also lacks
+        // OpenExistingHeapFromAddress, which kills memexport. Neither is
+        // something the core can ship its way out of.
+        return "vkd3d-proton lacks dxilconv (host render target transfer "
+               "shaders) and OpenExistingHeapFromAddress (memexport)";
+    }
+    return nullptr;
 }
 #endif
 
@@ -1988,7 +2030,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         // runtime is shipped alongside the frontend; otherwise use the
         // self-contained Vulkan backend (no extra DLLs, works under Wine too).
 #ifdef _WIN32
-        if (d3d12_runtime_available() && !primary_gpu_is_amd()) {
+        const char* no_d3d12 =
+            d3d12_runtime_available() ? d3d12_auto_unusable_reason() : nullptr;
+        if (no_d3d12) {
+            xenia_log(RETRO_LOG_INFO,
+                      "Defaulting to the Vulkan backend: %s\n", no_d3d12);
+        }
+        if (d3d12_runtime_available() && !no_d3d12) {
             strncpy(core_state.graphics_backend, XENIA_GRAPHICS_D3D12,
                     sizeof(core_state.graphics_backend) - 1);
         } else
@@ -1999,9 +2047,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         }
     } else {
         // D3D12, D3D11, OpenGL, or anything else -> use D3D12 backend, except
-        // on AMD where the D3D12 backend is currently broken (use Vulkan).
+        // on hosts whose D3D12 implementation can't run it (AMD drivers,
+        // vkd3d-proton), where Vulkan is the working choice.
 #ifdef _WIN32
-        if (primary_gpu_is_amd()) {
+        const char* no_d3d12 = d3d12_auto_unusable_reason();
+        if (no_d3d12) {
+            xenia_log(RETRO_LOG_INFO,
+                      "Defaulting to the Vulkan backend: %s\n", no_d3d12);
             strncpy(core_state.graphics_backend, XENIA_GRAPHICS_VULKAN,
                     sizeof(core_state.graphics_backend) - 1);
         } else {
@@ -2085,6 +2137,42 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                           d3d12_probe->AreBarycentricsSupported() ? "yes" : "no",
                           int(d3d12_probe->GetTiledResourcesTier()),
                           int(d3d12_probe->GetResourceBindingTier()));
+
+                // The caps above were where the Proton failure was hunted for,
+                // and they say nothing - vkd3d-proton reports the same or
+                // better than native. This is the line that matters. dxilconv
+                // is an in-box Windows DLL with no redistributable source, and
+                // without it the host render target path cannot build its
+                // transfer pixel shaders, so the title dies at its first real
+                // draws having logged nothing but a debug-level note. Treat a
+                // missing converter as a failed probe unless the pixel shader
+                // interlock path is both selected and supported, since that
+                // path doesn't use the transfer shaders.
+                const bool have_dxilconv =
+                    d3d12_probe->IsDxbcConverterAvailable();
+                const bool interlock_usable =
+                    cvars::render_target_path == "accuracy" &&
+                    d3d12_probe->AreRasterizerOrderedViewsSupported();
+                xenia_log(RETRO_LOG_INFO,
+                          "D3D12 dxilconv (DXBC->DXIL transfer shaders): %s\n",
+                          have_dxilconv ? "available"
+                                        : "MISSING - host render target path "
+                                          "cannot work");
+                if (!have_dxilconv) {
+                    if (interlock_usable) {
+                        xenia_log(RETRO_LOG_WARN,
+                                  "Staying on D3D12 without dxilconv because "
+                                  "render_target_path=accuracy uses the pixel "
+                                  "shader interlock path, which does not need "
+                                  "it\n");
+                    } else {
+                        d3d12_fail_reason =
+                            "dxilconv.dll is unavailable, so the host render "
+                            "target path cannot build its transfer shaders "
+                            "(an in-box Windows component; absent under "
+                            "Wine/Proton)";
+                    }
+                }
             }
         }
         if (d3d12_fail_reason) {
@@ -2211,8 +2299,8 @@ RETRO_API void retro_reset(void) {
 // so the interval between calls is the real end-to-end frame time.
 //
 // Summarised every 5s rather than per frame to keep the log usable. Frames
-// slower than 1.5x the target are counted separately, because an average can
-// look healthy while regular hitches make it feel bad.
+// slower than 1.5x the title's own measured cadence are counted separately,
+// because an average can look healthy while regular hitches make it feel bad.
 static void report_frame_pacing(void) {
     using clock = std::chrono::steady_clock;
     static clock::time_point last_frame{};
@@ -2241,8 +2329,18 @@ static void report_frame_pacing(void) {
         return;
     }
 
-    const double target_fps = core_state.pal_mode ? 50.0 : 60.0;
-    const double target_ms = 1000.0 / target_fps;
+    const double display_ms = 1000.0 / (core_state.pal_mode ? 50.0 : 60.0);
+
+    // What counts as "late" is the title's own cadence, not the display's. The
+    // core renders synchronously inside retro_run, so a 30 Hz title paces the
+    // host loop at ~33 ms - measuring that against 16.7 ms called every single
+    // frame late (Fable II and Viva Pinata both reported "151 of 151"), which
+    // is noise, not a diagnosis. Target the observed guest rate instead, taken
+    // from the previous window so it is a measurement rather than a guess, and
+    // never faster than the display can present nor slower than 15 fps, so a
+    // stalled window can't relax the bar until it stops meaning anything.
+    static double target_ms = 0.0;
+    if (target_ms <= 0.0) target_ms = display_ms;
 
     total_ms += ms;
     frames++;
@@ -2269,9 +2367,24 @@ static void report_frame_pacing(void) {
                 double(guest_count - last_guest_count) / window_s;
             xenia_log(RETRO_LOG_INFO,
                       "Frame pacing: host %.1f fps (%.1f ms avg, worst %.1f "
-                      "ms) | guest %.1f fps | %u of %u host frames late\n",
+                      "ms) | guest %.1f fps | %u of %u host frames over "
+                      "%.1f ms\n",
                       host_fps, avg_ms, worst_ms, guest_fps, slow_frames,
-                      frames);
+                      frames, target_ms * 1.5);
+
+            // Re-aim at what this title actually runs at, for the next window.
+            // A window with no guest presents at all is a load screen or a
+            // menu, not a cadence - keep the previous target rather than
+            // relaxing the bar to nothing. Clamped to the display rate at one
+            // end and 15 fps at the other so neither a fast nor a stalled
+            // window can move the bar somewhere it stops meaning anything.
+            if (guest_fps >= 1.0) {
+                const double aim = 1000.0 / guest_fps;
+                target_ms = aim < display_ms ? display_ms
+                                             : (aim > 1000.0 / 15.0
+                                                    ? 1000.0 / 15.0
+                                                    : aim);
+            }
         }
         last_guest_count = guest_count;
         window_start = now;

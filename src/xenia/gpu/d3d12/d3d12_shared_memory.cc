@@ -182,9 +182,14 @@ bool D3D12SharedMemory::ImportGuestRamHeap(void*& out_view,
   HRESULT hr = device3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap));
   device3->Release();
   if (FAILED(hr)) {
-    XELOGI(
+    // vkd3d-proton does not implement OpenExistingHeapFromAddress at all
+    // (0x80070057, E_INVALIDARG), so under Wine/Proton this always fails and
+    // memexport is dead - worth a warning rather than an info line, because
+    // the titles that use memexport misbehave without saying why.
+    XELOGW(
         "Shared memory host import: OpenExistingHeapFromAddress failed "
-        "(0x{:08X})",
+        "(0x{:08X}) - memexport will be unavailable. Not implemented by "
+        "vkd3d-proton, so this is expected under Wine/Proton.",
         static_cast<uint32_t>(hr));
     xe::memory::UnmapFileView(memory().mapping_handle(), view, kBufferSize);
     return false;
