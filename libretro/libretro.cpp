@@ -1232,28 +1232,28 @@ static void pace_software_frame(void) {
 
     auto now = clock::now();
     if (now < next) {
-        // Hybrid wait. A bare sleep_until to a ~16.7 ms deadline is at the
-        // mercy of OS timer granularity, which under Wine can be coarse enough
-        // to overshoot by milliseconds and show up as judder. Sleep the bulk,
-        // then yield-spin the last slice where precision actually matters.
-        constexpr auto kSpinSlack = std::chrono::microseconds(1500);
-        if (next - now > kSpinSlack) {
-            std::this_thread::sleep_until(next - kSpinSlack);
-        }
-        while (clock::now() < next) {
-            std::this_thread::yield();
-        }
+        // A plain sleep_until, deliberately. A yield-spin on the last
+        // millisecond or so was tried here to guard against coarse OS timer
+        // granularity under Wine, and measured worse: host frame rate fell
+        // from a pinned 60.0 to 47.2 fps on Viva Pinata, because the spin
+        // takes CPU away from an emulator that wants all of it. Plain
+        // sleep_until was already holding exactly 60.0, so there was no
+        // granularity problem to solve.
+        std::this_thread::sleep_until(next);
         now = clock::now();
     }
 
     next += frame_period;
-    // Never try to make up more than one frame of lost time. The old clamp
-    // only reset after falling a full 100 ms behind, so a single hitch left a
-    // backlog the pacer then burned through with no waiting at all - a burst
-    // of frames delivered as fast as they could be produced, which is its own
-    // visible stutter.
-    if (next < now) {
-        next = now;
+    // Allow a bounded amount of catch-up. Clamping straight to `now` was also
+    // measured worse for the same reason - with no credit for a frame that ran
+    // long, every overrun is absorbed into the next deadline and the average
+    // rate sags below target. Letting the deadline trail by a couple of frames
+    // keeps the long-run average honest, while still refusing the unbounded
+    // backlog the old 100 ms clamp permitted, where one hitch was followed by a
+    // burst of frames delivered as fast as they could be produced.
+    const auto max_lag = frame_period * 2;
+    if (next < now - max_lag) {
+        next = now - max_lag;
     }
 }
 
