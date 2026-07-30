@@ -304,10 +304,29 @@ bool D3D12Provider::Initialize() {
   // real draws. dxilconv is an in-box Windows component and is NOT present
   // under Wine/Proton, where this is the difference between a working run and
   // a silent death - so log it loudly enough to be found. It is also not
-  // redistributable through the DXC release or a NuGet package, which is why
-  // the libretro core defaults to Vulkan under Wine instead of shipping it.
+  // redistributable through the prebuilt DXC release or a NuGet package, but
+  // it IS buildable from DirectXShaderCompiler's projects/dxilconv (NCSA
+  // licence, HLSL_BUILD_DXILCONV defaults to ON), and it imports nothing but
+  // Win32/UCRT API sets - no D3D12, no DXGI - so a copy of it runs under Wine
+  // like any other CPU library.
+  //
+  // Look in the D3D12 folder next to the executable BEFORE falling back to the
+  // plain-name search, the same way dxcompiler.dll is loaded below. The bare
+  // LoadLibraryW finds an in-box copy on Windows but can never find one we
+  // bundle, so a Wine prefix had no way to be given the DLL short of dropping
+  // it next to the frontend executable.
+  auto d3d12_dir = xe::filesystem::GetExecutablePath().parent_path() / "D3D12";
   pfn_dxilconv_dxc_create_instance_ = nullptr;
-  library_dxilconv_ = LoadLibraryW(L"dxilconv.dll");
+  {
+    auto dxilconv_path_utf16 = xe::path_to_utf16(d3d12_dir / "dxilconv.dll");
+    library_dxilconv_ =
+        LoadLibraryW(reinterpret_cast<LPCWSTR>(dxilconv_path_utf16.c_str()));
+    if (library_dxilconv_) {
+      XELOGI("Loaded dxilconv.dll from the D3D12 directory");
+    } else {
+      library_dxilconv_ = LoadLibraryW(L"dxilconv.dll");
+    }
+  }
   if (library_dxilconv_) {
     pfn_dxilconv_dxc_create_instance_ = DxcCreateInstanceProc(
         GetProcAddress(library_dxilconv_, "DxcCreateInstance"));
@@ -331,7 +350,6 @@ bool D3D12Provider::Initialize() {
   // Load the required DXIL shader compiler runtime (dxcompiler.dll + dxil.dll)
   // from the D3D12 folder next to the executable. The D3D12 backend can't run
   // without it, so offer to download it if it's missing.
-  auto d3d12_dir = xe::filesystem::GetExecutablePath().parent_path() / "D3D12";
   pfn_dxcompiler_dxc_create_instance_ = nullptr;
   {
     EnsureShaderCompilerRuntime(d3d12_dir);

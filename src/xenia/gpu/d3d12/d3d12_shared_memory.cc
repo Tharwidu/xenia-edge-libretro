@@ -178,22 +178,62 @@ bool D3D12SharedMemory::ImportGuestRamHeap(void*& out_view,
   // Import the 512 MB view as a heap. Its size comes from the enclosing OS
   // allocation (this fresh view is exactly the buffer), so the buffer is placed
   // at offset 0.
+  //
+  // Prefer ID3D12Device13::OpenExistingHeapFromAddress1, which takes the size
+  // explicitly. The older ID3D12Device3 entry point has to infer the size, and
+  // both Microsoft's runtime and vkd3d-proton do that by walking VirtualQuery
+  // and then REJECTING the pointer unless the whole allocation is one uniform
+  // protection region with the base exactly at the address. A 512 MB file view
+  // does not always satisfy that - under Wine/Proton this is where memexport
+  // was being lost (E_INVALIDARG), not to a missing implementation as first
+  // assumed. Passing the size we already know skips the inference entirely.
   ID3D12Heap* heap = nullptr;
-  HRESULT hr = device3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap));
+  HRESULT hr = E_NOINTERFACE;
+  const char* import_entry_point = "OpenExistingHeapFromAddress1";
+  ID3D12Device13* device13 = nullptr;
+  if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device13)))) {
+    hr = device13->OpenExistingHeapFromAddress1(view, kBufferSize,
+                                                IID_PPV_ARGS(&heap));
+    device13->Release();
+    if (FAILED(hr)) {
+      XELOGI(
+          "Shared memory host import: OpenExistingHeapFromAddress1 failed "
+          "(0x{:08X}), falling back to the ID3D12Device3 entry point",
+          static_cast<uint32_t>(hr));
+    }
+  }
+  if (FAILED(hr)) {
+    import_entry_point = "OpenExistingHeapFromAddress";
+    hr = device3->OpenExistingHeapFromAddress(view, IID_PPV_ARGS(&heap));
+  }
   device3->Release();
   if (FAILED(hr)) {
-    // vkd3d-proton does not implement OpenExistingHeapFromAddress at all
-    // (0x80070057, E_INVALIDARG), so under Wine/Proton this always fails and
-    // memexport is dead - worth a warning rather than an info line, because
-    // the titles that use memexport misbehave without saying why.
-    XELOGW(
-        "Shared memory host import: OpenExistingHeapFromAddress failed "
-        "(0x{:08X}) - memexport will be unavailable. Not implemented by "
-        "vkd3d-proton, so this is expected under Wine/Proton.",
-        static_cast<uint32_t>(hr));
+    // Report what the size inference would have seen, so a failure here is
+    // actionable instead of an opaque E_INVALIDARG. The rejection rules are
+    // exactly these fields: base must equal the address, the pages must be
+    // committed, and the allocation must be a single region.
+    MEMORY_BASIC_INFORMATION info;
+    if (VirtualQuery(view, &info, sizeof(info))) {
+      XELOGW(
+          "Shared memory host import: {} failed (0x{:08X}) - view 0x{:X}, "
+          "AllocationBase 0x{:X}, BaseAddress 0x{:X}, RegionSize {} of {}, "
+          "State 0x{:X}, Type 0x{:X}. memexport will be unavailable.",
+          import_entry_point, static_cast<uint32_t>(hr),
+          reinterpret_cast<uintptr_t>(view),
+          reinterpret_cast<uintptr_t>(info.AllocationBase),
+          reinterpret_cast<uintptr_t>(info.BaseAddress),
+          uint64_t(info.RegionSize), uint64_t(kBufferSize),
+          uint32_t(info.State), uint32_t(info.Type));
+    } else {
+      XELOGW(
+          "Shared memory host import: {} failed (0x{:08X}) and the view could "
+          "not be queried. memexport will be unavailable.",
+          import_entry_point, static_cast<uint32_t>(hr));
+    }
     xe::memory::UnmapFileView(memory().mapping_handle(), view, kBufferSize);
     return false;
   }
+  XELOGI("Shared memory host import: heap opened via {}", import_entry_point);
 
   // Log the imported heap's coherency properties. CPUPageProperty WRITE_BACK
   // (3) is cache-coherent, WRITE_COMBINE (2) is not for GPU-write readback.

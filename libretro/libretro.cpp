@@ -654,26 +654,22 @@ static bool primary_gpu_is_amd() {
 }
 
 // Why the automatic backend choice must steer away from D3D12 on this host, or
-// nullptr when it needn't. Both cases are defects in the host's D3D12
-// implementation rather than in xenia, both were established by A/B against a
-// working run on the same build, and both are routed around the same way: pick
-// the self-contained Vulkan backend, and say in the log why. An explicit
-// xenia_gpu_backend=d3d12 still overrides this - it is a default, not a ban.
+// nullptr when it needn't. This is for defects that cannot be detected by
+// probing the D3D12 runtime itself - anything that CAN be probed belongs in the
+// backend probe further down, which is causal rather than correlational and so
+// stops being wrong the moment the host is fixed. An explicit
+// xenia_gpu_backend=d3d12 still overrides this: it is a default, not a ban.
+//
+// Wine/Proton deliberately is NOT listed here. D3D12 fails there for one
+// concrete, checkable reason - no dxilconv.dll, so the host render target path
+// cannot build its transfer pixel shaders - and the probe tests exactly that.
+// Blanket-banning D3D12 under Wine would run before the probe and make the
+// core unable to notice a prefix that HAS been given a dxilconv.dll, which is
+// the configuration we are trying to reach.
 static const char* d3d12_auto_unusable_reason() {
     if (primary_gpu_is_amd()) {
         return "xenia's D3D12 backend is broken on AMD (standalone xenia has "
                "the same breakage)";
-    }
-    if (running_under_wine()) {
-        // Confirmed 2026-07-30 by running the same build natively and under
-        // Proton on one machine: vkd3d-proton has no dxilconv.dll (an in-box
-        // Windows component), so D3D12RenderTargetCache cannot build the
-        // transfer pixel shaders the host render target path needs, and the
-        // title dies at its first real draws. It also lacks
-        // OpenExistingHeapFromAddress, which kills memexport. Neither is
-        // something the core can ship its way out of.
-        return "vkd3d-proton lacks dxilconv (host render target transfer "
-               "shaders) and OpenExistingHeapFromAddress (memexport)";
     }
     return nullptr;
 }
