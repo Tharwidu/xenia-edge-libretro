@@ -664,16 +664,55 @@ static bool primary_gpu_is_amd() {
 // stops being wrong the moment the host is fixed. An explicit
 // xenia_gpu_backend=d3d12 still overrides this: it is a default, not a ban.
 //
-// Wine/Proton deliberately is NOT listed here. D3D12 fails there for one
-// concrete, checkable reason - no dxilconv.dll, so the host render target path
-// cannot build its transfer pixel shaders - and the probe tests exactly that.
-// Blanket-banning D3D12 under Wine would run before the probe and make the
-// core unable to notice a prefix that HAS been given a dxilconv.dll, which is
-// the configuration we are trying to reach.
+// The core ships into four deployment contexts, and the backend default has to
+// be right in all of them:
+//
+//   1. Linux, native build, upstream frontend  - no D3D12 code is compiled at
+//      all (everything here is under _WIN32), so Vulkan is the only option.
+//      Decided at compile time; nothing below runs.
+//   2. Windows, native build, upstream frontend - D3D12.
+//   3. Windows, native, under RetroArch 1.7.5   - D3D12.
+//   4. Linux, under Wine/Proton, under RA 1.7.5 - must be Vulkan.
+//
+// Cases 3 and 4 are the awkward pair: they are the *same Windows DLL* on the
+// *same frontend*, so nothing at compile time or in the frontend handshake can
+// separate them. A host-side check is the only thing that can, which is why one
+// exists below despite describing the environment rather than the defect.
+//
+// A capability probe would be preferable and is not possible here. The Wine
+// blocker is not a missing feature that init can test - measured 2026-07-29,
+// supply a real dxilconv.dll and the probe reports "available", D3D12
+// initialises fully (SM 6.6, ROV, binding tier 3, tiled tier 4, swap chain with
+// tearing), and the title still never renders. vkd3d-proton's dxil-spirv cannot
+// digest the DXIL dxilconv produces from xenia's hand-built DXBC transfer pixel
+// shaders: Proton 10.0 aborts on assert "arg != 0" (dxil-spirv/ir.hpp:113);
+// Proton Experimental 11.0 has that assert fixed and instead deadlocks at the
+// same shader with every thread at 0% CPU. A deadlock seconds into real draws
+// cannot be probed at init, and cannot be probed safely at all.
+//
+// This is cheap to get wrong in the Vulkan direction and expensive to get wrong
+// in the D3D12 direction. Measured the same day: native Linux Vulkan runs Viva
+// Pinata at ~29 fps average against the ~30 fps native Windows D3D12 manages on
+// the same machine, so Vulkan is already at full speed and D3D12 has no
+// headroom to recover there. Defaulting case 4 to Vulkan costs approximately
+// nothing; defaulting it to D3D12 hangs the emulator.
+//
+// Not permanent, and not a ban: the bug is upstream in vkd3d-proton and already
+// partly fixed between Proton 10 and 11. xenia_gpu_backend=d3d12 still forces
+// it, which is how this gets re-tested as vkd3d improves. When it is fixed,
+// the right replacement is a vkd3d-proton version check rather than a host
+// check, so the default self-unlocks.
 static const char* d3d12_auto_unusable_reason() {
     if (primary_gpu_is_amd()) {
         return "xenia's D3D12 backend is broken on AMD (standalone xenia has "
                "the same breakage)";
+    }
+    // Context 4. Keyed on the host because cases 3 and 4 are indistinguishable
+    // any other way, not because Wine is unsupported.
+    if (running_under_wine()) {
+        return "vkd3d-proton cannot translate the DXIL that dxilconv produces "
+               "for xenia's transfer pixel shaders (asserts on Proton 10, "
+               "deadlocks on 11); Vulkan already runs at full speed on Linux";
     }
     return nullptr;
 }
