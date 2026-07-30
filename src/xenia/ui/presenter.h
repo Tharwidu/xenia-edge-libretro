@@ -703,6 +703,28 @@ class Presenter {
            (uint32_t(0xFF) << 24);
   }
 
+  // As above, but emitting blue in the low byte instead of red - i.e. the
+  // 0x00RRGGBB word order libretro's XRGB8888 expects. Same arithmetic, only
+  // the two shifts differ, so a caller that needs that byte order gets it for
+  // free rather than paying a whole-frame channel swap afterwards. The plain
+  // version above stays as-is because guest output capture (screenshots)
+  // wants red-first.
+  static uint32_t Packed10bpcRGBTo8bpcBytesBGRA(uint32_t rgb10) {
+    if constexpr (std::endian::native == std::endian::big) {
+      return (uint32_t(float((rgb10 >> 20) & 0x3FF) * (255.0f / 1023.0f) + 0.5f)
+              << 24) |
+             (uint32_t(float((rgb10 >> 10) & 0x3FF) * (255.0f / 1023.0f) + 0.5f)
+              << 16) |
+             (uint32_t(float(rgb10 & 0x3FF) * (255.0f / 1023.0f) + 0.5f) << 8) |
+             uint32_t(0xFF);
+    }
+    return uint32_t(float((rgb10 >> 20) & 0x3FF) * (255.0f / 1023.0f) + 0.5f) |
+           (uint32_t(float((rgb10 >> 10) & 0x3FF) * (255.0f / 1023.0f) + 0.5f)
+            << 8) |
+           (uint32_t(float(rgb10 & 0x3FF) * (255.0f / 1023.0f) + 0.5f) << 16) |
+           (uint32_t(0xFF) << 24);
+  }
+
   // Paints and presents the guest output if available (or just solid black
   // color), and if requested, the UI on top of it.
   //

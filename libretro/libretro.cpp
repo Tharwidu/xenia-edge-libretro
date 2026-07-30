@@ -261,8 +261,10 @@ static void vk_destroy_frame(VulkanFrameResources &f) {
     f.width = f.height = 0;
 }
 
+// is_bgra selects the image format so it matches whatever byte order the
+// capture blit produced - they must agree, the upload is a straight memcpy.
 static bool vk_create_frame(VulkanFrameResources &f,
-                             uint32_t w, uint32_t h) {
+                             uint32_t w, uint32_t h, bool is_bgra) {
     VkDevice dev = vk_hw->device;
     VkResult res;
 
@@ -284,7 +286,8 @@ static bool vk_create_frame(VulkanFrameResources &f,
     VkImageCreateInfo img_info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     img_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     img_info.imageType = VK_IMAGE_TYPE_2D;
-    img_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    img_info.format =
+        is_bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
     img_info.extent = {w, h, 1};
     img_info.mipLevels = 1;
     img_info.arrayLayers = 1;
@@ -313,7 +316,8 @@ static bool vk_create_frame(VulkanFrameResources &f,
     VkImageViewCreateInfo view_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view_info.image = f.image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_info.format =
+        is_bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
     view_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY,
                             VK_COMPONENT_SWIZZLE_IDENTITY,
                             VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1177,14 +1181,41 @@ static bool splash_run_frame(void) {
 static void pace_software_frame(void) {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
+
+    // Pace to exactly the rate advertised in retro_get_system_av_info. This
+    // used to be hardcoded to 59.94 Hz while av_info declared 60.0, so the
+    // pacer and the frontend's audio sync disagreed by ~17 us per frame and
+    // slowly walked apart until something had to give - a periodic hitch with
+    // no obvious cause. Derive both from one place so they cannot drift again.
+    const double target_fps = core_state.pal_mode ? 50.0 : 60.0;
+    const auto frame_period = std::chrono::nanoseconds(
+        int64_t(1000000000.0 / target_fps + 0.5));
+
     auto now = clock::now();
     if (now < next) {
-        std::this_thread::sleep_until(next);
+        // Hybrid wait. A bare sleep_until to a ~16.7 ms deadline is at the
+        // mercy of OS timer granularity, which under Wine can be coarse enough
+        // to overshoot by milliseconds and show up as judder. Sleep the bulk,
+        // then yield-spin the last slice where precision actually matters.
+        constexpr auto kSpinSlack = std::chrono::microseconds(1500);
+        if (next - now > kSpinSlack) {
+            std::this_thread::sleep_until(next - kSpinSlack);
+        }
+        while (clock::now() < next) {
+            std::this_thread::yield();
+        }
         now = clock::now();
     }
-    next += std::chrono::nanoseconds(
-        core_state.pal_mode ? 20000000 : 16683350);  // 50 / 59.94 Hz
-    if (next < now - std::chrono::milliseconds(100)) next = now;
+
+    next += frame_period;
+    // Never try to make up more than one frame of lost time. The old clamp
+    // only reset after falling a full 100 ms behind, so a single hitch left a
+    // backlog the pacer then burned through with no waiting at all - a burst
+    // of frames delivered as fast as they could be produced, which is its own
+    // visible stutter.
+    if (next < now) {
+        next = now;
+    }
 }
 
 static void update_video(void) {
@@ -1197,22 +1228,33 @@ static void update_video(void) {
     const void* blit_data = nullptr;
     uint32_t w = 0, h = 0;
     bool got = false;
+    bool is_bgra = false;
     if (lr_graphics && lr_graphics->presenter()) {
         if (strcmp(core_state.graphics_backend, "vulkan") == 0) {
             got = libretro_vk_capture_gpu_blit(lr_graphics->presenter(),
-                                               blit_data, w, h);
+                                               blit_data, w, h, is_bgra);
         }
 #ifdef _WIN32
         else {
             got = libretro_d3d12_capture_gpu_blit(lr_graphics->presenter(),
-                                                  blit_data, w, h);
+                                                  blit_data, w, h, is_bgra);
         }
 #endif
     }
 
     if (got && blit_data && w > 0 && h > 0) {
-        // R8G8B8A8 -> XRGB8888 (little-endian 0x00RRGGBB, B first): swap R/B
-        // into the reusable output buffer.
+        if (is_bgra) {
+            // The capture already produced XRGB8888, so hand the mapped
+            // readback straight to the frontend. This is the normal path: it
+            // skips a whole-frame scalar channel swap - 921,600 iterations at
+            // 720p, every single frame - that used to sit between the GPU and
+            // the frontend for no reason, because the blit was converting
+            // formats anyway and could simply convert to the right one.
+            core_state.video_cb(blit_data, w, h, w * 4);
+            return;
+        }
+        // Fallback only, for a device that cannot blit into B8G8R8A8:
+        // R8G8B8A8 -> XRGB8888 (little-endian 0x00RRGGBB, B first).
         size_t count = static_cast<size_t>(w) * h;
         if (sw_frame_buf.size() < count) sw_frame_buf.resize(count);
         const uint32_t* src = static_cast<const uint32_t*>(blit_data);
@@ -1240,9 +1282,10 @@ static void update_video_vulkan(void) {
     // Step 1: GPU blit capture (A2B10G10R10 ??? R8G8B8A8)
     const void* blit_data = nullptr;
     uint32_t w = 0, h = 0;
+    bool is_bgra = false;
     if (!lr_graphics || !lr_graphics->presenter() ||
         !libretro_vk_capture_gpu_blit(lr_graphics->presenter(),
-                                       blit_data, w, h) ||
+                                       blit_data, w, h, is_bgra) ||
         !blit_data || w == 0 || h == 0) {
         core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0);
         return;
@@ -1261,7 +1304,7 @@ static void update_video_vulkan(void) {
     // Recreate resources if dimensions changed
     if (f.width != w || f.height != h) {
         vk_destroy_frame(f);
-        if (!vk_create_frame(f, w, h)) {
+        if (!vk_create_frame(f, w, h, is_bgra)) {
             xenia_log(RETRO_LOG_ERROR,
                       "Failed to create frontend Vulkan frame resources %ux%u\n", w, h);
             vulkan_hw_render_active = false;
@@ -1326,7 +1369,8 @@ static void update_video_vulkan(void) {
     vk_current_image.create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vk_current_image.create_info.image = f.image;
     vk_current_image.create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vk_current_image.create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vk_current_image.create_info.format =
+        is_bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
     vk_current_image.create_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY,
                                                 VK_COMPONENT_SWIZZLE_IDENTITY,
                                                 VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1349,9 +1393,10 @@ static void update_video_d3d12(void) {
     // Step 1: Capture with persistent resources (no per-frame alloc)
     const void* blit_data = nullptr;
     uint32_t w = 0, h = 0;
+    bool is_bgra = false;
     if (!lr_graphics || !lr_graphics->presenter() ||
         !libretro_d3d12_capture_gpu_blit(lr_graphics->presenter(),
-                                          blit_data, w, h) ||
+                                          blit_data, w, h, is_bgra) ||
         !blit_data || w == 0 || h == 0) {
         core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0);
         return;

@@ -105,8 +105,10 @@ class D3D12Presenter final : public Presenter {
 #ifdef XENIA_LIBRETRO
   // GPU blit capture: R10G10B10A2 readback with persistent resources.
   // Returns pointer to converted 8bpc buffer (valid until next call).
+  // is_bgra_out is always true here: the 10bpc->8bpc conversion this path
+  // already performs emits libretro's XRGB8888 byte order directly.
   bool CaptureGuestOutputGPUBlit(const void*& data_out, uint32_t& width_out,
-                                 uint32_t& height_out);
+                                 uint32_t& height_out, bool& is_bgra_out);
 #endif
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {

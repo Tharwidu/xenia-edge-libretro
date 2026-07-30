@@ -149,7 +149,9 @@ bool D3D12Presenter::CreateGPUBlitResources(
 
 bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
                                                 uint32_t& width_out,
-                                                uint32_t& height_out) {
+                                                uint32_t& height_out,
+                                                bool& is_bgra_out) {
+  is_bgra_out = true;
   // Acquire guest output resource
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
   {
@@ -260,7 +262,10 @@ bool D3D12Presenter::CaptureGuestOutputGPUBlit(const void*& data_out,
         gpu_blit_.readback_layout.Offset +
         size_t(gpu_blit_.readback_layout.Footprint.RowPitch) * y);
     for (uint32_t x = 0; x < w; ++x) {
-      dest_row[x] = Packed10bpcRGBTo8bpcBytes(source_row[x]);
+      // BGRA variant: this loop has to touch every pixel anyway, so emitting
+      // libretro's byte order here is free and saves the caller a second
+      // whole-frame pass.
+      dest_row[x] = Packed10bpcRGBTo8bpcBytesBGRA(source_row[x]);
     }
   }
 

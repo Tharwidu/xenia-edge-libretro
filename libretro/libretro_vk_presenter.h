@@ -12,10 +12,12 @@ namespace xe {
 namespace ui { class Presenter; }
 }
 
-// GPU blit capture: A2B10G10R10 ??? R8G8B8A8 via VulkanPresenter.
+// GPU blit capture via VulkanPresenter. is_bgra_out true means the blit landed
+// directly in libretro's XRGB8888 byte order and no CPU channel swap is owed.
 bool libretro_vk_capture_gpu_blit(xe::ui::Presenter* presenter,
                                    const void*& data_out,
                                    uint32_t& width_out,
-                                   uint32_t& height_out);
+                                   uint32_t& height_out,
+                                   bool& is_bgra_out);
 
 #endif // LIBRETRO_VK_PRESENTER_H

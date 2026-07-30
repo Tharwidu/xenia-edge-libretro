@@ -294,10 +294,32 @@ bool VulkanPresenter::CreateGPUBlitResources(uint32_t w, uint32_t h) {
     return false;
   }
 
-  // Intermediate R8G8B8A8 blit image (device-local)
+  // Pick the blit destination format. The blit converts from the guest's
+  // A2B10G10R10 either way, so landing straight in B8G8R8A8 - which is
+  // libretro's XRGB8888 byte for byte - removes a full-frame channel swap from
+  // the CPU for free. Vulkan only guarantees BLIT_DST on R8G8B8A8 of the two,
+  // so ask the device rather than assume, and keep R8G8B8A8 as the fallback.
+  gpu_blit_.format = VK_FORMAT_R8G8B8A8_UNORM;
+  {
+    const VulkanInstance::Functions& ifn =
+        vulkan_device_->vulkan_instance()->functions();
+    VkFormatProperties fmt_props;
+    ifn.vkGetPhysicalDeviceFormatProperties(vulkan_device_->physical_device(),
+                                            VK_FORMAT_B8G8R8A8_UNORM,
+                                            &fmt_props);
+    if (fmt_props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) {
+      gpu_blit_.format = VK_FORMAT_B8G8R8A8_UNORM;
+    } else {
+      XELOGW(
+          "VulkanPresenter: B8G8R8A8_UNORM is not blit-destination capable; "
+          "falling back to R8G8B8A8 and a per-frame CPU channel swap");
+    }
+  }
+
+  // Intermediate blit image (device-local)
   VkImageCreateInfo img_info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   img_info.imageType = VK_IMAGE_TYPE_2D;
-  img_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  img_info.format = gpu_blit_.format;
   img_info.extent = {w, h, 1};
   img_info.mipLevels = 1;
   img_info.arrayLayers = 1;
@@ -335,7 +357,9 @@ bool VulkanPresenter::CreateGPUBlitResources(uint32_t w, uint32_t h) {
 
 bool VulkanPresenter::CaptureGuestOutputGPUBlit(const void*& data_out,
                                                  uint32_t& width_out,
-                                                 uint32_t& height_out) {
+                                                 uint32_t& height_out,
+                                                 bool& is_bgra_out) {
+  is_bgra_out = false;
   // Acquire the guest output image
   std::shared_ptr<GuestOutputImage> guest_output_image;
   {
@@ -480,6 +504,7 @@ bool VulkanPresenter::CaptureGuestOutputGPUBlit(const void*& data_out,
   data_out = gpu_blit_.readback_mapped;
   width_out = w;
   height_out = h;
+  is_bgra_out = (gpu_blit_.format == VK_FORMAT_B8G8R8A8_UNORM);
   return true;
 }
 #endif  // XENIA_LIBRETRO

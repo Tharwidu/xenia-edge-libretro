@@ -9,11 +9,13 @@
 bool libretro_d3d12_capture_gpu_blit(xe::ui::Presenter* presenter,
                                       const void*& data_out,
                                       uint32_t& width_out,
-                                      uint32_t& height_out) {
+                                      uint32_t& height_out,
+                                      bool& is_bgra_out) {
+    is_bgra_out = false;
     if (!presenter) return false;
     auto* d3d12_presenter =
         dynamic_cast<xe::ui::d3d12::D3D12Presenter*>(presenter);
     if (!d3d12_presenter) return false;
     return d3d12_presenter->CaptureGuestOutputGPUBlit(data_out, width_out,
-                                                       height_out);
+                                                       height_out, is_bgra_out);
 }

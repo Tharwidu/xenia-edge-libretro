@@ -145,10 +145,16 @@ class VulkanPresenter final : public Presenter {
   bool CaptureGuestOutput(RawImage& image_out) override;
 
 #ifdef XENIA_LIBRETRO
-  // GPU blit capture: A2B10G10R10 ??? R8G8B8A8 with persistent resources.
-  // Returns pointer to readback buffer (valid until next call).
+  // GPU blit capture with persistent resources. Returns a pointer to the
+  // readback buffer, valid until the next call.
+  //
+  // The blit already performs a format conversion from the guest's
+  // A2B10G10R10, so it costs nothing to land directly in the byte order
+  // libretro wants. is_bgra_out reports whether it did: true means the data is
+  // already XRGB8888 and the caller must not touch it, false means the device
+  // could not blit into B8G8R8A8 and the caller owes a channel swap.
   bool CaptureGuestOutputGPUBlit(const void*& data_out, uint32_t& width_out,
-                                 uint32_t& height_out);
+                                 uint32_t& height_out, bool& is_bgra_out);
 #endif
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
@@ -500,6 +506,11 @@ class VulkanPresenter final : public Presenter {
     VkFence fence = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Blit destination format. B8G8R8A8 is what libretro's XRGB8888 wants
+    // byte-for-byte, so when the device can blit into it the caller needs no
+    // channel swap at all. R8G8B8A8 is the fallback: it is the only one of the
+    // two Vulkan guarantees BLIT_DST for, and then the caller must swap.
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
   };
   GPUBlitResources gpu_blit_;
   void DestroyGPUBlitResources();

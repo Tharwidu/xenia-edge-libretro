@@ -16,6 +16,7 @@ namespace ui { class Presenter; }
 bool libretro_d3d12_capture_gpu_blit(xe::ui::Presenter* presenter,
                                       const void*& data_out,
                                       uint32_t& width_out,
-                                      uint32_t& height_out);
+                                      uint32_t& height_out,
+                                      bool& is_bgra_out);
 
 #endif // LIBRETRO_D3D12_PRESENTER_H
