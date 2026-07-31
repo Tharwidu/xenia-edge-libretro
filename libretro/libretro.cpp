@@ -65,6 +65,7 @@ DECLARE_bool(use_dedicated_xma_thread);
 DECLARE_bool(enable_xmp);
 DECLARE_int32(xmp_default_volume);
 DECLARE_bool(apply_patches);
+DECLARE_bool(patch_all_in_file);
 DECLARE_int32(license_mask);
 DECLARE_int32(headless_messagebox_button);
 DECLARE_int32(user_language);
@@ -872,6 +873,13 @@ static void apply_core_options(void) {
     // Apply game patches
     if ((v = opt_get(XENIA_OPT_APPLY_PATCHES))) {
         cvars::apply_patches = (strcmp(v, "enabled") == 0);
+    }
+
+    // Whether dropping a patch file in is enough to activate it, or whether
+    // each patch's is_enabled flag still decides. See the cvar's own comment in
+    // patcher.cc for why this is not the default.
+    if ((v = opt_get(XENIA_OPT_PATCH_ACTIVATION))) {
+        cvars::patch_all_in_file = (strcmp(v, "whole_file") == 0);
     }
 
     // License mask (0=None, 1=Full, -1=All)

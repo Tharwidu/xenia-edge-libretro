@@ -8,8 +8,28 @@
  */
 #include <cstring>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/patcher/patcher.h"
+
+// Upstream patch files ship every patch with is_enabled = false, so a user who
+// downloads one has to open the TOML and edit it before anything happens. That
+// is a poor fit for a libretro core, where the natural gesture is to drop a
+// file in a folder and have it take effect - and to delete it to undo.
+//
+// This makes the file the switch. It is opt-in rather than the default because
+// a patch file is not necessarily one patch: Sonic Unleashed ships seven in a
+// single file, including Disable Shadow Maps, Disable Depth of Field and Aspect
+// Ratio. Turning all of those on merely because the file exists would surprise
+// people. Titles with a single patch - the common case - behave exactly as
+// expected.
+DEFINE_bool(
+    patch_all_in_file, false,
+    "Apply every patch in a patch file, ignoring each patch's is_enabled "
+    "flag. Lets a patch file be enabled by dropping it in and disabled by "
+    "deleting it, with no TOML editing. Off means honour is_enabled, which "
+    "is what standalone xenia does.",
+    "General");
 
 namespace xe {
 namespace patcher {
@@ -26,7 +46,7 @@ void Patcher::ApplyPatchesForTitle(Memory* memory, const uint32_t title_id,
 
   for (const PatchFileEntry& patchFile : title_patches) {
     for (const PatchInfoEntry& patchEntry : patchFile.patch_info) {
-      if (!patchEntry.is_enabled) {
+      if (!patchEntry.is_enabled && !cvars::patch_all_in_file) {
         continue;
       }
       XELOGE("Patcher: Applying patch for: {}({:08X}) - {}",

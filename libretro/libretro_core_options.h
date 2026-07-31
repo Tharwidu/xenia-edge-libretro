@@ -51,6 +51,7 @@ struct xenia_core_state;
 #define XENIA_OPT_TIME_SCALAR           "xenia_time_scalar"
 #define XENIA_OPT_TITLE_UPDATES         "xenia_title_updates"
 #define XENIA_OPT_APPLY_PATCHES         "xenia_apply_patches"
+#define XENIA_OPT_PATCH_ACTIVATION      "xenia_patch_activation"
 #define XENIA_OPT_LICENSE_MASK          "xenia_license_mask"
 #define XENIA_OPT_USER_LANGUAGE         "xenia_user_language"
 #define XENIA_OPT_USER_COUNTRY          "xenia_user_country"
@@ -529,6 +530,26 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "enabled"
+    },
+    {
+        XENIA_OPT_PATCH_ACTIVATION,
+        "Patch Activation",
+        "Patch Activation",
+        "How patches inside a patch file are switched on.\n"
+        "File contents: honour each patch's is_enabled flag, the same as "
+        "standalone xenia - you edit the .toml to choose.\n"
+        "Whole file: apply every patch in the file, so dropping a file into "
+        "the patches folder enables it and deleting the file disables it, with "
+        "no editing. Note some files carry several patches - Sonic Unleashed "
+        "ships seven, including Disable Shadow Maps and Aspect Ratio.",
+        NULL,
+        "Emulation",
+        {
+            { "file_contents", "File contents (honour is_enabled)" },
+            { "whole_file",    "Whole file (drop in to enable)" },
+            { NULL, NULL }
+        },
+        "file_contents"
     },
     {
         XENIA_OPT_LICENSE_MASK,
