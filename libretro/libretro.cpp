@@ -75,8 +75,17 @@ static bool g_can_dupe = false;         // NULL frame means "repeat last"
 DECLARE_int32(license_mask);
 DECLARE_int32(headless_messagebox_button);
 DECLARE_int32(user_language);
+
+// Unlike every other cvar this core reaches for, the stick deadzones are
+// DEFINE_double'd *inside* `namespace xe { namespace hid {` in
+// input_system.cc, so they live at xe::hid::cvars rather than the global
+// cvars. Declaring them at file scope compiles cleanly and then fails at link.
+namespace xe {
+namespace hid {
 DECLARE_double(left_stick_deadzone_percentage);
 DECLARE_double(right_stick_deadzone_percentage);
+}  // namespace hid
+}  // namespace xe
 DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
 DECLARE_bool(clear_memory_page_state);
@@ -882,10 +891,10 @@ static void apply_core_options(void) {
     // them when strictly between 0 and 1, so 0 means "no deadzone" - which is
     // the default and the right answer for a pad that is not worn.
     if ((v = opt_get(XENIA_OPT_LSTICK_DEADZONE))) {
-        cvars::left_stick_deadzone_percentage = atoi(v) / 100.0;
+        xe::hid::cvars::left_stick_deadzone_percentage = atoi(v) / 100.0;
     }
     if ((v = opt_get(XENIA_OPT_RSTICK_DEADZONE))) {
-        cvars::right_stick_deadzone_percentage = atoi(v) / 100.0;
+        xe::hid::cvars::right_stick_deadzone_percentage = atoi(v) / 100.0;
     }
 
     // Apply game patches
