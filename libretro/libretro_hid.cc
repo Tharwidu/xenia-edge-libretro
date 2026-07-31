@@ -152,7 +152,7 @@ X_RESULT LibretroInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
 }
 
 void LibretroInputDriver::UpdateFromLibretro(
-    retro_input_state_t input_state_cb) {
+    retro_input_state_t input_state_cb, bool use_bitmasks) {
   if (!input_state_cb) return;
 
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -160,12 +160,23 @@ void LibretroInputDriver::UpdateFromLibretro(
   for (size_t port = 0; port < kMaxPorts; ++port) {
     auto& s = states_[port];
 
-    // Read digital buttons
+    // Read digital buttons - one call for all sixteen where the frontend
+    // supports it, sixteen calls where it does not.
     bool any_input = false;
-    for (int id = 0; id < 16; ++id) {
-      s.buttons[id] = input_state_cb(
-          static_cast<unsigned>(port), RETRO_DEVICE_JOYPAD, 0, id);
-      if (s.buttons[id]) any_input = true;
+    if (use_bitmasks) {
+      const int16_t mask = input_state_cb(
+          static_cast<unsigned>(port), RETRO_DEVICE_JOYPAD, 0,
+          RETRO_DEVICE_ID_JOYPAD_MASK);
+      for (int id = 0; id < 16; ++id) {
+        s.buttons[id] = (mask & (1 << id)) ? 1 : 0;
+      }
+      if (mask) any_input = true;
+    } else {
+      for (int id = 0; id < 16; ++id) {
+        s.buttons[id] = input_state_cb(
+            static_cast<unsigned>(port), RETRO_DEVICE_JOYPAD, 0, id);
+        if (s.buttons[id]) any_input = true;
+      }
     }
 
     // Read analog sticks

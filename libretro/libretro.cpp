@@ -66,9 +66,17 @@ DECLARE_bool(enable_xmp);
 DECLARE_int32(xmp_default_volume);
 DECLARE_bool(apply_patches);
 DECLARE_bool(patch_all_in_file);
+
+// Frontend capabilities queried once at init. Each has a working fallback, so
+// an older frontend - RetroArch 1.7.5, which EmuVR ships - simply keeps the
+// previous behaviour.
+static bool g_input_bitmasks = false;   // all buttons in one call per port
+static bool g_can_dupe = false;         // NULL frame means "repeat last"
 DECLARE_int32(license_mask);
 DECLARE_int32(headless_messagebox_button);
 DECLARE_int32(user_language);
+DECLARE_double(left_stick_deadzone_percentage);
+DECLARE_double(right_stick_deadzone_percentage);
 DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
 DECLARE_bool(clear_memory_page_state);
@@ -870,6 +878,16 @@ static void apply_core_options(void) {
         cvars::apply_title_update = (strcmp(v, "enabled") == 0);
     }
 
+    // Stick deadzones. Xenia stores these as a 0..1 fraction and only applies
+    // them when strictly between 0 and 1, so 0 means "no deadzone" - which is
+    // the default and the right answer for a pad that is not worn.
+    if ((v = opt_get(XENIA_OPT_LSTICK_DEADZONE))) {
+        cvars::left_stick_deadzone_percentage = atoi(v) / 100.0;
+    }
+    if ((v = opt_get(XENIA_OPT_RSTICK_DEADZONE))) {
+        cvars::right_stick_deadzone_percentage = atoi(v) / 100.0;
+    }
+
     // Apply game patches
     // One control, three states. "disabled" stops patch files being read at
     // all - which is how you turn everything off without deleting files -
@@ -1266,6 +1284,28 @@ static void pace_software_frame(void) {
 }
 
 static void update_video(void) {
+    // Skip the whole capture when the frontend has told us the frame will not
+    // be shown. Fast-forward drops most frames on the floor, and video can be
+    // disabled outright; either way the readback, the blit and the upload are
+    // pure waste. Passing NULL repeats the previous frame, which is what a
+    // frontend expects for a dropped frame - only valid if it advertised
+    // GET_CAN_DUPE, so fall through to a real capture when it did not.
+    if (g_can_dupe) {
+        bool ff = false;
+        if (core_state.environ_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &ff) &&
+            ff) {
+            core_state.video_cb(nullptr, 1280, 720, 1280 * 4);
+            return;
+        }
+        int av_enable = 0;
+        if (core_state.environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE,
+                                  &av_enable) &&
+            !(av_enable & 1)) {  // bit 0 = video enabled
+            core_state.video_cb(nullptr, 1280, 720, 1280 * 4);
+            return;
+        }
+    }
+
     // Capture the guest frame with the presenter's persistent-resource GPU
     // blit (the same path the HW-render present uses). The old
     // CaptureGuestOutput allocated a Vulkan readback buffer + command pool and
@@ -1837,6 +1877,64 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         { 0 },
     };
     cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)descs);
+
+    // Frontend capability probes. All three degrade silently: the fallback is
+    // exactly what the core did before, so RetroArch 1.7.5 is unaffected.
+    {
+        bool flag = false;
+        g_input_bitmasks =
+            cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, &flag) && flag;
+
+        flag = false;
+        g_can_dupe = cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &flag) && flag;
+
+        xenia_log(RETRO_LOG_INFO,
+                  "Frontend: input bitmasks %s, frame duping %s\n",
+                  g_input_bitmasks ? "yes" : "no", g_can_dupe ? "yes" : "no");
+    }
+
+    // Tell the frontend this core is demanding, so it can size its own
+    // buffering sensibly rather than assuming a light 2D core.
+    {
+        unsigned level = 15;
+        cb(RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL, &level);
+    }
+
+    // Take the guest's language from the frontend when the user has not pinned
+    // one. Xenia's user_language is the 360's own enum and happens to match the
+    // order libretro uses for the languages the 360 shipped with, so the common
+    // ones map directly; anything else falls back to English rather than
+    // guessing. Only a default - the core option still wins.
+    {
+        unsigned lang = 0;
+        if (cb(RETRO_ENVIRONMENT_GET_LANGUAGE, &lang)) {
+            static const struct { unsigned retro; int x360; } kLangMap[] = {
+                { RETRO_LANGUAGE_ENGLISH,             1 },
+                { RETRO_LANGUAGE_JAPANESE,            2 },
+                { RETRO_LANGUAGE_GERMAN,              3 },
+                { RETRO_LANGUAGE_FRENCH,              4 },
+                { RETRO_LANGUAGE_SPANISH,             5 },
+                { RETRO_LANGUAGE_ITALIAN,             6 },
+                { RETRO_LANGUAGE_KOREAN,              7 },
+                { RETRO_LANGUAGE_CHINESE_TRADITIONAL, 8 },
+                { RETRO_LANGUAGE_PORTUGUESE_BRAZIL,   9 },
+                { RETRO_LANGUAGE_PORTUGUESE_PORTUGAL, 9 },
+                { RETRO_LANGUAGE_POLISH,             11 },
+                { RETRO_LANGUAGE_RUSSIAN,            12 },
+                { RETRO_LANGUAGE_SWEDISH,            13 },
+                { RETRO_LANGUAGE_TURKISH,            14 },
+                { RETRO_LANGUAGE_NORWEGIAN,          15 },
+                { RETRO_LANGUAGE_DUTCH,              16 },
+                { RETRO_LANGUAGE_CHINESE_SIMPLIFIED, 17 },
+            };
+            for (const auto& m : kLangMap) {
+                if (m.retro == lang) {
+                    cvars::user_language = m.x360;
+                    break;
+                }
+            }
+        }
+    }
 
     // NOTE: deliberately no SET_CONTROLLER_INFO here. Declaring N controller
     // ports makes the frontend call retro_set_controller_port_device() for
@@ -2489,7 +2587,8 @@ RETRO_API void retro_run(void) {
 
     // Feed libretro input state into Xenia's HID system
     if (lr_input_driver && core_state.input_state_cb)
-        lr_input_driver->UpdateFromLibretro(core_state.input_state_cb);
+        lr_input_driver->UpdateFromLibretro(core_state.input_state_cb,
+                                            g_input_bitmasks);
 
     // Capture the latest frame via the appropriate video path.
 

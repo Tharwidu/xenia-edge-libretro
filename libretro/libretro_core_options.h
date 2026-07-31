@@ -19,6 +19,8 @@ struct xenia_core_state;
 #define XENIA_OPT_RENDER_TARGET_PATH    "xenia_render_target_path"
 #define XENIA_OPT_DRAW_RESOLUTION_SCALE "xenia_draw_resolution_scale"
 #define XENIA_OPT_ANISOTROPIC_FILTERING "xenia_anisotropic_filtering"
+#define XENIA_OPT_LSTICK_DEADZONE       "xenia_left_stick_deadzone"
+#define XENIA_OPT_RSTICK_DEADZONE       "xenia_right_stick_deadzone"
 #define XENIA_OPT_ASYNC_SHADERS         "xenia_async_shader_compilation"
 #define XENIA_OPT_READBACK_RESOLVE      "xenia_readback_resolve"
 #define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
@@ -90,7 +92,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Select render target emulation mode.\n"
         "Auto: use the config file, so a per-title config can set this.\n"
         "Performance: host render targets with fixed-function blending.\n"
-        "Accuracy: pixel shader interlock / rasterizer-ordered views.",
+        "Accuracy: pixel shader interlock / rasterizer-ordered views. Requires restart.",
         NULL,
         "Graphics",
         {
@@ -146,7 +148,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Async Shader Compilation",
         "Async Shaders",
         "Compile shaders in background threads. Reduces stutter but may "
-        "cause brief rendering artifacts.",
+        "cause brief rendering artifacts. Requires restart.",
         NULL,
         "Graphics",
         {
@@ -164,7 +166,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Auto: follow the frontend's preferred context; Vulkan when the\n"
         "frontend cannot express one (e.g. RetroArch 1.7.5 / EmuVR).\n"
         "Vulkan: best under Wine/Proton; no Agility SDK requirement.\n"
-        "D3D12: Windows only; requires the DirectX 12 Agility runtime.",
+        "D3D12: Windows only; requires the DirectX 12 Agility runtime. Requires restart.",
         NULL,
         "Graphics",
         {
@@ -204,7 +206,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Store Shaders",
         "Shader Cache",
         "Store compiled shaders persistently to avoid recompilation stutter "
-        "on subsequent runs.",
+        "on subsequent runs. Requires restart.",
         NULL,
         "Graphics",
         {
@@ -295,7 +297,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_50HZ_MODE,
         "PAL 50Hz Mode",
         "50Hz Mode",
-        "Run at 50Hz instead of 60Hz for PAL region games.",
+        "Run at 50Hz instead of 60Hz for PAL region games. Requires restart.",
         NULL,
         "Graphics",
         {
@@ -313,7 +315,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Internal Display Resolution (Restart)",
         "Display Resolution",
         "Allow games that support multiple resolutions to render at a "
-        "specific resolution. Not all games support this.",
+        "specific resolution. Not all games support this. Requires restart.",
         NULL,
         "Video",
         {
@@ -341,7 +343,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_WIDESCREEN,
         "Widescreen (16:9)",
         "Widescreen",
-        "Toggle between 16:9 widescreen and 4:3 standard aspect ratio.",
+        "Toggle between 16:9 widescreen and 4:3 standard aspect ratio. Requires restart.",
         NULL,
         "Video",
         {
@@ -355,7 +357,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_VIDEO_STANDARD,
         "Video Standard",
         "Signal",
-        "Select the video signal standard. Affects region detection.",
+        "Select the video signal standard. Affects region detection. Requires restart.",
         NULL,
         "Video",
         {
@@ -389,7 +391,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_AUDIO_ENABLED,
         "Audio Output",
         NULL,
-        "Enable or disable audio processing and output.",
+        "Enable or disable audio processing and output. Requires restart.",
         NULL,
         "Audio",
         {
@@ -418,7 +420,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "XMA Decoder (Restart)",
         "XMA Decoder",
         "Select the XMA audio decoder implementation. Try a different "
-        "option if audio is broken in a specific game.",
+        "option if audio is broken in a specific game. Requires restart.",
         NULL,
         "Audio",
         {
@@ -435,7 +437,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Dedicated XMA Thread",
         "XMA Thread",
         "Use a dedicated thread for XMA audio decoding. May improve "
-        "audio performance.",
+        "audio performance. Requires restart.",
         NULL,
         "Audio",
         {
@@ -506,7 +508,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_TITLE_UPDATES,
         "Apply Title Updates",
         "Title Updates",
-        "Apply title update patches if available in the content directory.",
+        "Apply title update patches if available in the content directory. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -515,6 +517,58 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "enabled"
+    },
+    {
+        XENIA_OPT_LSTICK_DEADZONE,
+        "Left Stick Deadzone",
+        "Left Deadzone",
+        "Ignore left stick movement below this fraction of full travel. "
+        "0% uses the stick exactly as the pad reports it, which is xenia's "
+        "default and correct for a healthy pad; raise it only to hide drift on "
+        "a worn stick, since a deadzone always costs fine control.",
+        NULL,
+        "Input",
+        {
+            { "0", "0%%" },
+            { "5", "5%%" },
+            { "10", "10%%" },
+            { "15", "15%%" },
+            { "20", "20%%" },
+            { "25", "25%%" },
+            { "30", "30%%" },
+            { "35", "35%%" },
+            { "40", "40%%" },
+            { "45", "45%%" },
+            { "50", "50%%" },
+            { NULL, NULL }
+        },
+        "0"
+    },
+    {
+        XENIA_OPT_RSTICK_DEADZONE,
+        "Right Stick Deadzone",
+        "Right Deadzone",
+        "Ignore right stick movement below this fraction of full travel. "
+        "0% uses the stick exactly as the pad reports it, which is xenia's "
+        "default and correct for a healthy pad; raise it only to hide drift on "
+        "a worn stick, since a deadzone always costs fine control.",
+        NULL,
+        "Input",
+        {
+            { "0", "0%%" },
+            { "5", "5%%" },
+            { "10", "10%%" },
+            { "15", "15%%" },
+            { "20", "20%%" },
+            { "25", "25%%" },
+            { "30", "30%%" },
+            { "35", "35%%" },
+            { "40", "40%%" },
+            { "45", "45%%" },
+            { "50", "50%%" },
+            { NULL, NULL }
+        },
+        "0"
     },
     {
         XENIA_OPT_APPLY_PATCHES,
@@ -529,7 +583,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Whole file: apply every patch in the file, so dropping a file in "
         "enables it and deleting the file disables it, with no editing. Note "
         "some files carry several patches - Sonic Unleashed ships seven, "
-        "including Disable Shadow Maps and Aspect Ratio.",
+        "including Disable Shadow Maps and Aspect Ratio. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -545,7 +599,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "License Mask",
         "License",
         "Set license mask for activated content (DLC, full version).\n"
-        "None: no licenses. Full: first license. All: all licenses.",
+        "None: no licenses. Full: first license. All: all licenses. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -569,7 +623,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "time.\n"
         "Place an MPEG-1 file at <system>/xenia/bootanim.mpg. Convert any "
         "video with: ffmpeg -i in.mp4 -c:v mpeg1video -q:v 4 -c:a mp2 "
-        "-ar 48000 bootanim.mpg",
+        "-ar 48000 bootanim.mpg Requires restart.",
         NULL,
         "Emulation",
         {
@@ -588,7 +642,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "(required for saves and scores in many titles, especially XBLA).\n"
         "Signs in the first existing profile, or creates one named "
         "'PlayerOne' on first run. Profiles are generated by the emulator "
-        "and stored in the save directory.",
+        "and stored in the save directory. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -629,7 +683,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_USER_LANGUAGE,
         "User Language",
         "Language",
-        "Set the emulated console language.",
+        "Set the emulated console language. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -653,7 +707,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_USER_COUNTRY,
         "User Country",
         "Country",
-        "Set the emulated console country/region.",
+        "Set the emulated console country/region. Requires restart.",
         NULL,
         "Emulation",
         {
@@ -689,7 +743,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Protect Zero Page",
         "Protect Zero",
         "Protect the zero page from reads and writes. Disable if a game "
-        "crashes on startup.",
+        "crashes on startup. Requires restart.",
         NULL,
         "Compatibility",
         {
@@ -704,7 +758,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Clear GPU Memory Page State",
         "Clear GPU Cache",
         "Refresh state of memory pages for GPU written data. Disable for "
-        "a minor performance boost, but may break rendering.",
+        "a minor performance boost, but may break rendering. Requires restart.",
         NULL,
         "Compatibility",
         {
@@ -719,7 +773,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "Disable Context Promotion",
         "No Ctx Promotion",
         "Disable context promotion CPU optimization. May be needed for "
-        "some sports games, but reduces performance.",
+        "some sports games, but reduces performance. Requires restart.",
         NULL,
         "Compatibility",
         {
@@ -733,7 +787,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_MOUNT_CACHE,
         "Mount Cache Partition",
         "Cache Mount",
-        "Enable cache partition mount. Required by some games.",
+        "Enable cache partition mount. Required by some games. Requires restart.",
         NULL,
         "Compatibility",
         {
@@ -747,7 +801,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_MOUNT_SCRATCH,
         "Mount Scratch Partition",
         "Scratch Mount",
-        "Enable scratch partition mount. Required by some games.",
+        "Enable scratch partition mount. Required by some games. Requires restart.",
         NULL,
         "Compatibility",
         {

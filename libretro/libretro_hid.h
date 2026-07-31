@@ -69,7 +69,12 @@ class LibretroInputDriver final : public InputDriver {
 
   // Called from libretro frontend thread (retro_run) to update
   // the cached controller state for all ports.
-  void UpdateFromLibretro(retro_input_state_t input_state_cb);
+  // use_bitmasks: the frontend supports RETRO_ENVIRONMENT_GET_INPUT_BITMASKS,
+  // so all sixteen digital buttons arrive in one call per port instead of
+  // sixteen. Falls back automatically when the frontend does not - RetroArch
+  // 1.7.5, which EmuVR ships, is one that does not.
+  void UpdateFromLibretro(retro_input_state_t input_state_cb,
+                          bool use_bitmasks = false);
 
   // Set the rumble callback obtained from the frontend.
   void SetRumbleCallback(retro_set_rumble_state_t cb);
