@@ -8,6 +8,7 @@
  * (at your option) any later version.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -172,6 +173,22 @@ static xe::apu::libretro::LibretroAudioRingBuffer *audio_ring = nullptr;
 static xe::hid::libretro_hid::LibretroInputDriver *lr_input_driver = nullptr;
 static xe::gpu::GraphicsSystem *lr_graphics = nullptr;
 static bool game_loaded = false;
+
+// Upper bound on the video the frontend must be prepared to receive. Declared
+// once in retro_get_system_av_info and never changed afterwards - raising it
+// later would need SET_SYSTEM_AV_INFO, which reinitializes the video driver.
+// The frontend may size buffers from these, so they are a real cost and not
+// something to inflate "just in case"; 4K covers every 360 display mode with
+// room for a 2x-3x resolution scale, and report_geometry clamps beyond that.
+static constexpr uint32_t kMaxGeometryWidth  = 3840;
+static constexpr uint32_t kMaxGeometryHeight = 2160;
+
+// Last geometry handed to the frontend, so report_geometry only calls out when
+// something actually changed. Cleared on shutdown: these outlive a single
+// title, and a stale match would make the first frame of the next game skip its
+// report and sit on whatever av_info declared.
+static uint32_t last_geometry_w = 0, last_geometry_h = 0;
+static uint32_t last_geometry_aspect_x = 0, last_geometry_aspect_y = 0;
 
 // Software frame capture buffer (fallback path)
 static xe::ui::RawImage captured_frame;
@@ -1298,6 +1315,107 @@ static void pace_software_frame(void) {
     }
 }
 
+// Tell the frontend the guest's output size and display aspect when either
+// changes.
+//
+// retro_get_system_av_info can only answer once, at load, and it has to answer
+// before the guest has booted far enough to have configured its scaler - so it
+// declares 1280x720 16:9 and would otherwise stay there for the whole session.
+// 360 titles are not all 720p16:9: 4:3 titles exist, sub-HD framebuffers are
+// common (the console's scaler hides it on real hardware), and a title may
+// change mode at runtime. Without this the frontend has no way to know, and
+// anything not matching the declared ratio is silently stretched.
+//
+// The ratio deliberately does NOT come from the frame's own dimensions. The
+// 360 scales its framebuffer to the display mode in hardware, so a 1024x600
+// buffer can be a 16:9 picture and dividing width by height would give 1.71 and
+// a subtly wrong image. xenia already models this: the guest declares its
+// scaled output through VdInitializeScalerCommandBuffer, and
+// CalculateScaledAspectRatio turns that into the ratio the picture would have
+// on a physical TV, honouring the console's widescreen setting. That is the
+// number the frontend wants.
+//
+// Must be called from retro_run - the environment call requires it.
+static void report_geometry(uint32_t w, uint32_t h) {
+    if (!w || !h) return;
+
+    uint32_t aspect_x = 0, aspect_y = 0;
+    if (lr_graphics) {
+        auto aspect = lr_graphics->GetScaledAspectRatio();
+        aspect_x = aspect.first;
+        aspect_y = aspect.second;
+    }
+
+    // Nothing moved - and this is the common case, every frame of a stable
+    // title, so it stays ahead of the environment call.
+    if (w == last_geometry_w && h == last_geometry_h &&
+        aspect_x == last_geometry_aspect_x &&
+        aspect_y == last_geometry_aspect_y) {
+        return;
+    }
+
+    // base must fit inside the max declared in av_info, which cannot be raised
+    // without a full SET_SYSTEM_AV_INFO reinit. Resolution scaling can push the
+    // guest output past 4K (up to 7x per axis), so clamp rather than send an
+    // out-of-range geometry. The frame itself is still delivered at its real
+    // size; only the nominal geometry is capped.
+    uint32_t base_w = std::min(w, kMaxGeometryWidth);
+    uint32_t base_h = std::min(h, kMaxGeometryHeight);
+    if (base_w != w || base_h != h) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            xenia_log(RETRO_LOG_WARN,
+                      "Guest output %ux%u exceeds the declared maximum %ux%u; "
+                      "reporting clamped geometry. Lower the resolution scale "
+                      "if the picture is wrong.\n",
+                      w, h, kMaxGeometryWidth, kMaxGeometryHeight);
+        }
+    }
+
+    struct retro_game_geometry geom = {};
+    geom.base_width  = base_w;
+    geom.base_height = base_h;
+    // max_* are documented as ignored by SET_GEOMETRY; filled in for clarity.
+    geom.max_width   = kMaxGeometryWidth;
+    geom.max_height  = kMaxGeometryHeight;
+    // 0 tells the frontend to derive the ratio from base_width/base_height.
+    // Close to unreachable in practice, and deliberately kept anyway: the
+    // presenter treats a zero aspect as "guest output inactive"
+    // (GuestOutputProperties::IsActive) and hands out no image, so having a
+    // frame at all implies a non-zero aspect was set when it was refreshed.
+    // The read here is of the current value rather than the one attached to
+    // this frame, so a mode change between the two could still show a zero,
+    // and square pixels beat a ratio we invented.
+    geom.aspect_ratio = (aspect_x && aspect_y)
+                            ? float(aspect_x) / float(aspect_y)
+                            : 0.0f;
+
+    if (!core_state.environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom)) {
+        // Old or minimal frontends may not have it. Nothing to fall back to -
+        // the declared av_info geometry stands - so say so once and stop
+        // trying, rather than repeating the call on every mode change.
+        static bool unsupported_logged = false;
+        if (!unsupported_logged) {
+            unsupported_logged = true;
+            xenia_log(RETRO_LOG_INFO,
+                      "Frontend: SET_GEOMETRY unsupported; geometry stays at "
+                      "the values declared in av_info\n");
+        }
+        return;
+    }
+
+    xenia_log(RETRO_LOG_INFO, "Geometry: %ux%u, display aspect %u:%u (%.4f)\n",
+              base_w, base_h, aspect_x, aspect_y,
+              geom.aspect_ratio ? geom.aspect_ratio
+                                : float(base_w) / float(base_h));
+
+    last_geometry_w = w;
+    last_geometry_h = h;
+    last_geometry_aspect_x = aspect_x;
+    last_geometry_aspect_y = aspect_y;
+}
+
 static void update_video(void) {
     // Skip the whole capture when the frontend has told us the frame will not
     // be shown. Fast-forward drops most frames on the floor, and video can be
@@ -1345,6 +1463,7 @@ static void update_video(void) {
     }
 
     if (got && blit_data && w > 0 && h > 0) {
+        report_geometry(w, h);
         if (is_bgra) {
             // The capture already produced XRGB8888, so hand the mapped
             // readback straight to the frontend. This is the normal path: it
@@ -1392,6 +1511,7 @@ static void update_video_vulkan(void) {
         core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0);
         return;
     }
+    report_geometry(w, h);
 
     // Step 2: Upload to frontend Vulkan image
     uint32_t sync_idx = vk_hw->get_sync_index(vk_hw->handle);
@@ -1503,6 +1623,7 @@ static void update_video_d3d12(void) {
         core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0);
         return;
     }
+    report_geometry(w, h);
 
     // Step 2: Upload to frontend D3D12 texture
     ID3D12Device *device = d3d12_hw->device;
@@ -1820,6 +1941,8 @@ static void xenia_shutdown(void) {
     lr_input_driver = nullptr;
     lr_graphics = nullptr;
     game_loaded = false;
+    last_geometry_w = last_geometry_h = 0;
+    last_geometry_aspect_x = last_geometry_aspect_y = 0;
 
     // Clean up Vulkan HW render resources (frontend side)
     if (vk_hw) {
@@ -2018,10 +2141,14 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info) {
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
     memset(info, 0, sizeof(*info));
+    // The opening guess only. It has to be answered before the guest has run,
+    // so the real values are unknowable here - 720p 16:9 is the most common
+    // 360 mode and therefore the cheapest wrong answer. report_geometry
+    // corrects it from the first guest frame onwards.
     info->geometry.base_width   = 1280;
     info->geometry.base_height  = 720;
-    info->geometry.max_width    = 3840;
-    info->geometry.max_height   = 2160;
+    info->geometry.max_width    = kMaxGeometryWidth;
+    info->geometry.max_height   = kMaxGeometryHeight;
     info->geometry.aspect_ratio = 16.0f / 9.0f;
     info->timing.fps            = core_state.pal_mode ? 50.0 : 60.0;
     info->timing.sample_rate    = core_state.audio_sample_rate;
