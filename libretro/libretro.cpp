@@ -553,8 +553,14 @@ static const char *opt_get(const char *key) {
 // touched the option - so an unconditional assignment here overwrites the
 // config every single launch. That made every cvar we expose impossible to set
 // per title, and a perfectly valid config line for one of them would silently
-// do nothing. RetroArch 1.7.5 has no per-game core options, so the config is
-// the only per-title mechanism available and it must be able to win.
+// do nothing.
+//
+// RetroArch 1.7.5 does have per-game core options - a hand-written
+// config/<core name>/<game>.opt is read, verified 2026-07-30 - but it REPLACES
+// the global options file rather than merging with it, so anything it omits
+// falls back to the core default. That makes it a poor per-title mechanism for
+// a core with hundreds of cvars, and the config file the practical one. Either
+// way the config has to be able to win.
 static bool opt_is_auto(const char *v) {
     return v && strcmp(v, "auto") == 0;
 }
@@ -2126,9 +2132,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         // clears the previous title's overrides first, so each game gets
         // base config + its own settings and nothing leaks between titles.
         // The desktop app does this; the core never did, which left per-game
-        // settings unreachable - and core options cannot fill the gap because
-        // RetroArch 1.7.5 has no per-game core options, so anything set there
-        // applies to every 360 title at once.
+        // settings unreachable. Per-game core options do exist on 1.7.5 (see
+        // opt_is_auto), but they reach only the ~38 options we expose and a
+        // .opt replaces the global file wholesale, so this is the mechanism
+        // that can actually carry per-title settings.
         // Report this through the core's own logger rather than relying on
         // xenia's. This runs before the emulator exists, so xenia's logging is
         // not up yet and its XELOGI lines about the config are dropped. Note

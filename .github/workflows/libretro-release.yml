@@ -201,6 +201,13 @@ jobs:
           The D3D12 folder enables the faster Direct3D 12 backend and is used
           automatically when present. Without it, the core falls back to the
           self-contained Vulkan backend on its own.
+
+          CONFIGURING
+          Three separate mechanisms change how a game runs: core options, the
+          xenia config in system\xenia\, and game patches in <save dir>\patches\.
+          Which one reaches what, which one wins, and the two traps that waste
+          the most time, are documented in docs/libretro-configuration.md in
+          the core's source repository.
           '@ | Set-Content dist/README-install.txt -Encoding utf8
           Compress-Archive -Path dist/* -DestinationPath xenia_edge_libretro-win64.zip
 
