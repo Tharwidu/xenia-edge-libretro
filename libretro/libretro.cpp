@@ -85,8 +85,25 @@ namespace xe {
 namespace hid {
 DECLARE_double(left_stick_deadzone_percentage);
 DECLARE_double(right_stick_deadzone_percentage);
+// Same file, same trap - vibration is defined inside xe::hid too.
+DECLARE_bool(vibration);
 }  // namespace hid
 }  // namespace xe
+// Everything below is defined at global scope, so a plain declaration resolves.
+DECLARE_uint32(volume);
+DECLARE_uint32(apu_max_queued_frames);
+DECLARE_int32(avpack);
+DECLARE_bool(allow_incompatible_title_update);
+DECLARE_int64(stack_size_multiplier_hack);
+DECLARE_bool(vulkan_sparse_shared_memory);
+DECLARE_bool(tiled_shared_memory);
+DECLARE_bool(readback_resolve_sync);
+#ifdef _WIN32
+// Defined in d3d12_command_processor.cc, and xenia-gpu-d3d12-headless is built
+// only `if os.istarget("windows")` - declaring it unconditionally compiles
+// everywhere and then fails to link on Linux.
+DECLARE_bool(d3d12_bindless);
+#endif
 DECLARE_int32(user_country);
 DECLARE_bool(protect_zero);
 DECLARE_bool(clear_memory_page_state);
@@ -868,6 +885,12 @@ static void apply_core_options(void) {
         cvars::kernel_display_gamma_type = (uint32_t)atoi(v);
     }
 
+    // AV pack - which cable the console claims, which gates the video modes a
+    // title will offer (restart required)
+    if ((v = opt_get(XENIA_OPT_AVPACK)) && !opt_is_auto(v)) {
+        cvars::avpack = atoi(v);
+    }
+
     // =================================================================
     // Audio
     // =================================================================
@@ -876,9 +899,23 @@ static void apply_core_options(void) {
     if ((v = opt_get(XENIA_OPT_AUDIO_ENABLED)))
         core_state.audio_enabled = (strcmp(v, "enabled") == 0);
 
-    // Mute (session-only volume; upstream removed the mute cvar)
+    // Master volume. Deliberately applied BEFORE mute so mute stays an
+    // override rather than the two fighting over the same value.
+    if ((v = opt_get(XENIA_OPT_VOLUME)) && !opt_is_auto(v)) {
+        cvars::volume = (uint32_t)atoi(v);
+    }
+
+    // Mute (session-only volume; upstream removed the mute cvar). Restores to
+    // the configured volume rather than a hardcoded 100, or turning mute off
+    // would quietly discard the user's volume setting.
     if ((v = opt_get(XENIA_OPT_MUTE))) {
-        xe::apu::SetVolume((strcmp(v, "enabled") == 0) ? 0 : 100);
+        xe::apu::SetVolume((strcmp(v, "enabled") == 0) ? 0
+                                                       : (int)cvars::volume);
+    }
+
+    // Audio buffering depth (restart required)
+    if ((v = opt_get(XENIA_OPT_APU_QUEUED_FRAMES)) && !opt_is_auto(v)) {
+        cvars::apu_max_queued_frames = (uint32_t)atoi(v);
     }
 
     // XMA decoder (restart required)
@@ -926,6 +963,11 @@ static void apply_core_options(void) {
     }
     if ((v = opt_get(XENIA_OPT_RSTICK_DEADZONE)) && !opt_is_auto(v)) {
         xe::hid::cvars::right_stick_deadzone_percentage = atoi(v) / 100.0;
+    }
+
+    // Controller vibration. Defined inside xe::hid like the deadzones above.
+    if ((v = opt_get(XENIA_OPT_VIBRATION)) && !opt_is_auto(v)) {
+        xe::hid::cvars::vibration = (strcmp(v, "enabled") == 0);
     }
 
     // Apply game patches
@@ -1002,6 +1044,43 @@ static void apply_core_options(void) {
     // Mount scratch partition
     if ((v = opt_get(XENIA_OPT_MOUNT_SCRATCH)) && !opt_is_auto(v)) {
         cvars::mount_scratch = (strcmp(v, "enabled") == 0);
+    }
+
+    // Allow a title update whose signature does not match the game
+    if ((v = opt_get(XENIA_OPT_INCOMPATIBLE_TU)) && !opt_is_auto(v)) {
+        cvars::allow_incompatible_title_update = (strcmp(v, "enabled") == 0);
+    }
+
+    // Guest thread stack size multiplier (setjmp/longjmp workaround)
+    if ((v = opt_get(XENIA_OPT_STACK_SIZE_HACK)) && !opt_is_auto(v)) {
+        cvars::stack_size_multiplier_hack = (int64_t)atoi(v);
+    }
+
+    // =================================================================
+    // Backend tuning
+    //
+    // Each of these is on by default in xenia because it is the faster or more
+    // capable path. They are exposed to be turned OFF: they are the first
+    // things to rule out when a backend will not start or renders wrongly on a
+    // particular driver, and without options that means editing a TOML.
+    // =================================================================
+
+    if ((v = opt_get(XENIA_OPT_VK_SPARSE_MEMORY)) && !opt_is_auto(v)) {
+        cvars::vulkan_sparse_shared_memory = (strcmp(v, "enabled") == 0);
+    }
+
+    if ((v = opt_get(XENIA_OPT_TILED_SHARED_MEMORY)) && !opt_is_auto(v)) {
+        cvars::tiled_shared_memory = (strcmp(v, "enabled") == 0);
+    }
+
+#ifdef _WIN32
+    if ((v = opt_get(XENIA_OPT_D3D12_BINDLESS)) && !opt_is_auto(v)) {
+        cvars::d3d12_bindless = (strcmp(v, "enabled") == 0);
+    }
+#endif
+
+    if ((v = opt_get(XENIA_OPT_READBACK_SYNC)) && !opt_is_auto(v)) {
+        cvars::readback_resolve_sync = (strcmp(v, "enabled") == 0);
     }
 
     // =================================================================

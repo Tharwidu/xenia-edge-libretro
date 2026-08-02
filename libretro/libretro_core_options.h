@@ -63,6 +63,20 @@ struct xenia_core_state;
 #define XENIA_OPT_DISABLE_CTX_PROMOTION "xenia_disable_context_promotion"
 #define XENIA_OPT_MOUNT_CACHE           "xenia_mount_cache"
 #define XENIA_OPT_MOUNT_SCRATCH         "xenia_mount_scratch"
+#define XENIA_OPT_INCOMPATIBLE_TU       "xenia_allow_incompatible_title_update"
+#define XENIA_OPT_STACK_SIZE_HACK       "xenia_stack_size_multiplier_hack"
+
+// Core option keys ??? Backend tuning
+#define XENIA_OPT_VK_SPARSE_MEMORY      "xenia_vulkan_sparse_shared_memory"
+#define XENIA_OPT_TILED_SHARED_MEMORY   "xenia_tiled_shared_memory"
+#define XENIA_OPT_D3D12_BINDLESS        "xenia_d3d12_bindless"
+#define XENIA_OPT_READBACK_SYNC         "xenia_readback_resolve_sync"
+
+// Core option keys ??? Audio / input additions
+#define XENIA_OPT_VOLUME                "xenia_volume"
+#define XENIA_OPT_APU_QUEUED_FRAMES     "xenia_apu_max_queued_frames"
+#define XENIA_OPT_VIBRATION             "xenia_vibration"
+#define XENIA_OPT_AVPACK                "xenia_avpack"
 
 // Core option keys ??? Debug
 #define XENIA_OPT_LOG_LEVEL             "xenia_log_level"
@@ -858,6 +872,188 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { XENIA_LOG_LEVEL_WARN,  "Warning" },
             { XENIA_LOG_LEVEL_INFO,  "Info" },
             { XENIA_LOG_LEVEL_DEBUG, "Debug" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_VOLUME,
+        "Master Volume",
+        "Volume",
+        "Overall output level. Mute overrides this while it is on.",
+        NULL,
+        "Audio",
+        {
+            { "auto", "Auto (from config)" },
+            { "0",   "0% (Silent)" }, { "10",  "10%" }, { "20", "20%" },
+            { "30",  "30%" },  { "40",  "40%" },  { "50", "50%" },
+            { "60",  "60%" },  { "70",  "70%" },  { "80", "80%" },
+            { "90",  "90%" },  { "100", "100%" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_APU_QUEUED_FRAMES,
+        "Audio Buffered Frames (Restart)",
+        "Audio Buffer",
+        "How many audio frames may be queued ahead. Lower cuts latency; too "
+        "low crackles under load. Requires restart.",
+        NULL,
+        "Audio",
+        {
+            { "auto", "Auto (from config)" },
+            { "2", "2 (Lowest latency)" }, { "4",  "4" },  { "6",  "6" },
+            { "8", "8 (Default)" },        { "12", "12" }, { "16", "16" },
+            { "24", "24 (Most stable)" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_VIBRATION,
+        "Controller Vibration",
+        "Vibration",
+        "Send rumble to the pad. The frontend may also have its own rumble "
+        "switch, and both have to be on.",
+        NULL,
+        "Input",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_AVPACK,
+        "AV Pack (Restart)",
+        "AV Pack",
+        "Which cable the console reports as connected, which is how a title "
+        "decides what video modes it may offer. HDMI suits almost everything; "
+        "the PAL-60 entries exist for titles that only offer 50Hz otherwise. "
+        "Requires restart.",
+        NULL,
+        "Video",
+        {
+            { "auto", "Auto (from config)" },
+            { "8", "HDMI (Default)" },
+            { "4", "HDMI + Audio" },
+            { "3", "480p Component (HD)" },
+            { "6", "VGA" },
+            { "0", "PAL-60 Component (SD)" },
+            { "2", "PAL-60 SCART" },
+            { "5", "PAL-60 Composite / S-Video" },
+            { "7", "TV PAL-60" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_INCOMPATIBLE_TU,
+        "Allow Mismatched Title Updates (Restart)",
+        "Mismatched TU",
+        "Apply a title update whose signature does not match the game. Needed "
+        "for some update/region combinations; disable to be strict. "
+        "Requires restart.",
+        NULL,
+        "Emulation",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_STACK_SIZE_HACK,
+        "Stack Size Multiplier Hack (Restart)",
+        "Stack Hack",
+        "Multiplies guest thread stack sizes. A workaround for titles that "
+        "misbehave around setjmp/longjmp - leave at 1 unless a specific game "
+        "is known to need it. Requires restart.",
+        NULL,
+        "Compatibility",
+        {
+            { "auto", "Auto (from config)" },
+            { "1", "1x (Default)" }, { "2", "2x" }, { "4", "4x" },
+            { "8", "8x" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_VK_SPARSE_MEMORY,
+        "Vulkan Sparse Shared Memory (Restart)",
+        "VK Sparse Mem",
+        "Use sparse binding for shared memory. Disable if the Vulkan backend "
+        "fails to start or misrenders on a driver with weak sparse support. "
+        "Requires restart.",
+        NULL,
+        "Backend Tuning",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+    {
+        XENIA_OPT_TILED_SHARED_MEMORY,
+        "Tiled Shared Memory (Restart)",
+        "Tiled Mem",
+        "Use tiled/sparse resources for the guest's large address space. "
+        "Disable if textures corrupt or the GPU backend refuses to start. "
+        "Requires restart.",
+        NULL,
+        "Backend Tuning",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+#ifdef _WIN32
+    // D3D12 is a Windows-only backend here, so this option would be inert
+    // everywhere else. Listing it only where it does something keeps the menu
+    // honest, and its cvar does not exist in a Linux build anyway.
+    {
+        XENIA_OPT_D3D12_BINDLESS,
+        "D3D12 Bindless Resources (Restart)",
+        "D3D12 Bindless",
+        "Use bindless resources on the Direct3D 12 backend where the hardware "
+        "supports them. Usually faster; disable to rule it out when "
+        "diagnosing D3D12 rendering faults. No effect on Vulkan. "
+        "Requires restart.",
+        NULL,
+        "Backend Tuning",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "auto"
+    },
+#endif  // _WIN32
+    {
+        XENIA_OPT_READBACK_SYNC,
+        "Readback Resolve Sync",
+        "Readback Sync",
+        "Stall the GPU after each readback copy so guest memory is correct "
+        "before the game reads it. Disabling is faster but can show stale "
+        "data. Only matters when Readback Resolve is not None.",
+        NULL,
+        "Backend Tuning",
+        {
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
             { NULL, NULL }
         },
         "auto"
