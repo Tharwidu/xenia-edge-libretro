@@ -64,7 +64,6 @@ struct xenia_core_state;
 #define XENIA_OPT_MOUNT_CACHE           "xenia_mount_cache"
 #define XENIA_OPT_MOUNT_SCRATCH         "xenia_mount_scratch"
 #define XENIA_OPT_INCOMPATIBLE_TU       "xenia_allow_incompatible_title_update"
-#define XENIA_OPT_STACK_SIZE_HACK       "xenia_stack_size_multiplier_hack"
 
 // Core option keys ??? Backend tuning
 #define XENIA_OPT_VK_SPARSE_MEMORY      "xenia_vulkan_sparse_shared_memory"
@@ -963,23 +962,6 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
-            { NULL, NULL }
-        },
-        "auto"
-    },
-    {
-        XENIA_OPT_STACK_SIZE_HACK,
-        "Stack Size Multiplier Hack (Restart)",
-        "Stack Hack",
-        "Multiplies guest thread stack sizes. A workaround for titles that "
-        "misbehave around setjmp/longjmp - leave at 1 unless a specific game "
-        "is known to need it. Requires restart.",
-        NULL,
-        "Compatibility",
-        {
-            { "auto", "Auto (from config)" },
-            { "1", "1x (Default)" }, { "2", "2x" }, { "4", "4x" },
-            { "8", "8x" },
             { NULL, NULL }
         },
         "auto"

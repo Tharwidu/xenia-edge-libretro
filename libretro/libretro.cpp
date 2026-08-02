@@ -94,7 +94,6 @@ DECLARE_uint32(volume);
 DECLARE_uint32(apu_max_queued_frames);
 DECLARE_int32(avpack);
 DECLARE_bool(allow_incompatible_title_update);
-DECLARE_int64(stack_size_multiplier_hack);
 DECLARE_bool(vulkan_sparse_shared_memory);
 DECLARE_bool(tiled_shared_memory);
 DECLARE_bool(readback_resolve_sync);
@@ -1051,10 +1050,6 @@ static void apply_core_options(void) {
         cvars::allow_incompatible_title_update = (strcmp(v, "enabled") == 0);
     }
 
-    // Guest thread stack size multiplier (setjmp/longjmp workaround)
-    if ((v = opt_get(XENIA_OPT_STACK_SIZE_HACK)) && !opt_is_auto(v)) {
-        cvars::stack_size_multiplier_hack = (int64_t)atoi(v);
-    }
 
     // =================================================================
     // Backend tuning
