@@ -139,9 +139,27 @@ toggles.
 <save dir>/patches/<title>.patch.toml
 ```
 
-> **Trap: this is the SAVE directory, not `system/xenia`.** Putting patch files
-> in the system directory does nothing at all, and says nothing in the log. If
-> patches appear to be ignored, check this first.
+> **Trap 1: this is the SAVE directory, not `system/xenia`.** Putting patch
+> files in the system directory does nothing at all, and says nothing in the
+> log. If patches appear to be ignored, check this first.
+>
+> **Trap 2: "save directory" means whatever the frontend hands the core, which
+> is often NOT the folder you configured.** RetroArch's *Sort Saves Into
+> Folders* (`sort_savefiles_enable`) appends the core name, so the real path
+> becomes:
+>
+> ```
+> <your save dir>/Xenia Edge/patches/<title>.patch.toml
+> ```
+>
+> That option is **on by default in modern RetroArch** and off in 1.7.5, so the
+> correct location differs between frontends. This is not hypothetical - it
+> silently defeated a patch during testing on 2026-08-02, and the only symptom
+> was the game running at its normal frame rate.
+>
+> **How to find the real path without guessing:** the core creates a `cache`
+> folder inside its storage root on every run. Wherever `cache/` appears,
+> `patches/` belongs beside it.
 
 A patch file looks like this:
 
