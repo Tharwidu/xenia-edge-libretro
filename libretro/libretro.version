@@ -1,0 +1,34 @@
+/* Linker version script: export the libretro API and nothing else.
+ *
+ * WHY THIS EXISTS
+ * The core statically links ffmpeg, and without this it exported ~14,900
+ * dynamic symbols, 609 of them ffmpeg's (avcodec_ and av_ prefixes). Note the
+ * prefixes are written without a trailing wildcard on purpose: a "star slash"
+ * inside this comment would close it early and corrupt the script, which is
+ * exactly what happened on the first attempt. A libretro core is dlopen'd
+ * into a frontend that often has its own ffmpeg (RetroArch does). When two
+ * definitions of avcodec_alloc_context3 are in the global scope, the dynamic
+ * linker binds our *calls* to the host's *implementation* - different version,
+ * different struct layouts - and the first real decode walks off into memory
+ * that is not what it thinks it is.
+ *
+ * That is not theoretical. It segfaulted on 2026-08-02, the first time the
+ * Linux core was ever loaded into a frontend:
+ *
+ *   #0  libavcodec.so.61.19.101              <- the frontend's ffmpeg
+ *   #2  xe::apu::XmaContextOld::PrepareDecoder   <- our call
+ *   #5  xe::apu::XmaDecoder::WorkerThreadMain
+ *
+ * Making those symbols local means our calls can no longer be preempted, so
+ * they bind to our own implementations. It also stops the core from polluting
+ * the frontend's symbol namespace, which is good manners regardless.
+ *
+ * ELF only. Windows DLLs bind imports at link time and were never affected -
+ * which is why months of Windows testing never saw this.
+ */
+{
+  global:
+    retro_*;
+  local:
+    *;
+};

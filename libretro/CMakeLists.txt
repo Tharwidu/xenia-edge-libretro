@@ -79,6 +79,15 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # executable flags set in the top-level CMakeLists. --no-undefined makes
   # missing symbols fail the link instead of surfacing at dlopen time.
   target_link_options(xenia-libretro PRIVATE -Wl,--start-group -Wl,--no-undefined)
+  # Export only retro_*. Without this the core exported ~14,900 symbols,
+  # including a whole statically-linked ffmpeg, and the frontend's own
+  # libavcodec preempted our calls - which segfaulted the XMA decoder the first
+  # time this core was ever loaded into RetroArch. See libretro/libretro.version.
+  target_link_options(xenia-libretro PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libretro.version")
+  # Relink whenever the script changes; CMake does not track it as a source.
+  set_property(TARGET xenia-libretro APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libretro.version")
 endif()
 
 xe_target_defaults(xenia-libretro)
