@@ -94,10 +94,18 @@ Loading order is: **xenia config → per-title config → core options**. Core
 options are applied last and overwrite, so for the ~38 settings they expose,
 **core options win.**
 
-That would make the config file useless for those 38 — so options that can defer
-have an **`auto`** value, and `auto` means "leave whatever the config set". If
-you want to control an exposed setting from the config file, set the
-corresponding core option to `auto`.
+That would make the config file useless for every setting a core option covers —
+so an option that can defer offers **`auto`**, meaning "leave whatever the config
+set". **To control an exposed setting from a config file, set the corresponding
+core option to `auto`.** It is the default for every option that has it, so this
+works out of the box.
+
+> **Not every option has `auto` yet.** All the Graphics and Video ones do, plus
+> the GPU backend, render target path and readback resolve. The audio, input and
+> system options do not: they write their cvar on every launch, so a config file
+> cannot override them and a per-title setting for one of those will silently do
+> nothing. If a config line appears to be ignored, check whether that option
+> offers `auto` — that is the difference.
 
 ---
 

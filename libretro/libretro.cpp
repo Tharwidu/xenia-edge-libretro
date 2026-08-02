@@ -773,7 +773,7 @@ static void apply_core_options(void) {
     }
 
     // Draw resolution scale (uniform X+Y, restart required)
-    if ((v = opt_get(XENIA_OPT_DRAW_RESOLUTION_SCALE))) {
+    if ((v = opt_get(XENIA_OPT_DRAW_RESOLUTION_SCALE)) && !opt_is_auto(v)) {
         int scale = atoi(v);
         if (scale >= 1 && scale <= 8) {
             cvars::draw_resolution_scale_x = scale;
@@ -782,12 +782,12 @@ static void apply_core_options(void) {
     }
 
     // Anisotropic filtering override
-    if ((v = opt_get(XENIA_OPT_ANISOTROPIC_FILTERING))) {
+    if ((v = opt_get(XENIA_OPT_ANISOTROPIC_FILTERING)) && !opt_is_auto(v)) {
         cvars::anisotropic_override = atoi(v);
     }
 
     // Async shader compilation
-    if ((v = opt_get(XENIA_OPT_ASYNC_SHADERS))) {
+    if ((v = opt_get(XENIA_OPT_ASYNC_SHADERS)) && !opt_is_auto(v)) {
         cvars::async_shader_compilation = (strcmp(v, "enabled") == 0);
     }
 
@@ -799,22 +799,22 @@ static void apply_core_options(void) {
     }
 
     // Store shaders
-    if ((v = opt_get(XENIA_OPT_STORE_SHADERS))) {
+    if ((v = opt_get(XENIA_OPT_STORE_SHADERS)) && !opt_is_auto(v)) {
         cvars::store_shaders = (strcmp(v, "enabled") == 0);
     }
 
     // Half-pixel offset
-    if ((v = opt_get(XENIA_OPT_HALF_PIXEL_OFFSET))) {
+    if ((v = opt_get(XENIA_OPT_HALF_PIXEL_OFFSET)) && !opt_is_auto(v)) {
         cvars::half_pixel_offset = (strcmp(v, "enabled") == 0);
     }
 
     // GPU allow invalid fetch constants
-    if ((v = opt_get(XENIA_OPT_GPU_INVALID_FETCH))) {
+    if ((v = opt_get(XENIA_OPT_GPU_INVALID_FETCH)) && !opt_is_auto(v)) {
         cvars::gpu_allow_invalid_fetch_constants = (strcmp(v, "enabled") == 0);
     }
 
     // Fuzzy alpha epsilon (NVIDIA fix)
-    if ((v = opt_get(XENIA_OPT_FUZZY_ALPHA_EPSILON))) {
+    if ((v = opt_get(XENIA_OPT_FUZZY_ALPHA_EPSILON)) && !opt_is_auto(v)) {
         cvars::use_fuzzy_alpha_epsilon = (strcmp(v, "enabled") == 0);
     }
 
@@ -825,15 +825,23 @@ static void apply_core_options(void) {
     }
 
     // Host framerate limit
-    if ((v = opt_get(XENIA_OPT_FRAMERATE_LIMIT))) {
+    if ((v = opt_get(XENIA_OPT_FRAMERATE_LIMIT)) && !opt_is_auto(v)) {
         uint64_t limit = (uint64_t)atoi(v);
         cvars::framerate_limit = limit;
     }
 
-    // PAL 50Hz mode
+    // PAL 50Hz mode. Unlike the other deferring options this one is mirrored
+    // into core state, because pal_mode picks the rate declared in av_info and
+    // the rate the software pacer targets. On "auto" the cvar is left for the
+    // config to decide - but pal_mode still has to follow it, or the config
+    // could select 50Hz while the frontend was told 60 and the pacer and the
+    // guest would disagree for the whole session. So read it back rather than
+    // skipping the mirror.
     if ((v = opt_get(XENIA_OPT_50HZ_MODE))) {
-        core_state.pal_mode = (strcmp(v, "enabled") == 0);
-        cvars::use_50Hz_mode = core_state.pal_mode;
+        if (!opt_is_auto(v)) {
+            cvars::use_50Hz_mode = (strcmp(v, "enabled") == 0);
+        }
+        core_state.pal_mode = cvars::use_50Hz_mode;
     }
 
     // =================================================================
@@ -841,22 +849,22 @@ static void apply_core_options(void) {
     // =================================================================
 
     // Internal display resolution (restart required)
-    if ((v = opt_get(XENIA_OPT_INTERNAL_DISPLAY_RES))) {
+    if ((v = opt_get(XENIA_OPT_INTERNAL_DISPLAY_RES)) && !opt_is_auto(v)) {
         cvars::internal_display_resolution = (uint32_t)atoi(v);
     }
 
     // Widescreen
-    if ((v = opt_get(XENIA_OPT_WIDESCREEN))) {
+    if ((v = opt_get(XENIA_OPT_WIDESCREEN)) && !opt_is_auto(v)) {
         cvars::widescreen = (strcmp(v, "enabled") == 0);
     }
 
     // Video standard (1=NTSC, 2=NTSC-J, 3=PAL)
-    if ((v = opt_get(XENIA_OPT_VIDEO_STANDARD))) {
+    if ((v = opt_get(XENIA_OPT_VIDEO_STANDARD)) && !opt_is_auto(v)) {
         cvars::video_standard = atoi(v);
     }
 
     // Display gamma type (0=linear, 1=sRGB, 2=BT.709)
-    if ((v = opt_get(XENIA_OPT_DISPLAY_GAMMA))) {
+    if ((v = opt_get(XENIA_OPT_DISPLAY_GAMMA)) && !opt_is_auto(v)) {
         cvars::kernel_display_gamma_type = (uint32_t)atoi(v);
     }
 

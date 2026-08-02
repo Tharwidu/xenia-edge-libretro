@@ -112,6 +112,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "1", "1x (Native 720p)" },
             { "2", "2x (1440p)" },
             { "3", "3x (2160p/4K)" },
@@ -122,7 +123,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "8", "8x" },
             { NULL, NULL }
         },
-        "1"
+        "auto"
     },
     {
         XENIA_OPT_ANISOTROPIC_FILTERING,
@@ -133,6 +134,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "-1", "Default (Game)" },
             { "0",  "Off" },
             { "1",  "2x" },
@@ -141,7 +143,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "4",  "16x" },
             { NULL, NULL }
         },
-        "-1"
+        "auto"
     },
     {
         XENIA_OPT_ASYNC_SHADERS,
@@ -152,11 +154,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_GPU_BACKEND,
@@ -210,11 +213,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_HALF_PIXEL_OFFSET,
@@ -225,11 +229,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_GPU_INVALID_FETCH,
@@ -240,11 +245,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_FUZZY_ALPHA_EPSILON,
@@ -255,11 +261,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "disabled", "Disabled" },
             { "enabled",  "Enabled" },
             { NULL, NULL }
         },
-        "disabled"
+        "auto"
     },
     {
         XENIA_OPT_VSYNC,
@@ -284,6 +291,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "0",   "Unlimited" },
             { "30",  "30 FPS" },
             { "60",  "60 FPS" },
@@ -291,7 +299,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "144", "144 FPS" },
             { NULL, NULL }
         },
-        "0"
+        "auto"
     },
     {
         XENIA_OPT_50HZ_MODE,
@@ -301,11 +309,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Graphics",
         {
+            { "auto",     "Auto (from config)" },
             { "disabled", "Disabled (60Hz NTSC)" },
             { "enabled",  "Enabled (50Hz PAL)" },
             { NULL, NULL }
         },
-        "disabled"
+        "auto"
     },
     /* ================================================================ */
     /* --- Video ---                                                     */
@@ -319,6 +328,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Video",
         {
+            { "auto",     "Auto (from config)" },
             { "0",  "640x480" },
             { "1",  "640x576" },
             { "2",  "720x480" },
@@ -337,7 +347,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "15", "1920x1080" },
             { NULL, NULL }
         },
-        "8"
+        "auto"
     },
     {
         XENIA_OPT_WIDESCREEN,
@@ -347,11 +357,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Video",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "16:9 Widescreen" },
             { "disabled", "4:3 Standard" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_VIDEO_STANDARD,
@@ -361,12 +372,13 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Video",
         {
+            { "auto",     "Auto (from config)" },
             { "1", "NTSC" },
             { "2", "NTSC-J (Japan)" },
             { "3", "PAL" },
             { NULL, NULL }
         },
-        "1"
+        "auto"
     },
     {
         XENIA_OPT_DISPLAY_GAMMA,
@@ -377,12 +389,13 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Video",
         {
+            { "auto",     "Auto (from config)" },
             { "0", "Linear" },
             { "1", "sRGB (CRT)" },
             { "2", "BT.709 (HDTV)" },
             { NULL, NULL }
         },
-        "2"
+        "auto"
     },
     /* ================================================================ */
     /* --- Audio ---                                                     */
