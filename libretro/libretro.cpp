@@ -2100,12 +2100,20 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
 
     // Frontend capability probes. All three degrade silently: the fallback is
     // exactly what the core did before, so RetroArch 1.7.5 is unaffected.
+    //
+    // These two adjacent calls have OPPOSITE contracts, and treating them the
+    // same way silently disabled bitmasks on every frontend:
+    //
+    //   GET_INPUT_BITMASKS - "@param data Ignored." The RETURN VALUE is the
+    //       answer. Testing a bool the frontend never writes leaves it false
+    //       forever, so the bitmask path had never once run anywhere.
+    //   GET_CAN_DUPE       - "@param[out] data bool*." The return value only
+    //       says the call exists; the answer is written into data. So this one
+    //       genuinely does need both.
     {
-        bool flag = false;
-        g_input_bitmasks =
-            cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, &flag) && flag;
+        g_input_bitmasks = cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
 
-        flag = false;
+        bool flag = false;
         g_can_dupe = cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &flag) && flag;
 
         xenia_log(RETRO_LOG_INFO,
