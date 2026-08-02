@@ -182,6 +182,12 @@ jobs:
           Copy-Item build-ci/bin/Windows/xenia_edge_libretro.dll dist/
           Copy-Item libretro/xenia_edge_libretro.info dist/
           Copy-Item LICENSE dist/
+          # Per-core RetroArch override that pins analog_dpad_mode off, so the
+          # left stick does not double as the d-pad. A core cannot set this -
+          # there is no libretro call for it - so it has to ship as a file.
+          # The .info notes told users this was bundled; until now it was not.
+          New-Item -ItemType Directory dist/config | Out-Null
+          Copy-Item -Recurse "libretro/retroarch-config/*" dist/config/ -Force
           # Bundle the DirectX 12 runtime so the (faster) D3D12 backend works
           # out of the box. Pinned versions must match the D3D12SDKVersion (619)
           # the code expects; the core auto-falls back to Vulkan if absent.
@@ -196,7 +202,14 @@ jobs:
           @'
           xenia_edge_libretro.dll  -> RetroArch\cores\
           xenia_edge_libretro.info -> RetroArch\info\
+          config\ (folder)         -> merge into RetroArch\config\
           D3D12\ (folder)          -> next to retroarch.exe (RetroArch root)
+
+          The config folder holds a per-core override that stops the left stick
+          from doubling as the d-pad (which otherwise scrolls menus while you
+          walk). A core cannot set that itself - there is no libretro call for
+          it - so it ships as a file. Merge it in; do not replace your existing
+          config folder.
 
           The D3D12 folder enables the faster Direct3D 12 backend and is used
           automatically when present. Without it, the core falls back to the
