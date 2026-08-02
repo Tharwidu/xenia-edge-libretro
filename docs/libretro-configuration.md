@@ -190,6 +190,15 @@ The **Apply Game Patches** option (`xenia_apply_patches`) has three states:
   it; deleting the file disables it. No editing.
 - **`disabled`** — ignore all patch files without deleting anything.
 
+> **A "60 FPS" patch can make the game run at double speed.** Many 360 titles
+> advance their simulation once per rendered frame, so lifting a 30 fps cap
+> lifts the game clock with it - everything moves twice as fast. Confirmed on
+> Viva Piñata (2026-08-02): the patch is a single byte that changes the present
+> interval, guest frame rate went 30 to 60 exactly, and the game visibly sped
+> up. The patch is working as designed; the side effect is inherent to the
+> title. If a patched game feels wrong rather than smooth, this is why - delete
+> the file or set Apply Game Patches to `disabled` to undo it.
+
 `whole_file` is the convenient one, but it is opt-in for a reason: **a patch
 file is not necessarily one patch.** Viva Piñata and Skate 3 ship one each, but
 Fable II ships three and Sonic Unleashed ships seven in a single file — among
