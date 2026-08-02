@@ -1,5 +1,5 @@
 display_name = "Microsoft - Xbox 360 (Xenia Edge)"
-authors = "Xenia Team|danprice142"
+authors = "Xenia Team|danprice142|Tharwidu"
 supported_extensions = "iso|xex|zar|xcp|x360"
 corename = "Xenia Edge"
 manufacturer = "Microsoft"
@@ -8,7 +8,7 @@ systemname = "Microsoft Xbox 360"
 systemid = "xbox360"
 license = "BSD-3-Clause"
 permissions = ""
-display_version = "0.1.0"
+display_version = "0.2.0"
 supports_no_game = "false"
 
 # Libretro Features

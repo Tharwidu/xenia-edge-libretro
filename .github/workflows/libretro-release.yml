@@ -72,8 +72,18 @@ jobs:
           cp -L build-ci/bin/Linux/libSDL3.so.0 dist/
           cp libretro/xenia_edge_libretro.info dist/
           cp LICENSE dist/
+          # Same per-core override the Windows zip carries. Without it the
+          # .info promises a bundled config that is not in the archive, which
+          # is exactly the gap this file was added to close - it has to be in
+          # BOTH archives or it is only half fixed.
+          mkdir -p dist/config
+          cp -r libretro/retroarch-config/* dist/config/
+          # The .info description points users at this file, so ship it rather
+          # than referring them to a repository they may never visit.
+          mkdir -p dist/docs
+          cp docs/libretro-configuration.md dist/docs/
           cd dist
-          zip ../xenia_edge_libretro-linux-x64.zip *
+          zip -r ../xenia_edge_libretro-linux-x64.zip *
 
       - uses: actions/upload-artifact@v4
         with:
@@ -188,6 +198,9 @@ jobs:
           # The .info notes told users this was bundled; until now it was not.
           New-Item -ItemType Directory dist/config | Out-Null
           Copy-Item -Recurse "libretro/retroarch-config/*" dist/config/ -Force
+          # The .info description points users at this document.
+          New-Item -ItemType Directory dist/docs | Out-Null
+          Copy-Item docs/libretro-configuration.md dist/docs/
           # Bundle the DirectX 12 runtime so the (faster) D3D12 backend works
           # out of the box. Pinned versions must match the D3D12SDKVersion (619)
           # the code expects; the core auto-falls back to Vulkan if absent.
