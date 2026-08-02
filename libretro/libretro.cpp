@@ -882,22 +882,22 @@ static void apply_core_options(void) {
     }
 
     // XMA decoder (restart required)
-    if ((v = opt_get(XENIA_OPT_XMA_DECODER))) {
+    if ((v = opt_get(XENIA_OPT_XMA_DECODER)) && !opt_is_auto(v)) {
         cvars::xma_decoder = v;
     }
 
     // Dedicated XMA thread
-    if ((v = opt_get(XENIA_OPT_DEDICATED_XMA_THREAD))) {
+    if ((v = opt_get(XENIA_OPT_DEDICATED_XMA_THREAD)) && !opt_is_auto(v)) {
         cvars::use_dedicated_xma_thread = (strcmp(v, "enabled") == 0);
     }
 
     // Enable XMP (music player)
-    if ((v = opt_get(XENIA_OPT_ENABLE_XMP))) {
+    if ((v = opt_get(XENIA_OPT_ENABLE_XMP)) && !opt_is_auto(v)) {
         cvars::enable_xmp = (strcmp(v, "enabled") == 0);
     }
 
     // XMP default volume
-    if ((v = opt_get(XENIA_OPT_XMP_DEFAULT_VOLUME))) {
+    if ((v = opt_get(XENIA_OPT_XMP_DEFAULT_VOLUME)) && !opt_is_auto(v)) {
         cvars::xmp_default_volume = atoi(v);
     }
 
@@ -906,7 +906,7 @@ static void apply_core_options(void) {
     // =================================================================
 
     // Time scalar
-    if ((v = opt_get(XENIA_OPT_TIME_SCALAR))) {
+    if ((v = opt_get(XENIA_OPT_TIME_SCALAR)) && !opt_is_auto(v)) {
         double scalar = atof(v);
         if (scalar > 0.0) {
             xe::Clock::set_guest_time_scalar(scalar);
@@ -914,17 +914,17 @@ static void apply_core_options(void) {
     }
 
     // Title updates
-    if ((v = opt_get(XENIA_OPT_TITLE_UPDATES))) {
+    if ((v = opt_get(XENIA_OPT_TITLE_UPDATES)) && !opt_is_auto(v)) {
         cvars::apply_title_update = (strcmp(v, "enabled") == 0);
     }
 
     // Stick deadzones. Xenia stores these as a 0..1 fraction and only applies
     // them when strictly between 0 and 1, so 0 means "no deadzone" - which is
     // the default and the right answer for a pad that is not worn.
-    if ((v = opt_get(XENIA_OPT_LSTICK_DEADZONE))) {
+    if ((v = opt_get(XENIA_OPT_LSTICK_DEADZONE)) && !opt_is_auto(v)) {
         xe::hid::cvars::left_stick_deadzone_percentage = atoi(v) / 100.0;
     }
-    if ((v = opt_get(XENIA_OPT_RSTICK_DEADZONE))) {
+    if ((v = opt_get(XENIA_OPT_RSTICK_DEADZONE)) && !opt_is_auto(v)) {
         xe::hid::cvars::right_stick_deadzone_percentage = atoi(v) / 100.0;
     }
 
@@ -934,24 +934,24 @@ static void apply_core_options(void) {
     // while the other two differ only in what switches on the individual
     // patches inside a file. Kept on the original option key so existing
     // configs saying "enabled" or "disabled" keep working unchanged.
-    if ((v = opt_get(XENIA_OPT_APPLY_PATCHES))) {
+    if ((v = opt_get(XENIA_OPT_APPLY_PATCHES)) && !opt_is_auto(v)) {
         const bool whole_file = (strcmp(v, "whole_file") == 0);
         cvars::apply_patches = whole_file || (strcmp(v, "enabled") == 0);
         cvars::patch_all_in_file = whole_file;
     }
 
     // License mask (0=None, 1=Full, -1=All)
-    if ((v = opt_get(XENIA_OPT_LICENSE_MASK))) {
+    if ((v = opt_get(XENIA_OPT_LICENSE_MASK)) && !opt_is_auto(v)) {
         cvars::license_mask = atoi(v);
     }
 
     // Headless message-box response (which button to auto-pick; -1 = default)
-    if ((v = opt_get(XENIA_OPT_MSGBOX_BUTTON))) {
+    if ((v = opt_get(XENIA_OPT_MSGBOX_BUTTON)) && !opt_is_auto(v)) {
         cvars::headless_messagebox_button = atoi(v);
     }
 
     // User language (upstream now uses numeric XConfig language IDs)
-    if ((v = opt_get(XENIA_OPT_USER_LANGUAGE))) {
+    if ((v = opt_get(XENIA_OPT_USER_LANGUAGE)) && !opt_is_auto(v)) {
         struct { const char* name; int id; } langs[] = {
             {"English", 1},  {"Japanese", 2},   {"German", 3},
             {"French", 4},   {"Spanish", 5},    {"Italian", 6},
@@ -964,7 +964,7 @@ static void apply_core_options(void) {
     }
 
     // User country (upstream now uses numeric XConfig country IDs)
-    if ((v = opt_get(XENIA_OPT_USER_COUNTRY))) {
+    if ((v = opt_get(XENIA_OPT_USER_COUNTRY)) && !opt_is_auto(v)) {
         struct { const char* name; int id; } countries[] = {
             {"United States", 103}, {"Great Britain", 35}, {"Japan", 53},
             {"Germany", 24},        {"France", 34},        {"Spain", 31},
@@ -980,27 +980,27 @@ static void apply_core_options(void) {
     // =================================================================
 
     // Protect zero page
-    if ((v = opt_get(XENIA_OPT_PROTECT_ZERO))) {
+    if ((v = opt_get(XENIA_OPT_PROTECT_ZERO)) && !opt_is_auto(v)) {
         cvars::protect_zero = (strcmp(v, "enabled") == 0);
     }
 
     // Clear GPU memory page state
-    if ((v = opt_get(XENIA_OPT_CLEAR_MEMORY_PAGE))) {
+    if ((v = opt_get(XENIA_OPT_CLEAR_MEMORY_PAGE)) && !opt_is_auto(v)) {
         cvars::clear_memory_page_state = (strcmp(v, "enabled") == 0);
     }
 
     // Disable context promotion
-    if ((v = opt_get(XENIA_OPT_DISABLE_CTX_PROMOTION))) {
+    if ((v = opt_get(XENIA_OPT_DISABLE_CTX_PROMOTION)) && !opt_is_auto(v)) {
         cvars::disable_context_promotion = (strcmp(v, "enabled") == 0);
     }
 
     // Mount cache partition
-    if ((v = opt_get(XENIA_OPT_MOUNT_CACHE))) {
+    if ((v = opt_get(XENIA_OPT_MOUNT_CACHE)) && !opt_is_auto(v)) {
         cvars::mount_cache = (strcmp(v, "enabled") == 0);
     }
 
     // Mount scratch partition
-    if ((v = opt_get(XENIA_OPT_MOUNT_SCRATCH))) {
+    if ((v = opt_get(XENIA_OPT_MOUNT_SCRATCH)) && !opt_is_auto(v)) {
         cvars::mount_scratch = (strcmp(v, "enabled") == 0);
     }
 
@@ -1009,7 +1009,7 @@ static void apply_core_options(void) {
     // =================================================================
 
     // Log level (0=error, 1=warning, 2=info, 3=debug)
-    if ((v = opt_get(XENIA_OPT_LOG_LEVEL))) {
+    if ((v = opt_get(XENIA_OPT_LOG_LEVEL)) && !opt_is_auto(v)) {
         int level = 2;
         if (strcmp(v, "error") == 0) level = 0;
         else if (strcmp(v, "warn") == 0) level = 1;

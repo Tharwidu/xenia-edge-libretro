@@ -437,6 +437,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Audio",
         {
+            { "auto",     "Auto (from config)" },
             { "old",    "Old (Default)" },
             { "new",    "New" },
             { "master", "Master" },
@@ -454,11 +455,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Audio",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_ENABLE_XMP,
@@ -468,11 +470,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Audio",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_XMP_DEFAULT_VOLUME,
@@ -482,6 +485,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Audio",
         {
+            { "auto",     "Auto (from config)" },
             { "0",   "0%" },
             { "10",  "10%" },
             { "20",  "20%" },
@@ -495,7 +499,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "100", "100%" },
             { NULL, NULL }
         },
-        "70"
+        "auto"
     },
     /* ================================================================ */
     /* --- Emulation ---                                                 */
@@ -508,6 +512,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "0.25", "0.25x" },
             { "0.5",  "0.5x" },
             { "1.0",  "1.0x (Normal)" },
@@ -515,7 +520,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "4.0",  "4.0x" },
             { NULL, NULL }
         },
-        "1.0"
+        "auto"
     },
     {
         XENIA_OPT_TITLE_UPDATES,
@@ -525,11 +530,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_LSTICK_DEADZONE,
@@ -542,6 +548,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Input",
         {
+            { "auto",     "Auto (from config)" },
             { "0", "0%%" },
             { "5", "5%%" },
             { "10", "10%%" },
@@ -555,7 +562,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "50", "50%%" },
             { NULL, NULL }
         },
-        "0"
+        "auto"
     },
     {
         XENIA_OPT_RSTICK_DEADZONE,
@@ -568,6 +575,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Input",
         {
+            { "auto",     "Auto (from config)" },
             { "0", "0%%" },
             { "5", "5%%" },
             { "10", "10%%" },
@@ -581,7 +589,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "50", "50%%" },
             { NULL, NULL }
         },
-        "0"
+        "auto"
     },
     {
         XENIA_OPT_APPLY_PATCHES,
@@ -600,12 +608,13 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",    "Enabled (honour is_enabled)" },
             { "whole_file", "Whole file (drop in to enable)" },
             { "disabled",   "Disabled (ignore all patch files)" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_LICENSE_MASK,
@@ -616,6 +625,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "1",  "Full" },
             { "0",  "None" },
             { "-1", "All" },
@@ -683,6 +693,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "-1", "Auto (recommended)" },
             { "0",  "Button 0" },
             { "1",  "Button 1" },
@@ -690,7 +701,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "3",  "Button 3" },
             { NULL, NULL }
         },
-        "-1"
+        "auto"
     },
     {
         XENIA_OPT_USER_LANGUAGE,
@@ -700,6 +711,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "English",    "English" },
             { "Japanese",   "Japanese" },
             { "German",     "German" },
@@ -714,7 +726,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "Russian",    "Russian" },
             { NULL, NULL }
         },
-        "English"
+        "auto"
     },
     {
         XENIA_OPT_USER_COUNTRY,
@@ -724,6 +736,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Emulation",
         {
+            { "auto",     "Auto (from config)" },
             { "United States", "United States" },
             { "Great Britain", "Great Britain" },
             { "Japan",         "Japan" },
@@ -746,7 +759,7 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "Hong Kong",     "Hong Kong" },
             { NULL, NULL }
         },
-        "United States"
+        "auto"
     },
     /* ================================================================ */
     /* --- Compatibility ---                                             */
@@ -760,11 +773,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Compatibility",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_CLEAR_MEMORY_PAGE,
@@ -775,11 +789,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Compatibility",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_DISABLE_CTX_PROMOTION,
@@ -790,11 +805,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Compatibility",
         {
+            { "auto",     "Auto (from config)" },
             { "disabled", "Disabled (Normal)" },
             { "enabled",  "Enabled (Sports Fix)" },
             { NULL, NULL }
         },
-        "disabled"
+        "auto"
     },
     {
         XENIA_OPT_MOUNT_CACHE,
@@ -804,11 +820,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Compatibility",
         {
+            { "auto",     "Auto (from config)" },
             { "enabled",  "Enabled" },
             { "disabled", "Disabled" },
             { NULL, NULL }
         },
-        "enabled"
+        "auto"
     },
     {
         XENIA_OPT_MOUNT_SCRATCH,
@@ -818,11 +835,12 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Compatibility",
         {
+            { "auto",     "Auto (from config)" },
             { "disabled", "Disabled" },
             { "enabled",  "Enabled" },
             { NULL, NULL }
         },
-        "disabled"
+        "auto"
     },
     /* ================================================================ */
     /* --- Debug ---                                                     */
@@ -835,13 +853,14 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         NULL,
         "Debug",
         {
+            { "auto",     "Auto (from config)" },
             { XENIA_LOG_LEVEL_ERROR, "Error Only" },
             { XENIA_LOG_LEVEL_WARN,  "Warning" },
             { XENIA_LOG_LEVEL_INFO,  "Info" },
             { XENIA_LOG_LEVEL_DEBUG, "Debug" },
             { NULL, NULL }
         },
-        XENIA_LOG_LEVEL_INFO
+        "auto"
     },
     /* Terminator */
     { NULL, NULL, NULL, NULL, NULL, NULL, {{0}}, NULL }
