@@ -204,6 +204,36 @@ static constexpr uint32_t kMaxGeometryHeight = 2160;
 // title, and a stale match would make the first frame of the next game skip its
 // report and sit on whatever av_info declared.
 static uint32_t last_geometry_w = 0, last_geometry_h = 0;
+
+// Dimensions of the last SOFTWARE frame actually handed to the frontend.
+//
+// A duped frame (NULL data) must repeat these exactly, because RetroArch keeps
+// the previous pixel buffer but overwrites the size it is read at:
+//
+//     void video_driver_cached_frame_publish(data, width, height, pitch) {
+//        if (data) frame_cache_data = data;   /* pixels: only when non-NULL */
+//        frame_cache_width  = width;          /* but these always change    */
+//        frame_cache_height = height;
+//        frame_cache_pitch  = pitch;
+//     }
+//
+// So passing a hardcoded 1280x720 alongside NULL tells the frontend to read the
+// previous frame's buffer at the wrong size. With dynamic geometry that buffer
+// is often smaller - Halo Reach renders 1152x720 - and 720 rows at a 1280*4
+// pitch reads ~368 KB past a 1152*720*4 allocation.
+//
+// Harmless until 2026-08-03 only because GET_CAN_DUPE was being clobbered, so
+// the fast-forward path never ran. Fixing that probe made this reachable.
+//
+// Seeded to 1280x720 so the very first frame, before anything has been
+// delivered, behaves as it always did.
+static uint32_t last_frame_w = 1280, last_frame_h = 720;
+
+// Repeat the previous frame. Never pass literal dimensions to a NULL frame.
+static inline void emit_dupe_frame(void) {
+    core_state.video_cb(nullptr, last_frame_w, last_frame_h,
+                        static_cast<size_t>(last_frame_w) * 4);
+}
 static uint32_t last_geometry_aspect_x = 0, last_geometry_aspect_y = 0;
 
 // Software frame capture buffer (fallback path)
@@ -1368,6 +1398,8 @@ static bool splash_run_frame(void) {
         }
     }
 
+    last_frame_w = splash_w;
+    last_frame_h = splash_h;
     core_state.video_cb(splash_frame_buf.data(), splash_w, splash_h,
                         splash_w * 4);
     return true;
@@ -1531,14 +1563,14 @@ static void update_video(void) {
         bool ff = false;
         if (core_state.environ_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &ff) &&
             ff) {
-            core_state.video_cb(nullptr, 1280, 720, 1280 * 4);
+            emit_dupe_frame();
             return;
         }
         int av_enable = 0;
         if (core_state.environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE,
                                   &av_enable) &&
             !(av_enable & 1)) {  // bit 0 = video enabled
-            core_state.video_cb(nullptr, 1280, 720, 1280 * 4);
+            emit_dupe_frame();
             return;
         }
     }
@@ -1575,6 +1607,8 @@ static void update_video(void) {
             // 720p, every single frame - that used to sit between the GPU and
             // the frontend for no reason, because the blit was converting
             // formats anyway and could simply convert to the right one.
+            last_frame_w = w;
+            last_frame_h = h;
             core_state.video_cb(blit_data, w, h, w * 4);
             return;
         }
@@ -1589,13 +1623,16 @@ static void update_video(void) {
             dst[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
                      ((v & 0x000000FFu) << 16);
         }
+        last_frame_w = w;
+        last_frame_h = h;
         core_state.video_cb(dst, w, h, w * 4);
         return;
     }
 
-    // Fallback: blank frame to prevent RetroArch hang.
-    uint32_t bw = 1280, bh = 720;
-    core_state.video_cb(nullptr, bw, bh, bw * 4);
+    // Fallback: repeat the previous frame rather than hang the frontend. Same
+    // rule as every other NULL frame - the size must match the buffer the
+    // frontend is still holding, not a literal.
+    emit_dupe_frame();
 }
 
 static void update_video_vulkan(void) {
@@ -2047,6 +2084,10 @@ static void xenia_shutdown(void) {
     game_loaded = false;
     last_geometry_w = last_geometry_h = 0;
     last_geometry_aspect_x = last_geometry_aspect_y = 0;
+    // Back to the seed, so a dupe issued before the next title's first frame
+    // cannot describe the previous title's buffer.
+    last_frame_w = 1280;
+    last_frame_h = 720;
 
     // Clean up Vulkan HW render resources (frontend side)
     if (vk_hw) {
@@ -2906,7 +2947,7 @@ RETRO_API void retro_run(void) {
             }
             if (lr_input_driver && pending_rumble_cb)
                 lr_input_driver->SetRumbleCallback(pending_rumble_cb);
-            core_state.video_cb(NULL, 1280, 720, 1280 * 4);  // dupe frame
+            emit_dupe_frame();
             return;
         }
         update_audio();
