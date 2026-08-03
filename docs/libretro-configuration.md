@@ -32,6 +32,27 @@ xenia_gpu_backend = "vulkan"
 xenia_apply_patches = "whole_file"
 ```
 
+> **The backend choice affects image quality, not speed.** Measured on native
+> Windows (RTX 3060) across Halo Reach, Fable II, Viva Piñata and Zuma: both
+> backends run at each title's native frame rate, and the difference between
+> them is within noise. What differs is what gets drawn — **the Vulkan backend
+> silently drops some geometry and effects that Direct3D 12 renders.** Nothing
+> is logged; the frame rate is unaffected; the picture is just incomplete.
+>
+> The two backends use different render-target emulation paths (Vulkan
+> `fbo`/`fsi`, D3D12 `rtv`/`rov`) and the Vulkan one loses render-to-texture
+> work. This is upstream xenia behaviour — it reproduces in standalone xenia
+> with this core removed entirely.
+>
+> The automatic choice already prefers D3D12 on Windows for exactly this
+> reason. Only set `xenia_gpu_backend` by hand if the automatic one is wrong.
+> On Linux, and under Wine/Proton where D3D12 cannot be used at all, Vulkan is
+> the only option available.
+>
+> An older claim that D3D12 is "~2x Vulkan on demanding titles" appeared in
+> this project's notes and in the core's comments. It was never measured
+> natively and it is **false**; it was corrected on 2026-08-02.
+
 **Many require a restart.** 23 of the options say "Requires restart" in their
 description, and they mean it — the graphics backend, render-target setup, VFS
 mounts, memory and JIT init, audio init, and everything the guest reads once at

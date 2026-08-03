@@ -748,11 +748,33 @@ static bool primary_gpu_is_amd() {
 // cannot be probed at init, and cannot be probed safely at all.
 //
 // This is cheap to get wrong in the Vulkan direction and expensive to get wrong
-// in the D3D12 direction. Measured the same day: native Linux Vulkan runs Viva
-// Pinata at ~29 fps average against the ~30 fps native Windows D3D12 manages on
-// the same machine, so Vulkan is already at full speed and D3D12 has no
-// headroom to recover there. Defaulting case 4 to Vulkan costs approximately
-// nothing; defaulting it to D3D12 hangs the emulator.
+// in the D3D12 direction: defaulting case 4 to D3D12 hangs the emulator, while
+// defaulting it to Vulkan costs image quality but still runs.
+//
+// CORRECTED 2026-08-02, after the first native-Windows measurements this
+// project has ever had. Two earlier claims here were wrong:
+//
+//   "D3D12 is ~2x Vulkan on demanding titles" - FALSE. Measured on Halo Reach,
+//   RTX 3060, native Windows, both backends warm: Vulkan 30.0 fps mean with 0%
+//   of samples dipping, D3D12 29.5 with 4%. Fable II, Viva Pinata and Zuma
+//   agree - every title sits at its own native rate on both backends. There is
+//   no performance argument for D3D12 at all.
+//
+//   "Defaulting case 4 to Vulkan costs approximately nothing" - FALSE, and it
+//   was measured with the wrong instrument. Frame rate was never the axis.
+//   D3D12 renders geometry and effects that Vulkan consistently DROPS, across
+//   every title tested and on upstream standalone xenia with this core removed
+//   entirely. The two backends run different render-target emulation paths
+//   (Vulkan fbo/fsi, D3D12 rtv/rov) and the Vulkan one loses render-to-texture
+//   work. It fails silently: nothing is logged, the frame rate is unaffected,
+//   the picture is just missing pieces.
+//
+// So the preference for D3D12 on Windows stands, but for correctness rather
+// than speed - which is the stronger reason. And case 4 is a real quality
+// penalty for Wine/Proton users, not the free choice this comment used to
+// claim. That does not reopen the D3D12-under-Proton track: the blocker is
+// still downstream in vkd3d-proton and still not ours to fix. It does mean the
+// cost of that closure is higher than recorded, and it belongs in the docs.
 //
 // Not permanent, and not a ban: the bug is upstream in vkd3d-proton and already
 // partly fixed between Proton 10 and 11. xenia_gpu_backend=d3d12 still forces
@@ -2098,27 +2120,65 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     };
     cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)descs);
 
-    // Frontend capability probes. All three degrade silently: the fallback is
+    // Frontend capability probes. Both degrade silently: the fallback is
     // exactly what the core did before, so RetroArch 1.7.5 is unaffected.
     //
-    // These two adjacent calls have OPPOSITE contracts, and treating them the
-    // same way silently disabled bitmasks on every frontend:
+    // A capability, once advertised, LATCHES. retro_set_environment is called
+    // more than once, and not every call carries a callback that answers these
+    // queries. Measured on RetroArch 1.22.2, 2026-08-02: the first call answers
+    // both (the frontend's own trace logs "GET_CAN_DUPE: true" beside it), then
+    // two later calls - after video/audio/display init - answer neither and log
+    // no [Environ] trace at all, because the callback in force there refuses
+    // them. Plain assignment made the last call win, so both flags ended up
+    // false for the entire session.
     //
-    //   GET_INPUT_BITMASKS - "@param data Ignored." The RETURN VALUE is the
-    //       answer. Testing a bool the frontend never writes leaves it false
-    //       forever, so the bitmask path had never once run anywhere.
-    //   GET_CAN_DUPE       - "@param[out] data bool*." The return value only
-    //       says the call exists; the answer is written into data. So this one
-    //       genuinely does need both.
+    // That silently disabled two of the things this core advertises: the
+    // bitmask input path never ran, and update_video's fast-forward/video-off
+    // skip never ran. Both fail closed, so nothing looked broken - the core
+    // just quietly did the slower thing everywhere.
+    //
+    // Latching is the safe direction. A frontend does not revoke these
+    // mid-session, and the fallback for a false negative costs performance
+    // while a false positive would cost correctness - so only ever upgrade.
     {
-        g_input_bitmasks = cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
+        const bool had_bitmasks = g_input_bitmasks;
+        const bool had_dupe     = g_can_dupe;
+
+        // GET_INPUT_BITMASKS and GET_CAN_DUPE have OPPOSITE contracts, and
+        // treating them the same way is what silently disabled bitmasks on
+        // every frontend before c1bdc2093:
+        //
+        //   GET_INPUT_BITMASKS - "@param data Ignored." The RETURN VALUE is
+        //       the answer. Testing a bool the frontend never writes leaves it
+        //       false forever, so the bitmask path had never once run anywhere.
+        //   GET_CAN_DUPE       - "@param[out] data bool*." The return value
+        //       only says the call exists; the answer is written into data.
+        //       So this one genuinely does need both.
+        if (cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL)) {
+            g_input_bitmasks = true;
+        }
 
         bool flag = false;
-        g_can_dupe = cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &flag) && flag;
+        if (cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &flag) && flag) {
+            g_can_dupe = true;
+        }
 
-        xenia_log(RETRO_LOG_INFO,
-                  "Frontend: input bitmasks %s, frame duping %s\n",
-                  g_input_bitmasks ? "yes" : "no", g_can_dupe ? "yes" : "no");
+        // Log the first probe unconditionally, then only on change. Logging
+        // purely on change would go silent on a frontend that supports
+        // neither - RetroArch 1.7.5 answers no to both, nothing ever moves off
+        // the initial false, and we would lose the diagnostic exactly where it
+        // is most worth having. After that, staying quiet stops the repeat
+        // calls emitting contradictory lines; three lines disagreeing is what
+        // made this bug read as noise for a whole session.
+        static bool logged_once = false;
+        if (!logged_once || g_input_bitmasks != had_bitmasks ||
+            g_can_dupe != had_dupe) {
+            logged_once = true;
+            xenia_log(RETRO_LOG_INFO,
+                      "Frontend: input bitmasks %s, frame duping %s\n",
+                      g_input_bitmasks ? "yes" : "no",
+                      g_can_dupe ? "yes" : "no");
+        }
     }
 
     // Tell the frontend this core is demanding, so it can size its own
