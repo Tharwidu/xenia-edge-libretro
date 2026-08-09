@@ -185,7 +185,7 @@ struct xenia_core_state {
 
 static struct xenia_core_state core_state;
 static std::unique_ptr<xe::Emulator> xenia_emulator;
-static xe::apu::libretro::LibretroAudioRingBuffer *audio_ring = nullptr;
+static xe::apu::libretro::LibretroAudioMixer *audio_mixer = nullptr;
 static xe::hid::libretro_hid::LibretroInputDriver *lr_input_driver = nullptr;
 static xe::gpu::GraphicsSystem *lr_graphics = nullptr;
 static bool game_loaded = false;
@@ -1149,8 +1149,14 @@ static void apply_core_options(void) {
 /*  Per-frame helpers                                                  */
 /* ================================================================== */
 static void update_audio(void) {
-    if (!core_state.audio_enabled || !core_state.audio_buffer) return;
-    if (!audio_ring || !core_state.audio_batch_cb) return;
+    if (!audio_mixer || !core_state.audio_buffer) return;
+
+    // Drain even when audio output is disabled, discarding what comes out.
+    // The drain is what credits each client's semaphore, so skipping it
+    // starves the guest's audio worker of slots and it stops calling the
+    // title's audio callback altogether.
+    const bool deliver =
+        core_state.audio_enabled && core_state.audio_batch_cb != nullptr;
 
     // Drain audio, capped at 2?? real-time (3200 samples max for 48kHz@60fps).
     constexpr size_t kChunkSamples = 1600;
@@ -1160,9 +1166,11 @@ static void update_audio(void) {
     while (total < kMaxDrain) {
         size_t want = kMaxDrain - total;
         if (want > kChunkSamples) want = kChunkSamples;
-        size_t got = audio_ring->Pop(core_state.audio_buffer, want);
+        size_t got = audio_mixer->Pop(core_state.audio_buffer, want);
         if (got == 0) break;
-        core_state.audio_batch_cb(core_state.audio_buffer, got / 2);
+        if (deliver) {
+            core_state.audio_batch_cb(core_state.audio_buffer, got / 2);
+        }
         total += got;
     }
 }
@@ -1392,9 +1400,9 @@ static bool splash_run_frame(void) {
     }
 
     // Discard the booting game's audio so it doesn't burst in afterwards.
-    if (audio_ring && core_state.audio_buffer) {
+    if (audio_mixer && core_state.audio_buffer) {
         for (int i = 0; i < 64; i++) {
-            if (!audio_ring->Pop(core_state.audio_buffer, 1600)) break;
+            if (!audio_mixer->Pop(core_state.audio_buffer, 1600)) break;
         }
     }
 
@@ -1974,7 +1982,7 @@ static bool xenia_setup_and_launch(const char *path) {
             [](xe::cpu::Processor *processor)
                 -> std::unique_ptr<xe::apu::AudioSystem> {
                 auto sys = std::make_unique<xe::apu::libretro::LibretroAudioSystem>(processor);
-                audio_ring = sys->ring_buffer();
+                audio_mixer = sys->mixer();
                 return sys;
             },
             /*graphics_system_factory=*/
@@ -2078,7 +2086,7 @@ static void xenia_shutdown(void) {
         xenia_emulator->Shutdown();
         xenia_emulator.reset();
     }
-    audio_ring = nullptr;
+    audio_mixer = nullptr;
     lr_input_driver = nullptr;
     lr_graphics = nullptr;
     game_loaded = false;
