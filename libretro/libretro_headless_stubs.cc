@@ -51,8 +51,5 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
 // achievement_sound_path is now defined by ui/audio_helper.cc, which builds
 // headless since the wx migration; the Qt version tag stub is likewise gone.
 
-// mount_memory_unit is defined in app/xenia_main.cc (excluded here) but
-// referenced from emulator.cc; the other xenia_main cvars libretro needs are
-// already defined in libretro.cpp.
-DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
-            "Storage");
+// mount_memory_unit used to live in app/xenia_main.cc, which this build
+// excludes, so the core defined it here. emulator.cc defines it upstream now.

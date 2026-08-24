@@ -137,8 +137,11 @@ DECLARE_bool(disable_context_promotion);
 #include "libretro_hid.h"
 
 // CVars from xenia_main.cc - libretro core replaces main entry point.
-DEFINE_string(apu, "libretro", "Audio system.", "APU");
-DEFINE_string(gpu, "d3d12", "Graphics system.", "GPU");
+// apu/gpu and the mount switches moved into emulator.cc upstream, so defining
+// them here now collides at link; declare those and keep the ones the app
+// still owns. The core sets apu/gpu itself once it has chosen its backends.
+DECLARE_string(apu);
+DECLARE_string(gpu);
 DEFINE_string(hid, "nop", "Input system.", "HID");
 
 DEFINE_path(storage_root, "", "Root path for persistent internal data storage.",
@@ -147,8 +150,8 @@ DEFINE_path(content_root, "", "Root path for guest content storage.",
             "Storage");
 DEFINE_path(cache_root, "", "Root path for cache files.", "Storage");
 
-DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
-DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
+DECLARE_bool(mount_scratch);
+DECLARE_bool(mount_cache);
 
 // win32_high_resolution_timer / win32_mmcss are now defined upstream in
 // base/main_win.cc, which the libretro build links.
@@ -2713,8 +2716,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         }
     }
 #endif
-    // Also update the gpu cvar so internal Xenia code stays consistent
+    // Also update the gpu cvar so internal Xenia code stays consistent, and
+    // name the audio system we actually install, since the emulator reports
+    // both cvars as the active backends.
     cvars::gpu = core_state.graphics_backend;
+    cvars::apu = "libretro";
     xenia_log(RETRO_LOG_INFO,
               "Frontend preferred HW context: %u -> using %s backend\n",
               preferred_hw, core_state.graphics_backend);
