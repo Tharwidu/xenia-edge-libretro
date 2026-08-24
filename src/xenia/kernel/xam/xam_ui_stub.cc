@@ -22,6 +22,11 @@
 // XN_SYS_UI on/off notification so waiting titles proceed. They intentionally
 // avoid the UI-thread dispatch helpers (xeXamDispatchHeadlessAsync), which need
 // a display window that does not exist here.
+//
+// Where upstream's headless branch answers with nothing at all, this build
+// answers with what the windowed dialog would have been seeded with (the
+// message box's steered button, the keyboard's gamertag), because a title that
+// gets an empty answer tends to ask again forever.
 
 #include <chrono>
 #include <cstring>
@@ -40,6 +45,7 @@
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/memory.h"
@@ -53,6 +59,16 @@ DEFINE_int32(headless_messagebox_button, -1,
              "Which message-box button the headless (libretro) core auto-picks "
              "(-1 = the game's default focused button).",
              "HID");
+
+// Headless: a title that opens the virtual keyboard with an empty box (e.g.
+// Skate 2 asking for a name) is waiting for the player to type. Empty back is
+// not an answer, so the core types the signed-in gamertag; set this to type
+// something else instead, globally or per title.
+DEFINE_string(headless_keyboard_text, "",
+              "Text the headless (libretro) core enters when a title opens the "
+              "virtual keyboard with no default (empty = the signed-in "
+              "profile's gamertag).",
+              "HID");
 
 namespace xe {
 namespace kernel {
@@ -259,6 +275,24 @@ dword_result_t XNotifyQueueUI_entry(dword_t exnq, dword_t dwUserIndex,
 }
 DECLARE_XAM_EXPORT1(XNotifyQueueUI, kUI, kSketchy);
 
+// Gamertag of the profile signed in to `user_index`, falling back to slot 0 -
+// the slot the core auto-signs-in at boot. Empty when there is no profile.
+static std::string SignedInGamertag(uint32_t user_index) {
+  auto* xam = kernel_state() ? kernel_state()->xam_state() : nullptr;
+  auto* profiles = xam ? xam->profile_manager() : nullptr;
+  if (!profiles) {
+    return "";
+  }
+  // GetProfile understands the sentinel indices a title can pass (any, latest,
+  // none) as well as a real slot, and returns null when nobody is signed in
+  // there; slot 0 is the one the core signs in at boot.
+  UserProfile* profile = profiles->GetProfile(static_cast<uint8_t>(user_index));
+  if (!profile) {
+    profile = profiles->GetProfile(static_cast<uint8_t>(0));
+  }
+  return profile ? profile->name() : "";
+}
+
 dword_result_t XamShowKeyboardUI_entry(
     dword_t user_index, dword_t flags, lpu16string_t default_text,
     lpu16string_t title, lpu16string_t description, lpu16string_t buffer,
@@ -267,15 +301,36 @@ dword_result_t XamShowKeyboardUI_entry(
     return X_ERROR_INVALID_PARAMETER;
   }
 
+  // Whatever the title pre-filled the box with is what a player would see and
+  // usually keep, so it wins.
+  std::u16string text = default_text ? default_text.value() : std::u16string();
+  const bool prefilled = !text.empty();
+  if (!prefilled) {
+    // Nothing pre-filled: the title wants the player to type a name (Skate 2's
+    // name prompt is the reported case) and handing back the empty string it
+    // started with just re-opens the keyboard. Type the gamertag, which is
+    // what the windowed build seeds its dialog with.
+    std::string entered = cvars::headless_keyboard_text;
+    if (entered.empty()) {
+      entered = SignedInGamertag(user_index);
+    }
+    text = xe::to_utf16(entered);
+  }
+
+  XELOGI(
+      "Headless keyboard: title='{}' description='{}' flags={:08X} -> entering "
+      "'{}' ({})",
+      title ? xe::to_utf8(title.value()) : "",
+      description ? xe::to_utf8(description.value()) : "", uint32_t(flags),
+      xe::to_utf8(text), prefilled ? "title's own default" : "auto-filled");
+
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
   return DispatchHeadless(
-      [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
-        // Headless: accept the provided default text unchanged.
-        if (!default_text) {
+      [text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+        if (text.empty()) {
           std::memset(buffer, 0, buffer_size);
         } else {
-          string_util::copy_and_swap_truncating(buffer, default_text.value(),
-                                                buffer_length);
+          string_util::copy_and_swap_truncating(buffer, text, buffer_length);
         }
         return X_ERROR_SUCCESS;
       },

@@ -140,6 +140,33 @@ The handful of options with no `auto` — VSync, Audio Enabled, Mute, Boot Splas
 Auto Profile — are core-level behaviour rather than xenia cvars, so there is
 nothing in a config file for them to defer to.
 
+### Cvars that exist only in this core
+
+The core is headless: there is no window, so the dialogs a 360 game opens —
+message boxes, the storage-device picker, the virtual keyboard — cannot be shown
+to you. The core answers them itself, and two cvars steer those answers.
+
+| Cvar | Default | What it does |
+|---|---|---|
+| `headless_messagebox_button` | `-1` | Which button a message box gets. `-1` picks automatically: the game's own focused button, except on save/storage and Xbox LIVE prompts, which are steered to the choice that keeps the game moving. Also exposed as the **Save Prompt Response** core option. |
+| `headless_keyboard_text` | *(empty)* | What gets typed when a game opens the keyboard with an **empty** box. Empty means the signed-in profile's gamertag. |
+
+A game that pre-fills the keyboard (editing an existing name, say) keeps its own
+text; `headless_keyboard_text` only applies when the box comes up blank, which
+is a game asking you to type something new. Answering blank makes those games
+re-open the keyboard indefinitely — Skate 2's name prompt is the case this was
+found on.
+
+There is no core option for the keyboard text because libretro options are
+menus, not text fields, so set it in the config:
+
+```toml
+headless_keyboard_text = "Tharwidu"
+```
+
+Per title, that is `system/xenia/config/<TITLEID>.config.toml` — which is how
+you give one game a different name from your gamertag.
+
 ---
 
 ## 3. Game patches — guest memory, not settings
