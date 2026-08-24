@@ -1,13 +1,13 @@
 <p align="center">
-    <img height="200px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
+    <img height="200px" src="assets/icon/256.png" />
 </p>
 
 <h1 align="center">Xenia Edge — libretro core</h1>
 
-Xbox 360 emulation as a libretro core. This packages
-[has207/xenia-edge](https://github.com/has207/xenia-edge) — an experimental fork
-of [Xenia Canary](https://github.com/xenia-canary/xenia-canary) — as a single
-`xenia_edge_libretro` library that RetroArch loads like any other core.
+This is a libretro core for [Xenia Edge](https://github.com/has207/xenia-edge),
+forked from [DanP142's work](https://github.com/danprice142/xenia-edge-libretro).
+It builds the emulator as a single `xenia_edge_libretro` library that RetroArch
+loads like any other core.
 
 It works across RetroArch versions rather than against one: every frontend
 capability it uses is probed for and has a fallback, so an older build that
@@ -93,9 +93,8 @@ Verified on Windows: Zuma, Viva Piñata, Sonic Unleashed, Halo: Reach, Fable II
 boot to gameplay.
 
 The same set runs on Linux **except Fable II**, which never presents a frame
-there. That failure reproduces on standalone xenia-edge and xenia-canary with
-this core removed entirely, so it is an upstream Linux issue rather than a
-packaging one.
+there. That failure reproduces on the standalone emulator with this core removed
+entirely, so it is an upstream Linux issue rather than a packaging one.
 
 Save states are not supported — xenia has no save-state implementation to expose.
 
@@ -116,18 +115,25 @@ The result is `build/bin/Linux/xenia_edge_libretro.so`. Windows builds go
 through `.github/workflows/libretro-release.yml` (clang-cl, static CRT), which
 also produces the redistributable zips.
 
+## Per-game compatibility
+
+How a given title behaves, and the settings it needs, is a property of the
+emulator rather than this core. The community tracker for that is
+[xenia-canary/game-compatibility](https://github.com/xenia-canary/game-compatibility);
+game patches live in
+[xenia-canary/game-patches](https://github.com/xenia-canary/game-patches) and
+this core can apply them — see the configuration doc above.
+
 ## Credits
 
-Xenia is the work of Ben Vanik and the Xenia contributors; xenia-canary and
-[has207/xenia-edge](https://github.com/has207/xenia-edge) build on it, and this
-core is that fork with a libretro front end attached. This repository is a fork
-of [danprice142/xenia-edge-libretro](https://github.com/danprice142/xenia-edge-libretro),
-which wrote that front end.
+The emulator is [Xenia Edge](https://github.com/has207/xenia-edge), itself built
+on the work of Ben Vanik and the Xenia contributors. The libretro front end is
+[DanP142's](https://github.com/danprice142/xenia-edge-libretro); this repository
+is a fork of it.
 
-Upstream's own FAQ about the desktop emulator — game compatibility, per-title
-config advice, platform differences — is
-[here](https://github.com/has207/xenia-edge#faq) and applies to the emulation
-underneath this core.
+Released under the BSD license; see [LICENSE](LICENSE).
 
-Released under the BSD license; see [LICENSE](LICENSE). Not affiliated with
-Microsoft. Xbox 360 and Xbox LIVE are trademarks of Microsoft Corporation.
+This project is not affiliated with or endorsed by the Xenia project, and not
+affiliated with Microsoft. Xbox 360 and Xbox LIVE are trademarks of Microsoft
+Corporation. Please do not take support requests for this core to Xenia's
+channels — open an issue here instead.
