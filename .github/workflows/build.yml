@@ -119,8 +119,12 @@ jobs:
           # Update submodules
           git submodule update --init --depth=1 -j$(getconf _NPROCESSORS_ONLN) $(grep -oP '(?<=path = )(?!third_party\/DirectXShaderCompiler).+' .gitmodules)
 
-          # Fetch data repos (game-patches)
-          ./xenia-build.py fetchdata
+          # Fetch data repos (game-patches). Not fatal: it also pulls
+          # compatibility_data.json from a xenia-canary release that has been
+          # deleted upstream (the tag remains, the release does not), and that
+          # data is baked into the desktop app, which this fork does not ship.
+          ./xenia-build.py fetchdata \
+            || echo "::warning::fetchdata failed - continuing without baked data" 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       - name: Build
@@ -241,8 +245,12 @@ jobs:
           git submodule update --init --recursive --depth=1 \
             -j$(sysctl -n hw.ncpu) third_party/wxWidgets
 
-          # Fetch data repos (game-patches)
-          ./xenia-build.py fetchdata
+          # Fetch data repos (game-patches). Not fatal: it also pulls
+          # compatibility_data.json from a xenia-canary release that has been
+          # deleted upstream (the tag remains, the release does not), and that
+          # data is baked into the desktop app, which this fork does not ship.
+          ./xenia-build.py fetchdata \
+            || echo "::warning::fetchdata failed - continuing without baked data" 
 
       # The runner's default python3 is Homebrew's and refuses pip installs
       # (PEP 668). mesa imports mako from whichever python3 it finds on PATH.
