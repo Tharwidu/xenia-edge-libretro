@@ -9,10 +9,11 @@ Xbox 360 emulation as a libretro core. This packages
 of [Xenia Canary](https://github.com/xenia-canary/xenia-canary) — as a single
 `xenia_edge_libretro` library that RetroArch loads like any other core.
 
-It exists because [EmuVR](https://www.emuvr.net/) ships RetroArch **1.7.5**, and
-no Xbox 360 core spoke that dialect. The core targets modern RetroArch and 1.7.5
-equally: it probes what the frontend supports and falls back rather than
-assuming.
+It targets current RetroArch and the older **1.7.5** API equally. Frontends of
+that vintage are still in use and lack most of the environment callbacks a
+modern core assumes, so this one probes for each capability and falls back
+instead of requiring it — core options v2 with a v0 fallback, hardware render
+negotiated when offered and a software presentation path when it is not.
 
 [![CI](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml/badge.svg?branch=ra175-compat)](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml)
 
@@ -53,22 +54,6 @@ its self-contained Vulkan backend on its own.
 On Linux, keep `libSDL3.so.0` beside the `.so` — the core resolves it through an
 `$ORIGIN` rpath.
 
-### EmuVR
-
-Put games in `Games\Xbox 360\` with an `emuvr_core.txt` alongside them:
-
-```
-media = "Xbox 360"
-core = "xenia_edge_libretro"
-```
-
-EmuVR's game scanner reads `Game Scanner\custom_media.txt`, which needs a line
-mapping the system to this core:
-
-```
-Xbox 360 = "xenia_edge_libretro|xenia_libretro"
-```
-
 ## Content formats
 
 | Format | How to launch it |
@@ -105,7 +90,7 @@ Two worth knowing before you start:
 
 ## Status
 
-Verified on Windows (RetroArch 1.7.5 under Proton, and 1.22 native): Zuma,
+Verified on Windows (RetroArch 1.7.5 and 1.22): Zuma,
 Viva Piñata, Sonic Unleashed, Halo: Reach, Fable II (including DLC) and Skate 2
 — covering ISO, GOD/SVOD and XBLA/STFS containers, boot to gameplay.
 

@@ -5,8 +5,8 @@ confuse because two of them involve files called "config". This is what each one
 reaches, where it lives, and which wins.
 
 All three are plain text and can be written by hand. None of them requires the
-RetroArch menu — which matters, because in some frontends (EmuVR, for one) the
-menu is not reachable while a game is running.
+RetroArch menu — which matters, because in some frontends the menu is not
+reachable while a game is running.
 
 | | What it reaches | Scope | Where |
 |---|---|---|---|
