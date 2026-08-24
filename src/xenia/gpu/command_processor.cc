@@ -9,7 +9,10 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <fstream>
+
 #include "third_party/fmt/include/fmt/format.h"
+#include "third_party/stb/stb_image_write.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -25,6 +28,7 @@
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/ui/presenter.h"
 
 #if !defined(NDEBUG)
 
@@ -35,24 +39,25 @@ DEFINE_bool(
     "Only does anything in debug builds, if set will log every write to a gpu "
     "register done by a guest. Does not log writes that are done by the CP on "
     "its own, just ones the guest makes or instructs it to make.",
-    "GPU");
+    "Logging");
 
 DEFINE_bool(disassemble_pm4, false,
             "Only does anything in debug builds, if set will disassemble and "
             "log all PM4 packets sent to the CP.",
-            "GPU");
+            "Logging");
 
 DEFINE_bool(
     log_ringbuffer_kickoff_initiator_bts, false,
     "Only does anything in debug builds, if set will log the pseudo-stacktrace "
     "of the guest thread that wrote the new read position.",
-    "GPU");
+    "Logging");
 
-DEFINE_bool(clear_memory_page_state, true,
+DEFINE_bool(clear_memory_page_state, false,
             "Refresh state of memory pages to enable gpu written data. "
             "Uses mostly lock-free double-buffering for minimal overhead. "
-            "(Disable for minor performance boost, but may break rendering)",
+            "(Enable if rendering breaks, at a minor performance cost)",
             "GPU");
+UPDATE_from_bool(clear_memory_page_state, 2026, 8, 1, 12, true);
 
 DEFINE_string(
     occlusion_query, "fast",
@@ -76,7 +81,16 @@ DEFINE_string(
     readback_resolve, "fast",
     "Controls which render-to-texture resolves are copied back into guest "
     "RAM.\n"
-    " fast: Copy only resolves the CPU reads back (default)\n"
+    " fast: Copy only the resolves the guest actually reads back (default).\n"
+    "       A resolve qualifies if the CPU is caught reading its destination, "
+    "if\n"
+    "       the destination cycles a ring of buffers the draw owns exclusively "
+    "(so\n"
+    "       something consumes it a frame or more later), or if the guest asks "
+    "for\n"
+    "       that exact range to be made coherent. Everything else stays in the "
+    "GPU\n"
+    "       buffer, which is where GPU-side consumers read it anyway.\n"
     " all: Copy every resolve\n"
     " none: Disable readback completely (improves performance).\n",
     "GPU");
@@ -368,11 +382,7 @@ void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode) {
   if (title_id != 0) {
     toml::table config_table = config::LoadGameConfig(title_id);
 
-    if (!config_table.contains("GPU")) {
-      config_table.insert("GPU", toml::table{});
-    }
-
-    auto* gpu_table = config_table["GPU"].as_table();
+    auto* gpu_table = config::ResolveSectionTable(config_table, "GPU");
     if (gpu_table) {
       gpu_table->insert_or_assign("readback_resolve", mode_str);
     }
@@ -414,11 +424,7 @@ void CommandProcessor::SetZPDMode(ZPDMode mode) {
   if (title_id != 0) {
     toml::table config_table = config::LoadGameConfig(title_id);
 
-    if (!config_table.contains("GPU")) {
-      config_table.insert("GPU", toml::table{});
-    }
-
-    auto* gpu_table = config_table["GPU"].as_table();
+    auto* gpu_table = config::ResolveSectionTable(config_table, "GPU");
     if (gpu_table) {
       gpu_table->insert_or_assign("occlusion_query", mode_str);
     }
@@ -1041,6 +1047,40 @@ void CommandProcessor::PrepareForWait() {
 
 void CommandProcessor::ReturnFromWait() {}
 
+void CommandProcessor::WriteTraceFrameScreenshot() {
+  if (trace_frame_file_path_.empty()) {
+    return;
+  }
+  std::filesystem::path png_path = trace_frame_file_path_;
+  png_path.replace_extension(".png");
+  trace_frame_file_path_.clear();
+
+  ui::Presenter* presenter =
+      graphics_system_ ? graphics_system_->presenter() : nullptr;
+  ui::RawImage image;
+  if (!presenter || !presenter->CaptureGuestOutput(image)) {
+    XELOGE("Failed to capture the guest output of the traced frame");
+    return;
+  }
+
+  auto file = std::ofstream(png_path, std::ios::binary);
+  if (!file.is_open()) {
+    XELOGE("Failed to open {} for the traced frame screenshot", png_path);
+    return;
+  }
+  if (!stbi_write_png_to_func(
+          [](void* context, void* data, int size) {
+            reinterpret_cast<std::ofstream*>(context)->write(
+                reinterpret_cast<const char*>(data), size);
+          },
+          &file, int(image.width), int(image.height), 4, image.data.data(),
+          int(image.stride))) {
+    XELOGE("Failed to write the traced frame screenshot to {}", png_path);
+    return;
+  }
+  XELOGI("Traced frame screenshot written to {}", png_path);
+}
+
 void CommandProcessor::InitializeTrace() {
   // Write the initial register values, to be loaded directly into the
   // RegisterFile since all registers, including those that may have side
@@ -1318,7 +1358,9 @@ bool CommandProcessor::EndZPDReport(uint32_t report_address,
 
   if (logical.pending_segments == 0) {
     resolved_immediately = true;
-    final_value = NormalizeSampleCount(logical.accumulated_samples);
+    // Segments were already normalized as they resolved.
+    final_value = static_cast<uint32_t>(
+        std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
 
     cached_delta = final_value;
     has_cached_delta = true;
@@ -1454,6 +1496,7 @@ void CommandProcessor::CloseQuerySegment() {
   uint64_t submission = 0;
   if (!CloseZPDQuery(zpd_active_segment_.report_handle, submission)) {
     zpd_active_segment_.segment_active = false;
+    zpd_active_segment_.scale_area = 0;
     zpd_active_segment_.segment_pending_begin =
         zpd_active_segment_.logical_active;
     zpd_stats_.failed++;
@@ -1472,14 +1515,30 @@ void CommandProcessor::CloseQuerySegment() {
   }
 
   zpd_active_segment_.segment_active = false;
+  zpd_active_segment_.scale_area = 0;
 
   zpd_active_segment_.segment_pending_begin =
       zpd_active_segment_.logical_active;
   zpd_stats_.segments_ended++;
 }
 
+void CommandProcessor::UpdateZPDScale(uint32_t scale_area) {
+  if (GetZPDMode() == ZPDMode::kFake || !zpd_active_segment_.logical_active) {
+    return;
+  }
+  if (zpd_active_segment_.segment_active && zpd_active_segment_.scale_area &&
+      zpd_active_segment_.scale_area != scale_area) {
+    // Draw scale changed in the middle of a report, so close the segment so
+    // normalization divides correctly, and start a fresh one for this draw.
+    CloseQuerySegment();
+    OpenQuerySegment(false);
+  }
+  zpd_active_segment_.scale_area = scale_area;
+}
+
 void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,
-                                          uint64_t raw_samples) {
+                                          uint64_t raw_samples,
+                                          uint32_t scale_area) {
   auto it = logical_zpd_reports_.find(report_handle);
   if (it == logical_zpd_reports_.end()) {
     return;
@@ -1491,10 +1550,11 @@ void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,
     logical.pending_segments--;
   }
 
-  logical.accumulated_samples += raw_samples;
+  logical.accumulated_samples += NormalizeSampleCount(raw_samples, scale_area);
 
   if (logical.ended && logical.pending_segments == 0) {
-    uint32_t final_value = NormalizeSampleCount(logical.accumulated_samples);
+    uint32_t final_value = static_cast<uint32_t>(
+        std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
 
     logical.cached_delta = final_value;
     logical.has_cached_delta = true;
@@ -1627,12 +1687,13 @@ bool CommandProcessor::IsZPDReportCurrent(const ZPDReport& report) const {
   return current_seq == report.slot_sequence_id;
 }
 
-uint32_t CommandProcessor::NormalizeSampleCount(uint64_t samples) const {
+uint32_t CommandProcessor::NormalizeSampleCount(uint64_t samples,
+                                                uint32_t scale_area) {
   if (samples == 0) {
     return 0;
   }
 
-  uint64_t scale = zpd_draw_resolution_scale_x_ * zpd_draw_resolution_scale_y_;
+  uint64_t scale = scale_area;
   // Round, don't truncate. 1 guest sample at 2x = 4 host samples, need >= 1.
   uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
 

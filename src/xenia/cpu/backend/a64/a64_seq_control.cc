@@ -160,13 +160,24 @@ struct DEBUG_BREAK : Sequence<DEBUG_BREAK, I<OPCODE_DEBUG_BREAK, VoidOp>> {
 EMITTER_OPCODE_TABLE(OPCODE_DEBUG_BREAK, DEBUG_BREAK);
 
 // ============================================================================
+// OPCODE_CHECK_PREEMPT
+// ============================================================================
+struct CHECK_PREEMPT
+    : Sequence<CHECK_PREEMPT, I<OPCODE_CHECK_PREEMPT, VoidOp>> {
+  static void Emit(A64Emitter& e, const EmitArgType& i) {
+    e.EmitPreemptCheck(uint32_t(i.instr->src1.offset));
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_CHECK_PREEMPT, CHECK_PREEMPT);
+
+// ============================================================================
 // OPCODE_DEBUG_BREAK_TRUE
 // ============================================================================
 struct DEBUG_BREAK_TRUE_I8
     : Sequence<DEBUG_BREAK_TRUE_I8, I<OPCODE_DEBUG_BREAK_TRUE, VoidOp, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -176,7 +187,7 @@ struct DEBUG_BREAK_TRUE_I16
                I<OPCODE_DEBUG_BREAK_TRUE, VoidOp, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -186,7 +197,7 @@ struct DEBUG_BREAK_TRUE_I32
                I<OPCODE_DEBUG_BREAK_TRUE, VoidOp, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -196,7 +207,7 @@ struct DEBUG_BREAK_TRUE_I64
                I<OPCODE_DEBUG_BREAK_TRUE, VoidOp, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -207,7 +218,7 @@ struct DEBUG_BREAK_TRUE_F32
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     e.fmov(e.w0, i.src1);
     auto& skip = e.NewCachedLabel();
-    e.cbz(e.w0, skip);
+    e.cbz_near(e.w0, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -218,7 +229,7 @@ struct DEBUG_BREAK_TRUE_F64
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     e.fmov(e.x0, i.src1);
     auto& skip = e.NewCachedLabel();
-    e.cbz(e.x0, skip);
+    e.cbz_near(e.x0, skip);
     e.DebugBreak();
     e.L(skip);
   }
@@ -245,7 +256,7 @@ struct TRAP_TRUE_I8
     : Sequence<TRAP_TRUE_I8, I<OPCODE_TRAP_TRUE, VoidOp, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Trap(i.instr->flags);
     e.L(skip);
   }
@@ -254,7 +265,7 @@ struct TRAP_TRUE_I16
     : Sequence<TRAP_TRUE_I16, I<OPCODE_TRAP_TRUE, VoidOp, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Trap(i.instr->flags);
     e.L(skip);
   }
@@ -263,7 +274,7 @@ struct TRAP_TRUE_I32
     : Sequence<TRAP_TRUE_I32, I<OPCODE_TRAP_TRUE, VoidOp, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Trap(i.instr->flags);
     e.L(skip);
   }
@@ -272,7 +283,7 @@ struct TRAP_TRUE_I64
     : Sequence<TRAP_TRUE_I64, I<OPCODE_TRAP_TRUE, VoidOp, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Trap(i.instr->flags);
     e.L(skip);
   }
@@ -329,7 +340,7 @@ struct CALL_TRUE_I8
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     assert_true(i.src2.value->is_guest());
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetFpcrMode();
@@ -340,7 +351,7 @@ struct CALL_TRUE_I16
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     assert_true(i.src2.value->is_guest());
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetFpcrMode();
@@ -351,7 +362,7 @@ struct CALL_TRUE_I32
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     assert_true(i.src2.value->is_guest());
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetFpcrMode();
@@ -362,7 +373,7 @@ struct CALL_TRUE_I64
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     assert_true(i.src2.value->is_guest());
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     e.Call(i.instr, static_cast<GuestFunction*>(i.src2.value));
     e.L(skip);
     e.ForgetFpcrMode();
@@ -413,7 +424,7 @@ struct CALL_INDIRECT_TRUE_I8
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I8Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);
@@ -428,7 +439,7 @@ struct CALL_INDIRECT_TRUE_I16
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I16Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);
@@ -443,7 +454,7 @@ struct CALL_INDIRECT_TRUE_I32
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);
@@ -458,7 +469,7 @@ struct CALL_INDIRECT_TRUE_I64
                I<OPCODE_CALL_INDIRECT_TRUE, VoidOp, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     auto& skip = e.NewCachedLabel();
-    e.cbz(i.src1, skip);
+    e.cbz_near(i.src1, skip);
     if (i.src2.is_constant) {
       e.mov(e.w16, static_cast<uint32_t>(i.src2.constant()));
       e.CallIndirect(i.instr, 16);

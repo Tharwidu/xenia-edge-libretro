@@ -316,10 +316,16 @@ if(MSVC)
     add_link_options($<$<CONFIG:Release>:/LTCG>)
     set(CMAKE_STATIC_LINKER_FLAGS_RELEASE "${CMAKE_STATIC_LINKER_FLAGS_RELEASE} /LTCG")
   endif()
-  # Release has no PDB.
-  string(REPLACE "/Zi" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
-  string(REPLACE "/Zi" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
-  string(REPLACE "/DEBUG" "" CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE}")
+  # Release emits a PDB so optimized crashes symbolize in a debugger. /DEBUG
+  # would disable REF/ICF folding and force incremental linking, so re-assert
+  # them to keep the optimized layout and size.
+  add_compile_options($<$<CONFIG:Release>:/Z7>)
+  add_link_options(
+    $<$<CONFIG:Release>:/DEBUG>
+    $<$<CONFIG:Release>:/OPT:REF>
+    $<$<CONFIG:Release>:/OPT:ICF>
+    $<$<CONFIG:Release>:/INCREMENTAL:NO>
+  )
 
 else()
   # GCC/Clang (Linux)
@@ -436,7 +442,7 @@ else()
     $<$<CONFIG:Release>:-fomit-frame-pointer>
     $<$<CONFIG:Release>:-g>
   )
-  # ThinLTO. On Linux/Windows use lld (faster and what LLVM tests ThinLTO
+  # ThinLTO. On Linux use lld (faster and what LLVM tests ThinLTO
   # against upstream). On macOS use Apple's ld64, which handles ThinLTO
   # natively and avoids an lld install requirement. Gated behind
   # XENIA_ENABLE_LTO so -DXENIA_ENABLE_LTO=OFF produces a Release binary
@@ -460,6 +466,13 @@ else()
     endif()
     if(LLVM_RANLIB)
       set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "" FORCE)
+    endif()
+    # Apple's ar reads bitcode natively. GNU ar loads whatever LLVMgold.so
+    # it finds and aborts mid-build on a version mismatch, so stop here.
+    if(NOT APPLE AND (NOT LLVM_AR OR NOT LLVM_RANLIB))
+      message(FATAL_ERROR
+        "ThinLTO needs llvm-ar-${_xe_clang_major} and "
+        "llvm-ranlib-${_xe_clang_major}, or -DXENIA_ENABLE_LTO=OFF.")
     endif()
   endif()
 

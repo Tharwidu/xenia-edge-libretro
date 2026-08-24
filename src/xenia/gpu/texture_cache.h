@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <unordered_map>
 
 #include "xenia/base/assert.h"
@@ -24,6 +25,7 @@
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/texture_util.h"
+#include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
 
 namespace xe {
@@ -97,7 +99,13 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Marks the range as containing resolved data and invalidates textures
+  // overlapping it. resolution_scaled is whether the data went to the scaled
+  // resolve address space, or to shared memory, such as resolves done at
+  // native resolution when a scale threshold is set. The latter clears the
+  // scaled state of the range.
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           bool resolution_scaled);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(
@@ -124,6 +132,9 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  // Writes the guest memory of every used texture into the trace, if one is
+  // being recorded.
+  void RecordUsedTexturesInTrace(uint32_t used_texture_mask);
   // Returns whether RequestTextures(used_texture_mask) may need to process
   // bindings or reload texture data from guest memory. Used as a cheap
   // pre-check to skip the full RequestTextures call when nothing changed.
@@ -203,13 +214,8 @@ class TextureCache {
     uint32_t is_valid : 1;  // 98
 
     TextureKey() { MakeInvalid(); }
-    TextureKey(const TextureKey& key) {
-      std::memcpy(this, &key, sizeof(*this));
-    }
-    TextureKey& operator=(const TextureKey& key) {
-      std::memcpy(this, &key, sizeof(*this));
-      return *this;
-    }
+    TextureKey(const TextureKey&) = default;
+    TextureKey& operator=(const TextureKey&) = default;
     void MakeInvalid() {
       // Zero everything, including the padding, for a stable hash.
       std::memset(this, 0, sizeof(*this));
@@ -253,6 +259,10 @@ class TextureCache {
     }
     void LogAction(const char* action) const;
   };
+  static_assert(
+      std::is_trivially_copyable_v<TextureKey>,
+      "TextureKey is compared and hashed by raw bytes; a trivial copy "
+      "is required so padding is carried and stays zero.");
 
   class Texture {
    public:
@@ -523,7 +533,7 @@ class TextureCache {
 
   struct TextureBinding {
     TextureKey key;
-    // Packed integer scale, 5 bits per component.
+    // Packed integer scale, 6 bits per component.
     uint32_t integer_scale_bits;
     // Destination swizzle merged with guest to host format swizzle.
     uint32_t host_swizzle;
@@ -546,7 +556,7 @@ class TextureCache {
   };
 
   explicit TextureCache(const RegisterFile& register_file,
-                        SharedMemory& shared_memory,
+                        SharedMemory& shared_memory, TraceWriter* trace_writer,
                         uint32_t draw_resolution_scale_x,
                         uint32_t draw_resolution_scale_y);
 
@@ -606,7 +616,7 @@ class TextureCache {
   // shader to restore guest integer units from normalized host samples.
   static uint32_t GetIntegerScaleBits(xenos::TextureFormat guest_format,
                                       uint32_t num_format,
-                                      uint32_t host_swizzle,
+                                      uint32_t guest_swizzle,
                                       uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
@@ -675,6 +685,7 @@ class TextureCache {
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
+  TraceWriter* trace_writer_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
   divisors::MagicDiv draw_resolution_scale_x_divisor_;

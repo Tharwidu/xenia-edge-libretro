@@ -322,6 +322,10 @@ struct GetViewportInfoArgs {
           uint32_t full_float24_in_0_to_1 : 1;
           uint32_t pixel_shader_writes_depth : 1;
           xenos::DepthRenderTargetFormat depth_format : 1;
+          // Compared since with a scale threshold the scale can differ per draw
+          // and a cached viewport has to match it. 3 bits fit max 7 scale.
+          uint32_t draw_resolution_scale_x : 3;
+          uint32_t draw_resolution_scale_y : 3;
         };
         uint32_t packed_portions;
       };
@@ -356,9 +360,7 @@ struct GetViewportInfoArgs {
 #endif
   };
 
-  // everything that follows here does not need to be compared
-  uint32_t draw_resolution_scale_x;
-  uint32_t draw_resolution_scale_y;
+  // everything that follows here does not need to be compared.
   divisors::MagicDiv draw_resolution_scale_x_divisor;
   divisors::MagicDiv draw_resolution_scale_y_divisor;
   void Setup(uint32_t _draw_resolution_scale_x,
@@ -532,10 +534,9 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
-    // Flag from gamma_decode_pwl_resolve in resolve shader. Some games appear
-    // overexposed unless full 8_8_8_8_GAMMA resolves decode PWL gamma to
-    // linear before MSAA averaging / conversion, then write gamma bytes again
-    // for gamma dests. Off keeps the old byte averaging.
+    // Some games appear overexposed unless full 8_8_8_8_GAMMA resolves decode
+    // PWL gamma to linear before MSAA averaging / conversion, then write gamma
+    // bytes again for gamma dests. Kept as a constant in the resolve shader.
     uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
@@ -781,6 +782,12 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
                     ResolveInfo& info_out);
+
+// Returns log2 of the copy destination texel size in bytes from a Resolve's
+// copy_dest_info (format already normalized) - the derivation GetResolveInfo
+// used for the destination extent.
+uint32_t GetResolveDownscalePixelSizeLog2(
+    reg::RB_COPY_DEST_INFO copy_dest_info);
 
 // Maximum length for debug marker labels.
 static constexpr size_t kDebugMarkerLabelMaxLength = 256;

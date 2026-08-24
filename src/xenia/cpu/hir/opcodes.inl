@@ -278,6 +278,14 @@ DEFINE_OPCODE(
     OPCODE_SIG_X,
     OPCODE_FLAG_MEMORY | OPCODE_FLAG_VOLATILE)
 
+// Orders prior loads against later accesses, the acquire half of a lock.
+// Free on a store-ordered host.
+DEFINE_OPCODE(
+    OPCODE_LOAD_BARRIER,
+    "load_barrier",
+    OPCODE_SIG_X,
+    OPCODE_FLAG_MEMORY | OPCODE_FLAG_VOLATILE)
+
 DEFINE_OPCODE(
     OPCODE_MAX,
     "max",
@@ -396,6 +404,17 @@ DEFINE_OPCODE(
     OPCODE_VECTOR_COMPARE_UGE,
     "vector_compare_uge",
     OPCODE_SIG_V_V_V,
+    0)
+
+DEFINE_OPCODE(
+    OPCODE_VECTOR_ALL_SET,
+    "vector_all_set",
+    OPCODE_SIG_V_V,
+    0)
+DEFINE_OPCODE(
+    OPCODE_VECTOR_NONE_SET,
+    "vector_none_set",
+    OPCODE_SIG_V_V,
     0)
 
 DEFINE_OPCODE(
@@ -663,6 +682,18 @@ DEFINE_OPCODE(
     0)
 
 DEFINE_OPCODE(
+    OPCODE_CLEAR_FP_EXCEPTIONS,
+    "clear_fp_exceptions",
+    OPCODE_SIG_X,
+    OPCODE_FLAG_VOLATILE)
+
+DEFINE_OPCODE(
+    OPCODE_LOAD_FP_EXCEPTIONS,
+    "load_fp_exceptions",
+    OPCODE_SIG_V,
+    OPCODE_FLAG_VOLATILE)
+
+DEFINE_OPCODE(
     OPCODE_VECTOR_DENORMFLUSH,
     "vector_denormflush",
     OPCODE_SIG_V_V,
@@ -706,14 +737,20 @@ DEFINE_OPCODE(
     OPCODE_SIG_X_V_V,
     OPCODE_FLAG_MEMORY)
 
-DEFINE_OPCODE(	
+DEFINE_OPCODE(
 	OPCODE_RESERVED_LOAD,
 	"reserved_load",
     OPCODE_SIG_V_V,
-    OPCODE_FLAG_MEMORY)
+    OPCODE_FLAG_MEMORY | OPCODE_FLAG_VOLATILE)
 
 DEFINE_OPCODE(
     OPCODE_RESERVED_STORE,
     "reserved_store",
     OPCODE_SIG_V_V_V,
-    OPCODE_FLAG_MEMORY)
+    OPCODE_FLAG_MEMORY | OPCODE_FLAG_VOLATILE)
+
+DEFINE_OPCODE(
+    OPCODE_CHECK_PREEMPT,
+    "check_preempt",
+    OPCODE_SIG_X,
+    OPCODE_FLAG_VOLATILE)

@@ -170,7 +170,13 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                            std::move(completion_callback));
 }
 
-void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
+  // Starting a new frame because descriptors may be needed.
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  render_target_cache_->RestoreEdramSnapshot(snapshot);
+}
 
 void VulkanCommandProcessor::PollCompletedSubmission() {
   // Strict ZPD can skip unnecessary work here that can wait for the next full
@@ -470,7 +476,7 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  // Needed by NormalizeSampleCount.
+  // Fallback for query segment normalization when no draw pinned a scale.
   zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
   zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
 
@@ -1348,6 +1354,7 @@ bool VulkanCommandProcessor::SetupContext() {
   // Initialize the ZPD occlusion query pool and resources.
   zpd_host_query_pool_ = std::make_unique<VulkanZPDQueryPool>();
   EnsureZPDQueryResources();
+  CreateGpuTimeQueryPool();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1365,6 +1372,11 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ShutdownZPDQueryResources();
   zpd_host_query_pool_.reset();
+  if (gpu_time_untimed_submissions_) {
+    XELOGW("GPU busy total is missing {} submission(s) with no free query slot",
+           gpu_time_untimed_submissions_);
+  }
+  DestroyGpuTimeQueryPool();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1408,6 +1420,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          fxaa_source_descriptor_set_layout_);
 
   // Resolve downscale cleanup.
+  ClearResolveHoldSnapshots();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          resolve_downscale_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -1648,10 +1661,169 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+bool VulkanCommandProcessor::CreateResolveHoldSnapshotBuffer(
+    ResolveHoldSnapshotBuffer& buffer, uint32_t size) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBufferCreateInfo buffer_info = {};
+  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_info.size = size;
+  buffer_info.usage =
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (dfn.vkCreateBuffer(device, &buffer_info, nullptr, &buffer.buffer) !=
+      VK_SUCCESS) {
+    XELOGE("Failed to create a {} KB resolve hold snapshot buffer", size >> 10);
+    return false;
+  }
+  VkMemoryRequirements memory_requirements;
+  dfn.vkGetBufferMemoryRequirements(device, buffer.buffer,
+                                    &memory_requirements);
+  const uint32_t memory_type_index = ui::vulkan::util::ChooseMemoryType(
+      vulkan_device->memory_types(), memory_requirements.memoryTypeBits,
+      ui::vulkan::util::MemoryPurpose::kDeviceLocal);
+  if (memory_type_index == UINT32_MAX) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           buffer.buffer);
+    return false;
+  }
+  VkMemoryAllocateInfo memory_info = {};
+  memory_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  memory_info.allocationSize = memory_requirements.size;
+  memory_info.memoryTypeIndex = memory_type_index;
+  if (dfn.vkAllocateMemory(device, &memory_info, nullptr, &buffer.memory) !=
+          VK_SUCCESS ||
+      dfn.vkBindBufferMemory(device, buffer.buffer, buffer.memory, 0) !=
+          VK_SUCCESS) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           buffer.memory);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           buffer.buffer);
+    return false;
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyResolveHoldSnapshotBuffer(
+    ResolveHoldSnapshotBuffer& buffer) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         buffer.buffer);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         buffer.memory);
+}
+
+// Nothing here is deferred, so copies still reading a snapshot have to drain
+// before it is destroyed.
+void VulkanCommandProcessor::PrepareResolveHoldSnapshotEviction() {
+  AwaitAllQueueOperationsCompletion();
+}
+
+void VulkanCommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
+                                                         uint32_t length,
+                                                         bool from_snapshot) {
+  const bool zero_copy = shared_memory_->is_zero_copy();
+  if (zero_copy && !from_snapshot) {
+    // buffer_ already aliases guest RAM, so the resolve landed there.
+    return;
+  }
+  // Readback lands in guest RAM: the host buffer in two-buffer mode, or buffer_
+  // itself in zero-copy mode, since it already aliases guest RAM.
+  VkBuffer host_buffer =
+      zero_copy ? shared_memory_->buffer() : shared_memory_->host_buffer();
+  if (host_buffer == VK_NULL_HANDLE || !length ||
+      !IsResolveDestinationResident(address, length)) {
+    return;
+  }
+  VkBuffer source_buffer;
+  VkDeviceSize source_offset;
+  if (from_snapshot) {
+    // An evicted snapshot just means the range goes unwritten.
+    ResolveHoldSnapshotBuffer* snapshot = FindResolveHoldSnapshot(address);
+    if (snapshot == nullptr) {
+      return;
+    }
+    source_buffer = snapshot->buffer;
+    source_offset = 0;
+  } else {
+    source_buffer = shared_memory_->buffer();
+    source_offset = address;
+  }
+  // The coherency poll this comes from is not inside a draw, so there is no
+  // submission open to record into.
+  if (!BeginSubmission(false)) {
+    return;
+  }
+  if (!from_snapshot) {
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  }
+  PushBufferMemoryBarrier(
+      host_buffer, VkDeviceSize(address), VkDeviceSize(length),
+      guest_shader_pipeline_stages_ | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT);
+  SubmitBarriers(true);
+  InsertDebugMarker("Resolve Release (guest RAM): 0x%08X, %u bytes", address,
+                    length);
+  VkBufferCopy copy_region = {};
+  copy_region.srcOffset = source_offset;
+  copy_region.dstOffset = address;
+  copy_region.size = length;
+  deferred_command_buffer_.CmdVkCopyBuffer(source_buffer, host_buffer, 1,
+                                           &copy_region);
+  PushBufferMemoryBarrier(
+      host_buffer, VkDeviceSize(address), VkDeviceSize(length),
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | guest_shader_pipeline_stages_ |
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+  // The guest is blocked on the coherency poll that got us here, so it must see
+  // the copy before it proceeds.
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE(
+        "VulkanCommandProcessor: Failed to complete queue operations for "
+        "resolve release");
+  }
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+
+  // Before the presenter check, the slot occurrences must be reset even on the
+  // paths that return early.
+  NoteResolveFrame(frontbuffer_ptr);
+
+  CollectCompletedGpuTimeQueries();
+  static constexpr uint32_t kRenderPassWindowFrames = 60;
+  if (++render_pass_window_frames_ >= kRenderPassWindowFrames) {
+    uint64_t submissions_now = GetCurrentSubmission();
+    COUNT_profile_set(
+        "gpu/command_buffers_per_frame",
+        int64_t((submissions_now - gpu_time_submissions_window_start_) /
+                render_pass_window_frames_));
+    gpu_time_submissions_window_start_ = submissions_now;
+    COUNT_profile_set(
+        "gpu/render_passes_per_frame",
+        int64_t((render_passes_total_ - render_passes_window_start_) /
+                render_pass_window_frames_));
+    render_passes_window_start_ = render_passes_total_;
+
+    COUNT_profile_set("gpu/gpu_busy_us_per_frame",
+                      int64_t((gpu_time_total_ns_ - gpu_time_window_start_ns_) /
+                              (uint64_t(1000) * render_pass_window_frames_)));
+    gpu_time_window_start_ns_ = gpu_time_total_ns_;
+
+    render_pass_window_frames_ = 0;
+  }
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -2432,6 +2604,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass,
     const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+  SCOPE_profile_cpu_f("gpu");
   SubmitBarriers(false);
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
@@ -2514,6 +2687,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+  ++render_passes_total_;
 
   // Resume any pending ZPD segment now that the pass is open.
   OpenQuerySegment(false);
@@ -2523,6 +2697,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass,
     const VulkanRenderTargetCache::Framebuffer* framebuffer,
     VkImageView transfer_dest_view, bool transfer_dest_is_depth) {
+  SCOPE_profile_cpu_f("gpu");
   SubmitBarriers(false);
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
@@ -2616,11 +2791,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+  ++render_passes_total_;
 
   OpenQuerySegment(false);
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
+  SCOPE_profile_cpu_f("gpu");
   assert_true(submission_open_);
   if (!in_render_pass_) {
     return;
@@ -3443,14 +3620,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+
+  // Resolution scale of this draw, which may be 1x1 because of
+  // draw_resolution_scale_threshold, which the divisors have to match too.
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
+  // ZPD segments can't mix scales. The resolved sample count is divided by
+  // one scale area per segment. Split before the FSI counter index goes
+  // into system constants.
+  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
   draw_util::GetViewportInfoArgs gviargs{};
   gviargs.Setup(
       draw_resolution_scale_x, draw_resolution_scale_y,
-      texture_cache_->draw_resolution_scale_x_divisor(),
-      texture_cache_->draw_resolution_scale_y_divisor(), false,
-      device_properties.maxViewportDimensions[0],
+      draw_resolution_scale_x > 1
+          ? texture_cache_->draw_resolution_scale_x_divisor()
+          : divisors::MagicDiv(1),
+      draw_resolution_scale_y > 1
+          ? texture_cache_->draw_resolution_scale_y_divisor()
+          : divisors::MagicDiv(1),
+      false, device_properties.maxViewportDimensions[0],
       device_properties.maxViewportDimensions[1], true,
       normalized_depth_control,
       host_render_targets_used &&
@@ -3626,7 +3814,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                 static_cast<uint32_t>(vfetch_constant.type));
             return false;
         }
-        vfetch_addresses[vfetch_current_queued] = vfetch_constant.address;
+        // Mask to physical like the shader - the guest may use a mirror window.
+        vfetch_addresses[vfetch_current_queued] =
+            xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
     }
@@ -3848,8 +4038,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   uint32_t written_address, written_length;
+  reg::RB_COPY_DEST_INFO copy_dest_info;
+  bool is_scaled;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                     written_address, written_length)) {
+                                     written_address, written_length,
+                                     &copy_dest_info, &is_scaled)) {
     if (debug_markers_enabled_) {
       PopDebugMarker();
     }
@@ -3871,15 +4064,25 @@ bool VulkanCommandProcessor::IssueCopy() {
       resolve_host_buffer != VK_NULL_HANDLE &&
       IsResolveDestinationResident(written_address, written_length)) {
     bool stall_after_copy;
-    if (!DecideResolveHostCopy(readback_mode, written_address, written_length,
-                               cvars::readback_resolve_sync,
-                               stall_after_copy)) {
-      // some mode: the range has not been read since its last resolve.
+    ResolveHostCopyAction copy_action = DecideResolveHostCopy(
+        readback_mode, written_address, written_length,
+        cvars::readback_resolve_sync, is_scaled, stall_after_copy);
+    if (copy_action == ResolveHostCopyAction::kSkip) {
+      // Not read back, or held for a later coherency request to release.
       PopDebugMarker();
       return true;
     }
+    const bool to_hold_snapshot =
+        copy_action == ResolveHostCopyAction::kToHoldSnapshot;
+    if (to_hold_snapshot) {
+      // A snapshot hold never stalls, nothing is reaching guest RAM yet.
+      stall_after_copy = false;
+    }
 
-    if (!texture_cache_->IsDrawResolutionScaled()) {
+    // is_scaled reflects this resolve, not the global scale. A native resolve
+    // under a scale threshold, and the fallback when the scaled buffer is
+    // unavailable, both write shared memory unscaled.
+    if (!is_scaled) {
       if (zero_copy) {
         // The non-scaled resolve already wrote buffer_ (guest RAM) in place, so
         // it is coherent with the CPU - nothing to read back.
@@ -3944,11 +4147,21 @@ bool VulkanCommandProcessor::IssueCopy() {
       return true;
     }
 
-    // Get the current scaled resolve range (not the buffer's total range)
-    uint32_t scaled_length = static_cast<uint32_t>(
-        texture_cache_->GetCurrentScaledResolveRangeLengthScaled());
-    uint64_t scaled_address =
-        texture_cache_->GetCurrentScaledResolveRangeStartScaled();
+    ScaledResolveReadbackInfo scaled_info;
+    if (!GetScaledResolveReadbackInfo(written_address, written_length,
+                                      copy_dest_info, scaled_info)) {
+      if (debug_markers_enabled_) {
+        PopDebugMarker();
+      }
+      return true;
+    }
+    uint32_t pixel_size_log2 = scaled_info.pixel_size_log2;
+    uint32_t tile_count = scaled_info.tile_count;
+    uint32_t readback_length = scaled_info.readback_length;
+    uint32_t scale_x = scaled_info.scale_x;
+    uint32_t scale_y = scaled_info.scale_y;
+    uint64_t scaled_start = scaled_info.scaled_start;
+    uint64_t scaled_readback_length = scaled_info.scaled_readback_length;
 
     // Calculate offset within the buffer using the buffer's base address.
     // GetCurrentScaledResolveBufferBaseOffset() returns:
@@ -3956,45 +4169,40 @@ bool VulkanCommandProcessor::IssueCopy() {
     // - For simple buffers: the buffer's range_start_scaled
     uint64_t buffer_base =
         texture_cache_->GetCurrentScaledResolveBufferBaseOffset();
-    if (scaled_address < buffer_base) {
+    if (scaled_start < buffer_base) {
       XELOGE(
           "VulkanCommandProcessor: Scaled address {} is before buffer start {}",
-          scaled_address, buffer_base);
+          scaled_start, buffer_base);
       if (debug_markers_enabled_) {
         PopDebugMarker();
       }
       return true;
     }
-    uint64_t source_offset = scaled_address - buffer_base;
+    uint64_t source_offset = scaled_start - buffer_base;
 
-    // Get format info for downscaling
-    auto copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
-    const FormatInfo* format_info =
-        FormatInfo::Get(static_cast<uint32_t>(copy_dest_info.copy_dest_format));
-    uint32_t bits_per_pixel = format_info->bits_per_pixel;
-
-    uint32_t scale_x = texture_cache_->draw_resolution_scale_x();
-    uint32_t scale_y = texture_cache_->draw_resolution_scale_y();
-
-    assert_true(scale_x >= 1 &&
-                scale_x <= TextureCache::kMaxDrawResolutionScaleAlongAxis);
-    assert_true(scale_y >= 1 &&
-                scale_y <= TextureCache::kMaxDrawResolutionScaleAlongAxis);
-    assert_true(scale_x > 1 || scale_y > 1);
-    assert_true(bits_per_pixel == 8 || bits_per_pixel == 16 ||
-                bits_per_pixel == 32 || bits_per_pixel == 64);
-
-    // The downscale compute writes 1x data straight into host_buffer_ (guest
-    // RAM) at the resolved range.
+    // The downscale writes 1x data straight into guest RAM at the resolved
+    // range, or into a hold snapshot for a held resolve.
     VkBuffer dest_buffer = resolve_host_buffer;
     VkDeviceSize dest_offset = written_address;
+    if (to_hold_snapshot) {
+      ResolveHoldSnapshotBuffer* snapshot =
+          AcquireResolveHoldSnapshot(written_address, readback_length);
+      if (snapshot == nullptr) {
+        if (debug_markers_enabled_) {
+          PopDebugMarker();
+        }
+        return true;
+      }
+      dest_buffer = snapshot->buffer;
+      dest_offset = 0;
+    }
 
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
 
     // Ensure intermediate buffer for GPU downscaling is large enough
-    uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length);
+    uint32_t downscale_buffer_size = AlignReadbackBufferSize(readback_length);
     if (downscale_buffer_size > resolve_downscale_buffer_size_) {
       // Clean up old buffer
       if (resolve_downscale_buffer_ != VK_NULL_HANDLE) {
@@ -4125,7 +4333,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     // Destination buffer (intermediate device-local buffer)
     buffer_infos[1].buffer = resolve_downscale_buffer_;
     buffer_infos[1].offset = 0;
-    buffer_infos[1].range = written_length;
+    buffer_infos[1].range = readback_length;
 
     std::array<VkWriteDescriptorSet, 2> descriptor_writes;
     descriptor_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -4173,31 +4381,13 @@ bool VulkanCommandProcessor::IssueCopy() {
         0, nullptr);
 
     PushDebugMarker("Resolve Downscale: 0x%08X, %u bytes -> %u bytes",
-                    written_address, scaled_length, written_length);
+                    written_address, uint32_t(scaled_readback_length),
+                    readback_length);
 
     // Bind compute pipeline
     BindExternalComputePipeline(resolve_downscale_pipeline_);
 
     // Push constants
-    uint32_t pixel_size_log2;
-    xe::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2);
-    uint32_t bytes_per_pixel = 1u << pixel_size_log2;
-    uint32_t tile_size_1x = 32 * 32 * bytes_per_pixel;
-    uint32_t tile_count = written_length / tile_size_1x;
-
-    // Skip if no complete tiles to process
-    if (tile_count == 0) {
-      XELOGW(
-          "VulkanCommandProcessor: Scaled resolve has no complete tiles "
-          "(written_length=%u, tile_size=%u)",
-          written_length, tile_size_1x);
-      if (debug_markers_enabled_) {
-        PopDebugMarker();  // Pop "Resolve Downscale"
-        PopDebugMarker();  // Pop "IssueCopy (Resolve)"
-      }
-      return true;
-    }
-
     ResolveDownscaleConstants constants;
     constants.scale_x = scale_x;
     constants.scale_y = scale_y;
@@ -4233,7 +4423,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     pre_copy_barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     pre_copy_barriers[0].buffer = resolve_downscale_buffer_;
     pre_copy_barriers[0].offset = 0;
-    pre_copy_barriers[0].size = written_length;
+    pre_copy_barriers[0].size = readback_length;
     pre_copy_barriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     pre_copy_barriers[1].srcAccessMask =
         VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -4242,25 +4432,39 @@ bool VulkanCommandProcessor::IssueCopy() {
     pre_copy_barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     pre_copy_barriers[1].buffer = dest_buffer;
     pre_copy_barriers[1].offset = dest_offset;
-    pre_copy_barriers[1].size = written_length;
+    pre_copy_barriers[1].size = readback_length;
     deferred_command_buffer_.CmdVkPipelineBarrier(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
             guest_shader_pipeline_stages_,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 2, pre_copy_barriers, 0,
         nullptr);
 
-    // Copy the downscaled data into host_buffer_ (guest RAM).
+    // Copy the downscaled data into the destination.
     VkBufferCopy copy_region = {};
     copy_region.srcOffset = 0;
     copy_region.dstOffset = dest_offset;
-    copy_region.size = written_length;
+    copy_region.size = readback_length;
     deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_,
                                              dest_buffer, 1, &copy_region);
+    if (to_hold_snapshot) {
+      // Order the write before whenever the release copy reads it.
+      PushBufferMemoryBarrier(
+          dest_buffer, dest_offset, VkDeviceSize(readback_length),
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      // Only now that the snapshot holds the data is the hold real.
+      HoldResolveOutput(written_address, readback_length, true);
+      PopDebugMarker();
+      if (debug_markers_enabled_) {
+        PopDebugMarker();
+      }
+      return true;
+    }
     // Make the copy visible to within-frame consumers reading host_buffer_
     // (route_to_host draws sampling guest RAM as index, vertex or texture, and
     // EnsureMemexportRangeInDeviceBuffer copying out of it).
     PushBufferMemoryBarrier(
-        dest_buffer, dest_offset, VkDeviceSize(written_length),
+        dest_buffer, dest_offset, VkDeviceSize(readback_length),
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | guest_shader_pipeline_stages_ |
             VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -4553,6 +4757,7 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   resolve.submission = GetCurrentSubmission();
   resolve.query_index = zpd_active_query_index_;
   resolve.query_generation = zpd_active_query_generation_;
+  resolve.scale_area = GetZPDScaleArea();
   resolve.uses_fsi_counter = zpd_active_query_is_fsi_;
   resolve.report_handle = report_handle;
   zpd_resolves_in_flight_.push_back(resolve);
@@ -4656,7 +4861,8 @@ void VulkanCommandProcessor::PumpQueryResolves() {
       }
       zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index,
                                               resolve.query_generation);
-      OnZPDQueryResolved(resolve.report_handle, raw_samples);
+      OnZPDQueryResolved(resolve.report_handle, raw_samples,
+                         resolve.scale_area);
     }
   }
 }
@@ -4716,13 +4922,17 @@ void VulkanCommandProcessor::InitializeTrace() {
   if (!BeginSubmission(true)) {
     return;
   }
-  // TODO(Triang3l): Write the EDRAM.
+  bool render_target_cache_submitted =
+      render_target_cache_->InitializeTraceSubmitDownloads();
   bool shared_memory_submitted =
       shared_memory_->InitializeTraceSubmitDownloads();
-  if (!shared_memory_submitted) {
+  if (!render_target_cache_submitted && !shared_memory_submitted) {
     return;
   }
   AwaitAllQueueOperationsCompletion();
+  if (render_target_cache_submitted) {
+    render_target_cache_->InitializeTraceCompleteDownloads();
+  }
   if (shared_memory_submitted) {
     shared_memory_->InitializeTraceCompleteDownloads();
   }
@@ -5051,6 +5261,58 @@ bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
          !pipeline_cache_->IsCreatingPipelines();
 }
 
+void VulkanCommandProcessor::CreateGpuTimeQueryPool() {
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  if (!vulkan_device->properties().timestampPeriod) {
+    XELOGW("Vulkan: no timestamp support, GPU busy time will not be reported");
+    return;
+  }
+  VkQueryPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  pool_info.queryCount = kGpuTimeQuerySubmissions * 2;
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                            &gpu_time_query_pool_) != VK_SUCCESS) {
+    XELOGE("Vulkan: failed to create the GPU time query pool");
+    gpu_time_query_pool_ = VK_NULL_HANDLE;
+  }
+}
+
+void VulkanCommandProcessor::DestroyGpuTimeQueryPool() {
+  if (gpu_time_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(),
+                                                gpu_time_query_pool_, nullptr);
+  gpu_time_query_pool_ = VK_NULL_HANDLE;
+}
+
+void VulkanCommandProcessor::CollectCompletedGpuTimeQueries() {
+  if (gpu_time_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const double period = vulkan_device->properties().timestampPeriod;
+  const uint64_t completed = GetCompletedSubmission();
+  for (uint32_t slot = 0; slot < kGpuTimeQuerySubmissions; ++slot) {
+    uint64_t submission = gpu_time_query_submissions_[slot];
+    if (!submission || submission > completed) {
+      continue;
+    }
+    uint64_t timestamps[2] = {};
+    if (dfn.vkGetQueryPoolResults(vulkan_device->device(), gpu_time_query_pool_,
+                                  slot * 2, 2, sizeof(timestamps), timestamps,
+                                  sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        timestamps[1] > timestamps[0]) {
+      gpu_time_total_ns_ += uint64_t((timestamps[1] - timestamps[0]) * period);
+    }
+    gpu_time_query_submissions_[slot] = 0;
+  }
+}
+
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5196,11 +5458,37 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       XELOGE("Failed to begin a Vulkan command buffer");
       return false;
     }
+    // Bracket the whole submission. Recycle finished slots first, or a frame
+    // with more submissions than slots leaves the later ones untimed.
+    CollectCompletedGpuTimeQueries();
+    const bool gpu_time_pool_available = gpu_time_query_pool_ != VK_NULL_HANDLE;
+    const uint32_t gpu_time_slot = gpu_time_query_slot_;
+    const bool gpu_time_recorded =
+        gpu_time_pool_available && !gpu_time_query_submissions_[gpu_time_slot];
+    if (gpu_time_pool_available && !gpu_time_recorded) {
+      ++gpu_time_untimed_submissions_;
+    }
+    if (gpu_time_recorded) {
+      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_,
+                              gpu_time_slot * 2, 2);
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              gpu_time_query_pool_, gpu_time_slot * 2);
+    }
+
     deferred_command_buffer_.Execute(command_buffer.buffer);
 
     // Record ZPD resolves before submitting.
     if (zpd_host_query_pool_) {
       zpd_host_query_pool_->RecordResolveBatch(command_buffer.buffer);
+    }
+    if (gpu_time_recorded) {
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer,
+                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              gpu_time_query_pool_, gpu_time_slot * 2 + 1);
+      gpu_time_query_submissions_[gpu_time_slot] = GetCurrentSubmission();
+      gpu_time_query_slot_ =
+          (gpu_time_query_slot_ + 1) % kGpuTimeQuerySubmissions;
     }
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       XELOGE("Failed to end a Vulkan command buffer");
@@ -5439,13 +5727,12 @@ void VulkanCommandProcessor::UpdateDynamicState(
               ? draw_util::kD3D10PolygonOffsetFactorUnorm24
               : draw_util::kD3D10PolygonOffsetFactorFloat24;
       // With non-square resolution scaling, make sure the worst-case impact is
-      // reverted (slope only along the scaled axis), thus max. More bias is
-      // better than less bias, because less bias means Z fighting with the
-      // background is more likely.
+      // reverted (slope only along the scaled axis), thus max. Per-draw scale
+      // so native draws get the guest bias as is. More bias is better than less
+      // bias; less bias means Z fighting with the background is more likely.
       depth_bias_slope_factor *=
           xenos::kPolygonOffsetScaleSubpixelUnit *
-          float(std::max(render_target_cache_->draw_resolution_scale_x(),
-                         render_target_cache_->draw_resolution_scale_y()));
+          float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
     }
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
@@ -5626,8 +5913,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Resolution scale of this draw.
+  // 1x1 with draw_resolution_scale_threshold (FSI only).
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   // Get the color info register values for each render target. Also, for FSI,
   // exclude components that don't exist in the format from the write mask.

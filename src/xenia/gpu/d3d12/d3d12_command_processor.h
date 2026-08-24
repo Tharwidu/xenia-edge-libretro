@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
@@ -177,6 +178,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kNullRawSRV = kNullRawSRVAndSharedMemoryRawUAVStart,
     kSharedMemoryRawUAV,
 
+    // Device SRV + UAV pair, the device-buffer version of the host RW pair
+    // below, for memexport draws on the device path.
+    kSharedMemoryRawSRVAndRawUAVStart,
+    kSharedMemoryRawSRVForRW = kSharedMemoryRawSRVAndRawUAVStart,
+    kSharedMemoryRawUAVForRW,
+
     // Host-imported (guest RAM) buffer pairs mirroring the device pairs above,
     // bound instead for memexport-touching draws. Written only when the host
     // buffer exists (two-buffer memexport routing). Unused otherwise.
@@ -187,6 +194,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kNullRawSRVAndSharedMemoryHostRawUAVStart,
     kSharedMemoryHostNullRawSRV = kNullRawSRVAndSharedMemoryHostRawUAVStart,
     kSharedMemoryHostRawUAV,
+
+    // Host SRV + UAV as one adjacent pair for memexport draws that also read
+    // shared memory through the t0 SRV (guest vertex fetch). Mirrors Vulkan
+    // using one read + write buffer.
+    kSharedMemoryHostRawSRVAndHostRawUAVStart,
+    kSharedMemoryHostRawSRVForRW = kSharedMemoryHostRawSRVAndHostRawUAVStart,
+    kSharedMemoryHostRawUAVForRW,
 
     kEdramRawSRV,
     kEdramR32UintSRV,
@@ -353,6 +367,22 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
+  // Copies a held resolve range into guest RAM and waits for it, out of the
+  // shared memory buffer or out of the destination's hold snapshot. Called
+  // from NoteResolveCoherency.
+  void FlushResolveRangeToGuestRam(uint32_t address, uint32_t length,
+                                   bool from_snapshot);
+
+  // Hold snapshot storage for command_processor_resolve_readwatch.inc, which
+  // owns the pool itself.
+  struct ResolveHoldSnapshotBuffer {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+  };
+  bool CreateResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer,
+                                       uint32_t size);
+  void DestroyResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer);
+  // Deletion is deferred here, so nothing has to be drained up front.
+  void PrepareResolveHoldSnapshotEviction() {}
 
   void InitializeTrace() override;
 
@@ -505,10 +535,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
       D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out,
       D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out);
 
-  void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
-                                const draw_util::Scissor& scissor,
-                                bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
+  void UpdateFixedFunctionState(
+      const draw_util::ViewportInfo& viewport_info,
+      const draw_util::Scissor& scissor, bool primitive_polygonal,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      uint32_t bound_depth_and_color_render_target_bits);
 
   // Parallel binding for the spirv_to_dxil guest path (Mesa root signature).
   // Fills a SpirvShaderTranslator::SystemConstants (mirroring the Vulkan
@@ -577,6 +609,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
     bool uses_rov_counter = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };

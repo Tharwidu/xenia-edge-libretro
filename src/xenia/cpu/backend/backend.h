@@ -42,6 +42,15 @@ class CodeCache;
 using GuestTrampolineProc = void (*)(ppc::PPCContext* context, void* userarg1,
                                      void* userarg2);
 using SimpleGuestTrampolineProc = void (*)(ppc::PPCContext*);
+// One emitted HIR instruction: which sequence the backend selected for it, how
+// much host code that produced, and which guest instruction of the function it
+// belongs to, so the coverage counters can weight it.
+struct SequenceSample {
+  uint64_t key;
+  uint32_t guest_index;
+  uint32_t host_bytes;
+};
+
 class Backend {
  public:
   explicit Backend();
@@ -122,6 +131,16 @@ class Backend {
   }
   virtual void FreeGuestTrampoline(uint32_t trampoline_addr) {}
 
+  // lwarx/stwcx. for host code, on the same reservation state the JIT uses, so
+  // a host store cancels a guest thread's reservation. Values are guest endian.
+  // Defaults are a plain access, for backends that never run guest code.
+  virtual uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address);
+  virtual uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address);
+  virtual bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                               uint32_t value);
+  virtual bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                               uint64_t value);
+
   // JIT tracing runtime controls. "available" reflects whether the trace hooks
   // were compiled into emitted code (XENIA_ENABLE_ITRACE / XENIA_ENABLE_DTRACE
   // build options); when unavailable the enable flags have no effect.
@@ -134,6 +153,10 @@ class Backend {
   virtual void set_trace_data_enabled(bool value) {}
   virtual bool trace_func_enabled() const { return false; }
   virtual void set_trace_func_enabled(bool value) {}
+
+  // Renders a sequence selection key as "OPCODE_NAME dest src1 src2 src3" for
+  // the profiler dump. The key layout is private to each backend.
+  virtual std::string FormatSequenceKey(uint64_t key) const { return ""; }
 
  protected:
   Processor* processor_ = nullptr;
@@ -177,6 +200,11 @@ struct GuestTrampolineGroup
     return _NewTrampoline(proc, false);
   }
 };
+
+// Registered by the cooperative scheduler when it starts, null otherwise. A
+// JIT safepoint calls it with the PPCContext once the scheduler has raised the
+// context's preempt_requested flag.
+extern void (*preempt_yield_handler)(void* raw_context);
 
 }  // namespace backend
 }  // namespace cpu

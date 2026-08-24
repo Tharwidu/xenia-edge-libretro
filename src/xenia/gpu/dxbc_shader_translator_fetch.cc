@@ -933,6 +933,37 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       a_.OpIAdd(
           dxbc::Dest::R(size_and_is_3d_temp, size_needed_components & 0b0111),
           dxbc::Src::R(size_and_is_3d_temp), dxbc::Src::LU(1));
+      // HZB reducers in 555308B6 and 5553080B lock the sampler to one mip
+      // and address it with unnormalized coordinates. Those coordinates are
+      // in the locked mip's grid, but the denominator below was always the
+      // base level size, so each reduction after the first read garbage.
+      // Limit this to 2D unnormalized fetches with a locked mip. This changes
+      // only the denominator.
+      bool selected_mip_grid_possible =
+          instr.opcode == FetchOpcode::kTextureFetch &&
+          instr.dimension == xenos::FetchOpDimension::k2D &&
+          instr.attributes.unnormalized_coordinates;
+      if (selected_mip_grid_possible) {
+        uint32_t selected_mip_temp = PushSystemTemp();
+        // Word 4 has MipMinLevel in bits 2:5 and MipMaxLevel in bits 6:9.
+        a_.OpUBFE(dxbc::Dest::R(selected_mip_temp, 0b0011),
+                  dxbc::Src::LU(4, 4, 0, 0), dxbc::Src::LU(2, 6, 0, 0),
+                  RequestTextureFetchConstantWord(tfetch_index, 4));
+        a_.OpIEq(dxbc::Dest::R(selected_mip_temp, 0b0100),
+                 dxbc::Src::R(selected_mip_temp, dxbc::Src::kXXXX),
+                 dxbc::Src::R(selected_mip_temp, dxbc::Src::kYYYY));
+        // max(size >> mip, 1) for non-pow2 textures. Scaling stays unchanged.
+        a_.OpUShR(dxbc::Dest::R(selected_mip_temp, 0b1010),
+                  dxbc::Src::R(size_and_is_3d_temp, 0b01000000),
+                  dxbc::Src::R(selected_mip_temp, dxbc::Src::kXXXX));
+        a_.OpUMax(dxbc::Dest::R(selected_mip_temp, 0b1010),
+                  dxbc::Src::R(selected_mip_temp), dxbc::Src::LU(1));
+        a_.OpMovC(dxbc::Dest::R(size_and_is_3d_temp, 0b0011),
+                  dxbc::Src::R(selected_mip_temp, dxbc::Src::kZZZZ),
+                  dxbc::Src::R(selected_mip_temp, 0b00001101),
+                  dxbc::Src::R(size_and_is_3d_temp));
+        PopSystemTemp();
+      }
       // Convert the size to float for multiplication/division.
       a_.OpUToF(
           dxbc::Dest::R(size_and_is_3d_temp, size_needed_components & 0b0111),
@@ -2141,12 +2172,16 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // the guest integer range here.
       uint32_t integer_scale_bits_temp = PushSystemTemp();
       uint32_t integer_scale_temp = PushSystemTemp();
+      uint32_t integer_scale_flags_temp = PushSystemTemp();
       dxbc::Dest integer_scale_bits_dest(dxbc::Dest::R(
           integer_scale_bits_temp, used_result_nonzero_components));
       dxbc::Src integer_scale_bits_src(dxbc::Src::R(integer_scale_bits_temp));
       dxbc::Dest integer_scale_dest(
           dxbc::Dest::R(integer_scale_temp, used_result_nonzero_components));
       dxbc::Src integer_scale_src(dxbc::Src::R(integer_scale_temp));
+      dxbc::Dest integer_scale_flags_dest(dxbc::Dest::R(
+          integer_scale_flags_temp, used_result_nonzero_components));
+      dxbc::Src integer_scale_flags_src(dxbc::Src::R(integer_scale_flags_temp));
       dxbc::Src integer_scale_bits_packed = LoadSystemConstant(
           SystemConstants::Index::kTextureIntegerScaleBits,
           offsetof(SystemConstants, texture_integer_scale_bits) +
@@ -2155,21 +2190,33 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // Uniform early out. Zero means leave the sample alone. Only integer
       // num_format on fixed textures has scale bits.
       a_.OpIf(true, integer_scale_bits_packed);
-      a_.OpUBFE(integer_scale_bits_dest, dxbc::Src::LU(5),
-                dxbc::Src::LU(0, 5, 10, 15), integer_scale_bits_packed);
+      a_.OpUBFE(integer_scale_bits_dest, dxbc::Src::LU(6),
+                dxbc::Src::LU(0, 6, 12, 18), integer_scale_bits_packed);
       a_.OpAnd(integer_scale_dest, integer_scale_bits_src, dxbc::Src::LU(0xF));
       a_.OpIAdd(integer_scale_dest, integer_scale_src, dxbc::Src::LU(1));
-      a_.OpUShR(integer_scale_bits_dest, integer_scale_bits_src,
-                dxbc::Src::LU(4));
-      a_.OpIAdd(integer_scale_dest, integer_scale_src, -integer_scale_bits_src);
+      a_.OpUBFE(integer_scale_flags_dest, dxbc::Src::LU(1), dxbc::Src::LU(4),
+                integer_scale_bits_src);
+      a_.OpIAdd(integer_scale_dest, integer_scale_src,
+                -integer_scale_flags_src);
       a_.OpIShL(integer_scale_dest, dxbc::Src::LU(1), integer_scale_src);
       a_.OpIAdd(integer_scale_dest, integer_scale_src, dxbc::Src::LI(-1));
       a_.OpUToF(integer_scale_dest, integer_scale_src);
-      a_.OpMul(
+      // Unsigned biased samples are already mapped from [0, 1] to [-1, 1], so
+      // use half of the unsigned scale and subtract 0.5 to restore the guest's
+      // integer value.
+      a_.OpUBFE(integer_scale_bits_dest, dxbc::Src::LU(1), dxbc::Src::LU(5),
+                integer_scale_bits_src);
+      a_.OpMovC(integer_scale_flags_dest, integer_scale_bits_src,
+                dxbc::Src::LF(0.5f), dxbc::Src::LF(1.0f));
+      a_.OpMul(integer_scale_dest, integer_scale_src, integer_scale_flags_src);
+      a_.OpMovC(integer_scale_flags_dest, integer_scale_bits_src,
+                dxbc::Src::LF(-0.5f), dxbc::Src::LF(0.0f));
+      a_.OpMAd(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
-          dxbc::Src::R(system_temp_result_), integer_scale_src);
+          dxbc::Src::R(system_temp_result_), integer_scale_src,
+          integer_scale_flags_src);
       a_.OpEndIf();
-      PopSystemTemp(2);
+      PopSystemTemp(3);
     }
     if (signs_temp != UINT32_MAX) {
       PopSystemTemp();

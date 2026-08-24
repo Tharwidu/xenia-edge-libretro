@@ -81,6 +81,7 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   bool gpu_allow_invalid_fetch_constants_;
   bool gpu_3d_to_2d_texture_;
   bool half_pixel_offset_;
+  bool force_depth_clamp_;
   bool submit_on_primary_buffer_end_;
   int32_t occlusion_query_fake_lower_threshold_;
   int32_t occlusion_query_fake_upper_threshold_;
@@ -112,11 +113,13 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   bool force_convert_quad_lists_to_triangle_lists_;
   bool force_convert_line_loops_to_strips_;
   // Memory / Boot Hacks
+  bool clear_memory_page_state_;
   bool scribble_heap_;
   int32_t scribble_heap_value_;
   // Diagnostics / Logging
   int32_t log_level_;
   uint32_t log_mask_;
+  bool log_high_frequency_kernel_calls_;
   bool occlusion_query_log_;
   bool gpu_debug_markers_;
   bool disassemble_pm4_;

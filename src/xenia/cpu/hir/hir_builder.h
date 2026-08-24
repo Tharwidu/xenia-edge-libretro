@@ -116,6 +116,9 @@ class HIRBuilder {
 
   void SourceOffset(uint32_t offset);
 
+  // Preemption safepoint. Returns the instr so the caller can place it.
+  Instr* CheckPreempt();
+
   // trace info/etc
   void DebugBreak();
   void DebugBreakTrue(Value* cond);
@@ -178,6 +181,11 @@ class HIRBuilder {
 
   Value* LoadClock();
 
+  // Host FP exception status, as FpExceptionFlags. Clear before an operation
+  // and load after it to get the set that operation raised.
+  void ClearFpExceptions();
+  Value* LoadFpExceptions();
+
   Value* AllocLocal(TypeName type);
   Value* LoadLocal(Value* slot);
   void StoreLocal(Value* slot, Value* value);
@@ -208,6 +216,7 @@ class HIRBuilder {
   void CacheControl(Value* address, size_t cache_line_size,
                     CacheControlType type);
   void MemoryBarrier();
+  void LoadBarrier();
   void DelayExecution();
   void SetRoundingMode(Value* value);
   Value* Max(Value* value1, Value* value2);
@@ -219,6 +228,9 @@ class HIRBuilder {
   Value* Select(Value* cond, Value* value1, Value* value2);
   Value* IsTrue(Value* value);
   Value* IsFalse(Value* value);
+  // Reduce a whole V128 to a bool: every bit set / no bit set.
+  Value* VectorAllSet(Value* value);
+  Value* VectorNoneSet(Value* value);
   Value* IsNan(Value* value);
   Value* CompareEQ(Value* value1, Value* value2);
   Value* CompareNE(Value* value1, Value* value2);
@@ -249,8 +261,12 @@ class HIRBuilder {
   Value* Mul(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
   Value* MulHi(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
   Value* Div(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
-  Value* MulAdd(Value* value1, Value* value2, Value* value3);  // (1 * 2) + 3
-  Value* MulSub(Value* value1, Value* value2, Value* value3);  // (1 * 2) - 3
+  // (1 * 2) + 3, optionally negated
+  Value* MulAdd(Value* value1, Value* value2, Value* value3,
+                bool negate_result = false);
+  // (1 * 2) - 3, optionally negated
+  Value* MulSub(Value* value1, Value* value2, Value* value3,
+                bool negate_result = false);
 
   Value* Neg(Value* value);
   Value* Abs(Value* value);

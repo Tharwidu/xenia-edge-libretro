@@ -1100,6 +1100,7 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
+  // Fallback for query segment normalization when no draw pinned a scale.
   zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
   zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
 
@@ -1521,6 +1522,14 @@ bool D3D12CommandProcessor::SetupContext() {
     shared_memory_->WriteRawUAVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_,
         uint32_t(SystemBindlessView::kSharedMemoryRawUAV)));
+    // Device SRV + UAV pair for memexport draws that also read shared memory
+    // (guest vertex fetch via t0). Both address the device buffer.
+    shared_memory_->WriteRawSRVDescriptor(provider.OffsetViewDescriptor(
+        view_bindless_heap_cpu_start_,
+        uint32_t(SystemBindlessView::kSharedMemoryRawSRVForRW)));
+    shared_memory_->WriteRawUAVDescriptor(provider.OffsetViewDescriptor(
+        view_bindless_heap_cpu_start_,
+        uint32_t(SystemBindlessView::kSharedMemoryRawUAVForRW)));
     // Host buffer pairs for two-buffer memexport routing, only when it exists.
     // The read pair is [host SRV, null UAV], the write pair [null SRV, host
     // UAV], matching the device layout above.
@@ -1548,6 +1557,20 @@ bool D3D12CommandProcessor::SetupContext() {
           provider.OffsetViewDescriptor(
               view_bindless_heap_cpu_start_,
               uint32_t(SystemBindlessView::kSharedMemoryHostRawUAV)),
+          shared_memory_->GetHostBuffer(), SharedMemory::kBufferSize);
+      // Host SRV + UAV pair for memexport draws that also read shared memory
+      // (guest vertex fetch via t0). Both address the host buffer.
+      ui::d3d12::util::CreateBufferRawSRV(
+          device,
+          provider.OffsetViewDescriptor(
+              view_bindless_heap_cpu_start_,
+              uint32_t(SystemBindlessView::kSharedMemoryHostRawSRVForRW)),
+          shared_memory_->GetHostBuffer(), SharedMemory::kBufferSize);
+      ui::d3d12::util::CreateBufferRawUAV(
+          device,
+          provider.OffsetViewDescriptor(
+              view_bindless_heap_cpu_start_,
+              uint32_t(SystemBindlessView::kSharedMemoryHostRawUAVForRW)),
           shared_memory_->GetHostBuffer(), SharedMemory::kBufferSize);
     }
     // kEdramRawSRV.
@@ -1636,6 +1659,9 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
+
+  // Before the deletion list is drained, hold snapshots are freed through it.
+  ClearResolveHoldSnapshots();
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
        resources_for_deletion_) {
@@ -2185,6 +2211,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
 
+  // Before the presenter check, the slot occurrences must be reset even on the
+  // paths that return early.
+  NoteResolveFrame(frontbuffer_ptr);
+
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     return;
@@ -2579,6 +2609,91 @@ bool D3D12CommandProcessor::EnsureMemexportRangeInDeviceBuffer(
   return true;
 }
 
+bool D3D12CommandProcessor::CreateResolveHoldSnapshotBuffer(
+    ResolveHoldSnapshotBuffer& buffer, uint32_t size) {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Resource* resource;
+  // Copy source is the state a release expects, the downscale transitions it
+  // to copy dest and back.
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+          IID_PPV_ARGS(&resource)))) {
+    XELOGE("Failed to create a {} KB resolve hold snapshot buffer", size >> 10);
+    return false;
+  }
+  resource->SetName(L"Resolve Hold Snapshot");
+  buffer.resource.Attach(resource);
+  return true;
+}
+
+void D3D12CommandProcessor::DestroyResolveHoldSnapshotBuffer(
+    ResolveHoldSnapshotBuffer& buffer) {
+  if (!buffer.resource) {
+    return;
+  }
+  // Deferred, a submitted copy may still be reading it.
+  resources_for_deletion_.emplace_back(GetCurrentSubmission(),
+                                       buffer.resource.Detach());
+}
+
+void D3D12CommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
+                                                        uint32_t length,
+                                                        bool from_snapshot) {
+  const bool zero_copy = shared_memory_->is_zero_copy();
+  if (zero_copy && !from_snapshot) {
+    // buffer_ already aliases guest RAM, so the resolve landed there.
+    return;
+  }
+  // Readback lands in guest RAM: the host buffer in two-buffer mode, or buffer_
+  // itself in zero-copy mode, since it already aliases guest RAM.
+  ID3D12Resource* guest_ram_buffer =
+      zero_copy ? shared_memory_->GetBuffer() : shared_memory_->GetHostBuffer();
+  if (guest_ram_buffer == nullptr || !length ||
+      !IsResolveDestinationResident(address, length)) {
+    return;
+  }
+  ID3D12Resource* source_buffer;
+  uint32_t source_offset;
+  if (from_snapshot) {
+    // An evicted snapshot just means the range goes unwritten.
+    ResolveHoldSnapshotBuffer* snapshot = FindResolveHoldSnapshot(address);
+    if (snapshot == nullptr) {
+      return;
+    }
+    source_buffer = snapshot->resource.Get();
+    source_offset = 0;
+  } else {
+    source_buffer = shared_memory_->GetBuffer();
+    source_offset = address;
+  }
+  // The coherency poll this comes from is not inside a draw, so there is no
+  // submission open to record into.
+  if (!BeginSubmission(false)) {
+    return;
+  }
+  if (!from_snapshot) {
+    shared_memory_->UseAsCopySource();
+  }
+  if (zero_copy) {
+    shared_memory_->UseAsCopyDestination();
+  } else {
+    shared_memory_->UseHostAsCopyDestination();
+  }
+  SubmitBarriers();
+  InsertDebugMarker("Resolve Release (guest RAM): 0x%08X, %u bytes", address,
+                    length);
+  deferred_command_list_.D3DCopyBufferRegion(
+      guest_ram_buffer, address, source_buffer, source_offset, length);
+  // The guest is blocked on the coherency poll that got us here, so it must see
+  // the copy before it proceeds.
+  AwaitAllQueueOperationsCompletion();
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
@@ -2866,17 +2981,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     current_external_pipeline_ = nullptr;
   }
 
-  // Get dynamic rasterizer state.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Get dynamic rasterizer state. Using the resolution scale of this draw,
+  // which may be 1x1 because of draw_resolution_scale_threshold.
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
+  // ZPD segments can't mix scales. The resolved sample count is divided by
+  // one scale area per segment. Split before the ROV counter index goes
+  // into system constants.
+  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
   draw_util::ViewportInfo viewport_info;
   draw_util::GetViewportInfoArgs gviargs{};
 
   gviargs.Setup(
       draw_resolution_scale_x, draw_resolution_scale_y,
-      texture_cache_->draw_resolution_scale_x_divisor(),
-      texture_cache_->draw_resolution_scale_y_divisor(), true,
-      D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+      draw_resolution_scale_x > 1
+          ? texture_cache_->draw_resolution_scale_x_divisor()
+          : divisors::MagicDiv(1),
+      draw_resolution_scale_y > 1
+          ? texture_cache_->draw_resolution_scale_y_divisor()
+          : divisors::MagicDiv(1),
+      true, D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
       normalized_depth_control,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
@@ -2906,7 +3030,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 #endif
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
-                           normalized_depth_control);
+                           normalized_depth_control, normalized_color_mask,
+                           bound_depth_and_color_render_target_bits);
 
   // The spirv_to_dxil guest path fills SPIR-V system constants and binds the
   // Mesa root signature itself.
@@ -2962,7 +3087,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
             return false;
         }
-        vfetch_addresses[vfetch_current_queued] = vfetch_constant.address;
+        // Mask to physical like the shader - the guest may use a mirror window.
+        vfetch_addresses[vfetch_current_queued] =
+            xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
     }
@@ -3269,8 +3396,11 @@ bool D3D12CommandProcessor::IssueCopy() {
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
+  reg::RB_COPY_DEST_INFO copy_dest_info;
+  bool is_scaled;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                     written_address, written_length)) {
+                                     written_address, written_length,
+                                     &copy_dest_info, &is_scaled)) {
     return false;
   }
 
@@ -3293,20 +3423,28 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   bool stall_after_copy;
-  if (!DecideResolveHostCopy(readback_mode, written_address, written_length,
-                             cvars::readback_resolve_sync, stall_after_copy)) {
-    // some mode: the range has not been read since its last resolve.
+  ResolveHostCopyAction copy_action = DecideResolveHostCopy(
+      readback_mode, written_address, written_length,
+      cvars::readback_resolve_sync, is_scaled, stall_after_copy);
+  if (copy_action == ResolveHostCopyAction::kSkip) {
+    // Not read back, or held for a later coherency request to release.
     return true;
   }
+  const bool to_hold_snapshot =
+      copy_action == ResolveHostCopyAction::kToHoldSnapshot;
 
-  bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  // is_scaled reflects this resolve (native resolves under a scale threshold go
+  // to shared memory unscaled); a native or zero-copy resolve is already in
+  // guest RAM, so there is nothing to read back.
   if (!is_scaled && zero_copy) {
-    // The non-scaled resolve already wrote buffer_ (guest RAM) in place, so it
-    // is coherent with the CPU - nothing to read back.
     return true;
   }
   ID3D12Resource* dest_buffer = guest_ram_buffer;
   uint32_t dest_offset = written_address;
+  // A snapshot hold never stalls, nothing is reaching guest RAM yet.
+  if (to_hold_snapshot) {
+    stall_after_copy = false;
+  }
 
   // Copy the resolved data into guest RAM (downscaling first if scaled).
   if (is_scaled) {
@@ -3318,46 +3456,32 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    // Get format info for downscaling
-    auto copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
-    const FormatInfo* format_info =
-        FormatInfo::Get((uint32_t)copy_dest_info.copy_dest_format);
-    uint32_t bits_per_pixel = format_info->bits_per_pixel;
-
-    // Calculate tile count early to bail out if zero
-    uint32_t pixel_size_log2;
-    xe::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2);
-    uint32_t bytes_per_pixel = 1u << pixel_size_log2;
-    uint32_t tile_size_1x = 32 * 32 * bytes_per_pixel;
-    uint32_t tile_count = written_length / tile_size_1x;
-    if (tile_count == 0) {
+    ScaledResolveReadbackInfo scaled_info;
+    if (!GetScaledResolveReadbackInfo(written_address, written_length,
+                                      copy_dest_info, scaled_info)) {
       return true;
     }
+    uint32_t pixel_size_log2 = scaled_info.pixel_size_log2;
+    uint32_t tile_count = scaled_info.tile_count;
+    uint32_t readback_length = scaled_info.readback_length;
+    uint32_t scale_x = scaled_info.scale_x;
+    uint32_t scale_y = scaled_info.scale_y;
+    uint64_t scaled_start = scaled_info.scaled_start;
+    uint64_t scaled_readback_length = scaled_info.scaled_readback_length;
 
-    uint32_t scaled_length =
-        (uint32_t)texture_cache_->GetCurrentScaledResolveRangeLengthScaled();
-    uint64_t scaled_address =
-        texture_cache_->GetCurrentScaledResolveRangeStartScaled();
-
-    // Validate scaled resolve range is set up
-    if (scaled_length == 0) {
-      XELOGE("Resolve downscale: scaled_length is 0");
-      return true;
+    // Taken before the dispatch so a refusal costs nothing.
+    if (to_hold_snapshot) {
+      ResolveHoldSnapshotBuffer* snapshot =
+          AcquireResolveHoldSnapshot(written_address, readback_length);
+      if (snapshot == nullptr) {
+        return true;
+      }
+      dest_buffer = snapshot->resource.Get();
+      dest_offset = 0;
     }
-
-    uint32_t scale_x = texture_cache_->draw_resolution_scale_x();
-    uint32_t scale_y = texture_cache_->draw_resolution_scale_y();
-
-    assert_true(scale_x >= 1 &&
-                scale_x <= TextureCache::kMaxDrawResolutionScaleAlongAxis);
-    assert_true(scale_y >= 1 &&
-                scale_y <= TextureCache::kMaxDrawResolutionScaleAlongAxis);
-    assert_true(scale_x > 1 || scale_y > 1);
-    assert_true(bits_per_pixel == 8 || bits_per_pixel == 16 ||
-                bits_per_pixel == 32 || bits_per_pixel == 64);
 
     // Ensure intermediate buffer for GPU downscaling is large enough
-    uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length);
+    uint32_t downscale_buffer_size = AlignReadbackBufferSize(readback_length);
     if (downscale_buffer_size > resolve_downscale_buffer_size_) {
       const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
       ID3D12Device* device = provider.GetDevice();
@@ -3413,23 +3537,25 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
     ID3D12Device* device = provider.GetDevice();
 
-    // Create SRV for source (scaled resolve buffer)
+    // Create SRV for source (the written extent within the scaled resolve
+    // buffer). The shader reads from the start of the bound range, so
+    // source_offset_bytes stays 0.
     uint64_t source_offset =
-        scaled_address - (uint64_t(resolve_buffer_index) << 30);
-    uint32_t aligned_scaled_length =
-        (scaled_length + (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
-        ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
+        scaled_start - (uint64_t(resolve_buffer_index) << 30);
+    uint32_t aligned_source_length = (uint32_t(scaled_readback_length) +
+                                      (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
+                                     ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
     ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
-                                        resolve_buffer, aligned_scaled_length,
+                                        resolve_buffer, aligned_source_length,
                                         source_offset);
 
     // Create UAV for destination (downscale buffer)
-    uint32_t aligned_written_length =
-        (written_length + (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
+    uint32_t aligned_readback_length =
+        (readback_length + (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
         ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
     ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
                                         resolve_downscale_buffer_.Get(),
-                                        aligned_written_length, 0);
+                                        aligned_readback_length, 0);
 
     // Transition source to SRV state
     PushUAVBarrier(resolve_buffer);
@@ -3438,7 +3564,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     SubmitBarriers();
 
     PushDebugMarker("Resolve Downscale: 0x%08X, %u bytes -> %u bytes",
-                    written_address, scaled_length, written_length);
+                    written_address, uint32_t(scaled_readback_length),
+                    readback_length);
 
     // Set up compute shader
     SetExternalPipeline(resolve_downscale_pipeline_.Get());
@@ -3474,23 +3601,34 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     // Dispatch compute shader - one thread group per 32x32 tile
     deferred_command_list_.D3DDispatch(tile_count, 1, 1);
 
-    // Transition the downscale buffer to copy source and the guest RAM buffer
-    // to copy dest.
+    // Transition the downscale buffer to copy source and the destination to
+    // copy dest.
     PushUAVBarrier(resolve_downscale_buffer_.Get());
     PushTransitionBarrier(resolve_downscale_buffer_.Get(),
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (zero_copy) {
+    if (to_hold_snapshot) {
+      PushTransitionBarrier(dest_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+    } else if (zero_copy) {
       shared_memory_->UseAsCopyDestination();
     } else {
       shared_memory_->UseHostAsCopyDestination();
     }
     SubmitBarriers();
 
-    // Copy the downscaled data into guest RAM.
+    // Copy the downscaled data into the destination.
     deferred_command_list_.D3DCopyBufferRegion(dest_buffer, dest_offset,
                                                resolve_downscale_buffer_.Get(),
-                                               0, written_length);
+                                               0, readback_length);
+
+    if (to_hold_snapshot) {
+      // Back to copy source, which is how a release finds it.
+      PushTransitionBarrier(dest_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+      // Only now that the snapshot holds the data is the hold real.
+      HoldResolveOutput(written_address, readback_length, true);
+    }
 
     // Transition downscale buffer back to UAV for next use
     PushTransitionBarrier(resolve_downscale_buffer_.Get(),
@@ -3951,7 +4089,9 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
 void D3D12CommandProcessor::UpdateFixedFunctionState(
     const draw_util::ViewportInfo& viewport_info,
     const draw_util::Scissor& scissor, bool primitive_polygonal,
-    reg::RB_DEPTHCONTROL normalized_depth_control) {
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask,
+    uint32_t bound_depth_and_color_render_target_bits) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3985,6 +4125,51 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
         regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
         regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
     };
+    if (!GetD3D12Provider().IsAlphaBlendFactorSupported()) {
+      bool color_uses_constant_color = false;
+      bool color_uses_constant_alpha = false;
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        // Ignore unbound targets and targets that don't write RGB, since their
+        // color blend factors don't affect the host output merger.
+        if (!(bound_depth_and_color_render_target_bits &
+              (uint32_t(1) << (1 + i))) ||
+            !((normalized_color_mask >> (i * 4)) & 0b0111)) {
+          continue;
+        }
+        auto blend_control = regs.Get<reg::RB_BLENDCONTROL>(
+            reg::RB_BLENDCONTROL::rt_register_indices[i]);
+        // Direct3D 12 ignores blend factors for MIN and MAX.
+        if (blend_control.color_comb_fcn == xenos::BlendOp::kMin ||
+            blend_control.color_comb_fcn == xenos::BlendOp::kMax) {
+          continue;
+        }
+        const xenos::BlendFactor color_blend_factors[] = {
+            blend_control.color_srcblend, blend_control.color_destblend};
+        for (xenos::BlendFactor color_blend_factor : color_blend_factors) {
+          switch (color_blend_factor) {
+            case xenos::BlendFactor::kConstantColor:
+            case xenos::BlendFactor::kOneMinusConstantColor:
+              color_uses_constant_color = true;
+              break;
+            case xenos::BlendFactor::kConstantAlpha:
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              color_uses_constant_alpha = true;
+              break;
+            default:
+              break;
+          }
+        }
+      }
+      // Legacy D3D12 has only a four-component constant-color factor. If the
+      // draw needs only the scalar constant-alpha factor, emulate it by
+      // replicating A. Mixed constant-color and constant-alpha use can't be
+      // represented exactly, so preserve the color factor in that case.
+      if (color_uses_constant_alpha && !color_uses_constant_color) {
+        blend_factor[0] = blend_factor[3];
+        blend_factor[1] = blend_factor[3];
+        blend_factor[2] = blend_factor[3];
+      }
+    }
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
     ff_blend_factor_update_needed_ |=
@@ -4034,8 +4219,10 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
 
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Resolution scale of this draw.
+  // 1x1 with draw_resolution_scale_threshold (RTV only)
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   // Fill the SPIR-V system constants, mirroring
   // VulkanCommandProcessor::UpdateSystemConstantValues (the shared
@@ -4482,14 +4669,17 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
   // layout. Memexport-routed draws pick the host buffer's equivalent pairs.
   SystemBindlessView shared_memory_view;
   if (route_to_host) {
+    // A memexport draw also reads its vertices through the t0 SRV, so bind the
+    // host buffer as both SRV and UAV.
     shared_memory_view =
         memexport_used
-            ? SystemBindlessView::kNullRawSRVAndSharedMemoryHostRawUAVStart
+            ? SystemBindlessView::kSharedMemoryHostRawSRVAndHostRawUAVStart
             : SystemBindlessView::kSharedMemoryHostRawSRVAndNullRawUAVStart;
   } else {
+    // Same as the host path. Bind the device buffer as both SRV and UAV.
     shared_memory_view =
         memexport_used
-            ? SystemBindlessView::kNullRawSRVAndSharedMemoryRawUAVStart
+            ? SystemBindlessView::kSharedMemoryRawSRVAndRawUAVStart
             : SystemBindlessView::kSharedMemoryRawSRVAndNullRawUAVStart;
   }
   D3D12_GPU_DESCRIPTOR_HANDLE shared_memory_handle =
@@ -4832,6 +5022,7 @@ bool D3D12CommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   resolve.submission = GetCurrentSubmission();
   resolve.query_index = zpd_active_query_index_;
   resolve.query_generation = zpd_active_query_generation_;
+  resolve.scale_area = GetZPDScaleArea();
   resolve.uses_rov_counter = zpd_active_query_is_rov_;
   resolve.report_handle = report_handle;
   zpd_resolves_in_flight_.push_back(resolve);
@@ -4894,7 +5085,8 @@ void D3D12CommandProcessor::PumpQueryResolves() {
           resolve.query_index, resolve.uses_rov_counter);
       zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index,
                                               resolve.query_generation);
-      OnZPDQueryResolved(resolve.report_handle, raw_samples);
+      OnZPDQueryResolved(resolve.report_handle, raw_samples,
+                         resolve.scale_area);
     } else {
       if (cvars::occlusion_query_log) {
         XELOGI(

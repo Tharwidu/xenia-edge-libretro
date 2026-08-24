@@ -14,6 +14,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
+#include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
@@ -35,6 +36,7 @@
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
+#include "xenia/cpu/backend/vrsqrte_table.h"
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
@@ -91,6 +93,8 @@ class A64HelperEmitter : public A64Emitter {
   GuestToHostThunk EmitGuestToHostThunk();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
+  void* EmitVRsqrtefpHelper(void** out_vector_entry);
+  void* EmitFrsqrteHelper();
 };
 
 A64HelperEmitter::A64HelperEmitter(A64Backend* backend,
@@ -488,10 +492,293 @@ void* A64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   return Emplace(func_info);
 }
 
+// --------------------------------------------------------------------------
+// vrsqrtefp
+// --------------------------------------------------------------------------
+// One blob with two entry points:
+//   scalar (the returned pointer): w0 = float bits in, w0 = result out
+//   vector (*out_vector_entry):    v0.4s in, v0.4s out
+//
+// The scalar entry clobbers w0-w5 and touches no vector register; the vector
+// entry adds v0-v2 and x10. Both stay inside the scratch set the register
+// allocator never hands out (x0-x18, v0-v3), so guest values in v4-v31 survive
+// without EmitGuestToHostThunk's 28-register spill.
+void* A64HelperEmitter::EmitVRsqrtefpHelper(void** out_vector_entry) {
+  using namespace Xbyak_aarch64;
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  Label interpolate_setup, slow, exp_nonzero, check_negative;
+  Label signed_inf, quiet_nan, ret_qnan, oddball, table;
+  Label lane;
+
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  L(lane);
+  // Positive normals are a straight lookup: the table holds the result for a
+  // canonical exponent, and the real exponent is a subtract on top of it.
+  ubfx(w1, w0, 23, 9);  // sign:exponent
+  sub(w1, w1, 1);
+  cmp(w1, 253);
+  b(HI, slow);
+  ubfx(w1, w0, 9, 15);
+  mov(x2, reinterpret_cast<uint64_t>(GetNormalVRsqrteTable()));
+  ldr(w2, ptr(x2, x1, LSL, 2));
+  lsr(w0, w0, 24);
+  sub(w0, w0, 63);
+  sub(w0, w2, w0, LSL, 23);
+  ret();
+
+  L(slow);
+  and_(w1, w0, 0x7FFFFF);  // mantissa
+  ubfx(w2, w0, 23, 8);     // biased exponent
+  cbnz(w2, exp_nonzero);
+  cbz(w1, signed_inf);  // +-0 -> +-inf
+  // Denormal. With NJM on it flushes to +-0 first and takes the same path.
+  ldr(w3, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
+  tbnz(w3, kA64BackendNJMOn, signed_inf);
+  eor(w3, w1, 0x400000);
+  cbz(w3, oddball);
+  tbnz(w0, 31, ret_qnan);
+  // Renormalize into the same (mantissa, biased exponent) form a normal has.
+  clz(w3, w1);
+  sub(w4, w3, 8);
+  lsl(w1, w0, w4);
+  and_(w1, w1, 0x7FFFFE);
+  mov(w4, 9);
+  sub(w2, w4, w3);
+  b(interpolate_setup);
+
+  L(exp_nonzero);
+  cmp(w2, 255);
+  b(NE, check_negative);
+  cbnz(w1, quiet_nan);     // NaN -> quiet it, keeping sign and payload
+  tbnz(w0, 31, ret_qnan);  // -inf -> QNaN
+  mov(w0, 0);              // +inf -> +0
+  ret();
+
+  L(check_negative);
+  tbnz(w0, 31, ret_qnan);
+  // Positive normals took the fast path above, so nothing reaches the fall
+  // through; it computes the same result they would.
+
+  L(interpolate_setup);
+  // w1 = mantissa, w2 = biased exponent (<= 0 once renormalized)
+  ubfx(w4, w1, 19, 4);
+  and_(w5, w2, 1);
+  mov(w3, 127);
+  sub(w3, w3, w2);
+  asr(w3, w3, 1);
+  ubfx(w2, w1, 9, 10);
+  orr(w1, w4, w5, LSL, 4);
+
+  // w1 = coefficient index, w2 = interpolation factor, w3 = exponent term.
+  adr(x4, table);
+  ldr(w4, ptr(x4, x1, LSL, 2));
+  lsr(w5, w4, 16);  // slope
+  mul(w2, w2, w5);
+  lsl(w4, w4, 10);
+  and_(w4, w4, 0x3FFFC00);  // base
+  sub(w4, w4, w2);
+  // The interpolated estimate is always within [2^24, 2^26), so normalizing it
+  // is a one-bit shift and needs no leading zero count.
+  tst(w4, 0x2000000);
+  lsl(w5, w4, 1);
+  csel(w4, w4, w5, NE);
+  sub(w3, w3, 1);
+  cinc(w3, w3, NE);
+  // Round up by 4 when bit 1 and either bit 0 or bit 2 is set.
+  orr(w5, w4, w4, LSR, 2);
+  and_(w5, w5, w4, LSR, 1);
+  and_(w5, w5, 1);
+  add(w4, w4, w5, LSL, 2);
+  // Every input reaching here yields a biased exponent of 63..201 and a clear
+  // sign, so the result can never be denormal and needs no flush.
+  lsl(w3, w3, 23);
+  mov(w5, 0x3F800000);
+  add(w3, w3, w5);
+  ubfx(w4, w4, 2, 23);
+  orr(w0, w3, w4);
+  ret();
+
+  L(signed_inf);
+  and_(w0, w0, 0x80000000);
+  orr(w0, w0, 0x7F800000);
+  ret();
+
+  L(quiet_nan);
+  orr(w0, w0, 0x400000);
+  ret();
+
+  L(oddball);
+  tbnz(w0, 31, ret_qnan);
+  mov(w0, 0x5F34FD00);
+  ret();
+
+  L(ret_qnan);
+  mov(w0, 0x7FC00000);
+  ret();
+
+  const size_t vector_entry_offset = getSize();
+  // bl reaches the lane routine because both live in this one blob; the code
+  // cache is far larger than its +-128 MiB range.
+  mov(x10, x30);
+  mov(VReg(1).b16, VReg(0).b16);
+  for (uint32_t element = 0; element < 4; ++element) {
+    umov(w0, VReg(1).s4[element]);
+    bl(lane);
+    ins(VReg(2).s4[element], w0);
+  }
+  mov(VReg(0).b16, VReg(2).b16);
+  mov(x30, x10);
+  ret();
+
+  L(table);
+  static constexpr uint32_t kCoefficients[32] = {
+      0x0568B4FD, 0x04F3AF97, 0x048DAAA5, 0x0435A618, 0x03E7A1E4, 0x03A29DFE,
+      0x03659A5C, 0x032E96F8, 0x02FC93CA, 0x02D090CE, 0x02A88DFE, 0x02838B57,
+      0x026188D4, 0x02438673, 0x02268431, 0x020B820B, 0x03D27FFA, 0x03807C29,
+      0x033878AA, 0x02F97572, 0x02C27279, 0x02926FB7, 0x02666D26, 0x023F6AC0,
+      0x021D6881, 0x01FD6665, 0x01E16468, 0x01C76287, 0x01AF60C1, 0x01995F12,
+      0x01855D79, 0x01735BF4,
+  };
+  for (uint32_t coefficient : kCoefficients) {
+    dd(coefficient);
+  }
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  void* fn = Emplace(func_info);
+  *out_vector_entry = static_cast<uint8_t*>(fn) + vector_entry_offset;
+  return fn;
+}
+
+// --------------------------------------------------------------------------
+// frsqrte
+// --------------------------------------------------------------------------
+// x0 = double bits in, x0 = result out. Clobbers x0-x5 and no vector register,
+// so it needs no guest->host thunk.
+void* A64HelperEmitter::EmitFrsqrteHelper() {
+  using namespace Xbyak_aarch64;
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  Label exp_nonmax, check_negative, compute;
+  Label signed_inf, quiet_nan, ret_qnan, table;
+
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  ubfx(x1, x0, 52, 11);              // biased exponent
+  and_(x2, x0, 0xFFFFFFFFFFFFFULL);  // mantissa
+  cmp(x1, 0x7FF);
+  b(NE, exp_nonmax);
+  cbnz(x2, quiet_nan);     // NaN -> quiet it, keeping sign and payload
+  tbnz(x0, 63, ret_qnan);  // -inf -> QNaN
+  mov(x0, 0);              // +inf -> +0
+  ret();
+
+  L(exp_nonmax);
+  cbnz(x1, check_negative);
+  cbz(x2, signed_inf);  // +-0 -> +-inf
+  // Denormal. Non-IEEE mode flushes it to +-0 and takes the same path.
+  ldr(w3, ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, flags))));
+  tbnz(w3, kA64BackendNonIEEEMode, signed_inf);
+  tbnz(x0, 63, ret_qnan);
+  // Renormalize; the implicit 1 lands at bit 52 and the index masks it off.
+  clz(x3, x2);
+  sub(x4, x3, 11);
+  lsl(x2, x2, x4);
+  mov(w4, 12);
+  sub(w1, w4, w3);
+  b(compute);
+
+  L(check_negative);
+  tbnz(x0, 63, ret_qnan);
+
+  L(compute);
+  // index = (((exponent & 1) << 3) | (mantissa >> 49)) ^ 8
+  ubfx(x4, x2, 49, 3);
+  and_(w5, w1, 1);
+  orr(w4, w4, w5, LSL, 3);
+  eor(w4, w4, 8);
+  adr(x5, table);
+  ldrb(w4, ptr(x5, x4));
+  // result exponent = 1022 - ((exponent - 1023) >> 1)
+  sub(w1, w1, 1023);
+  asr(w1, w1, 1);
+  mov(w5, 1022);
+  sub(w1, w5, w1);
+  lsl(x1, x1, 52);
+  lsl(x4, x4, 44);
+  orr(x0, x1, x4);
+  ret();
+
+  L(signed_inf);
+  and_(x0, x0, 0x8000000000000000ULL);
+  orr(x0, x0, 0x7FF0000000000000ULL);
+  ret();
+
+  L(quiet_nan);
+  orr(x0, x0, 1ULL << 51);
+  ret();
+
+  L(ret_qnan);
+  mov(x0, 0x7FF8000000000000ULL);
+  ret();
+
+  L(table);
+  static constexpr uint8_t kEstimates[16] = {
+      241, 216, 192, 168, 152, 136, 128, 112, 96, 76, 60, 48, 32, 24, 16, 8};
+  for (uint32_t word = 0; word < 4; ++word) {
+    dd(kEstimates[word * 4] | (kEstimates[word * 4 + 1] << 8) |
+       (kEstimates[word * 4 + 2] << 16) | (kEstimates[word * 4 + 3] << 24));
+  }
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  return Emplace(func_info);
+}
+
 // ==========================================================================
-// Reservation helpers — implement PPC lwarx/stwcx semantics with a global
-// per-cache-line bitmap so cross-thread stores invalidate other threads'
-// reservations (data-based CAS alone is ABA-vulnerable).
+// Reservation helpers. A global per-granule generation counter so
+// cross-thread stores invalidate other threads' reservations. A CAS on the
+// value alone would be ABA-vulnerable.
 // ==========================================================================
 namespace {
 
@@ -500,46 +787,33 @@ A64BackendContext* BackendContextFromRawContext(void* raw_context) {
       reinterpret_cast<uint8_t*>(raw_context) - sizeof(A64BackendContext));
 }
 
-void ReserveOffsetAndBit(ReserveHelper* reserve_helper, uint32_t guest_address,
-                         volatile uint64_t*& out_block, uint32_t& out_bit) {
-  const uint32_t block_idx = guest_address >> A64_RESERVE_BLOCK_SHIFT;
-  out_block = &reserve_helper->blocks[block_idx >> 6];
-  out_bit = block_idx & 63;
+std::atomic<uint32_t>& ReserveGranule(ReserveHelper* reserve_helper,
+                                      uint32_t guest_address) {
+  const uint32_t granule = guest_address >> A64_RESERVE_GRANULE_SHIFT;
+  return reserve_helper->generations[granule & A64_RESERVE_ENTRY_MASK];
 }
 
-extern "C" uint64_t TryAcquireReservationHelper(void* raw_context,
-                                                uint64_t guest_address) {
+uint64_t TryAcquireReservationHelper(void* raw_context,
+                                     uint64_t guest_address) {
   auto* bctx = BackendContextFromRawContext(raw_context);
-  const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
-  // PPC lwarx implicitly drops any prior reservation.
-  bctx->flags &= ~reserve_flag;
+  auto& granule =
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
+  // snapshot the generation first, the acquire pins the value read after
+  bctx->reserve_generation = granule.load(std::memory_order_acquire);
+  bctx->reserve_address = uint32_t(guest_address);
+  // lwarx replaces any reservation this thread already held
+  bctx->flags |= 1u << kA64BackendHasReserveBit;
+  return 1;
+}
 
-  volatile uint64_t* block;
-  uint32_t bit;
-  ReserveOffsetAndBit(bctx->reserve_helper_, uint32_t(guest_address), block,
-                      bit);
-  const uint64_t mask = uint64_t(1) << bit;
-
-  bool acquired = false;
-  while (true) {
-    const uint64_t old = *block;
-    if (old & mask) {
-      // Another thread already holds the reservation.
-      break;
-    }
-    if (xe::atomic_cas(old, old | mask,
-                       reinterpret_cast<volatile uint64_t*>(block))) {
-      acquired = true;
-      break;
-    }
-  }
-
-  bctx->cached_reserve_offset = reinterpret_cast<uintptr_t>(block);
-  bctx->cached_reserve_bit = bit;
-  if (acquired) {
-    bctx->flags |= reserve_flag;
-  }
-  return acquired ? 1 : 0;
+template <typename T>
+T ReservedLoadImpl(ppc::PPCContext* context, uint32_t address) {
+  T* host_address = context->TranslateVirtual<T*>(address);
+  TryAcquireReservationHelper(context, address);
+  auto* bctx = BackendContextFromRawContext(context);
+  const T raw = *host_address;
+  bctx->cached_reserve_value_ = static_cast<uint64_t>(raw);
+  return xe::byte_swap(raw);
 }
 
 template <typename T>
@@ -548,20 +822,17 @@ uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
   auto* bctx = BackendContextFromRawContext(raw_context);
   const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
   const bool had_reservation = (bctx->flags & reserve_flag) != 0;
-  // PPC stwcx. unconditionally clears the reservation.
+  // stwcx. always clears the reservation, stored or not
   bctx->flags &= ~reserve_flag;
-  if (!had_reservation) {
+  // the reservation must be for the address we're storing to
+  if (!had_reservation || bctx->reserve_address != uint32_t(guest_address)) {
     return 0;
   }
 
-  volatile uint64_t* block;
-  uint32_t bit;
-  ReserveOffsetAndBit(bctx->reserve_helper_, uint32_t(guest_address), block,
-                      bit);
-  // Sanity: the cached offset/bit from the matching lwarx must match.
-  if (bctx->cached_reserve_offset != reinterpret_cast<uintptr_t>(block) ||
-      bctx->cached_reserve_bit != bit) {
-    assert_always();
+  auto& granule =
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
+  // a store to this granule since our lwarx kills the reservation
+  if (granule.load(std::memory_order_acquire) != bctx->reserve_generation) {
     return 0;
   }
 
@@ -576,41 +847,42 @@ uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
         reinterpret_cast<volatile uint32_t*>(uintptr_t(host_address)));
   }
 
-  // Clear our reservation bit even if exchange failed — PPC stwcx. always
-  // releases. If it's already clear (another thread invalidated us), the
-  // exchange will have failed and we'll return 0.
-  const uint64_t mask = uint64_t(1) << bit;
-  while (true) {
-    const uint64_t old = *block;
-    if ((old & mask) == 0) {
-      break;
-    }
-    if (xe::atomic_cas(old, old & ~mask,
-                       reinterpret_cast<volatile uint64_t*>(block))) {
-      break;
-    }
+  if (exchange_ok) {
+    // the store landed, so kill other reservations on this granule
+    granule.fetch_add(1, std::memory_order_release);
   }
-
   return exchange_ok ? 1 : 0;
 }
 
-extern "C" uint64_t ReservedStore32Helper(void* raw_context,
-                                          uint64_t guest_address,
-                                          uint64_t host_address,
-                                          uint64_t value) {
-  return ReservedStoreImpl<uint32_t>(raw_context, guest_address, host_address,
-                                     value);
-}
-
-extern "C" uint64_t ReservedStore64Helper(void* raw_context,
-                                          uint64_t guest_address,
-                                          uint64_t host_address,
-                                          uint64_t value) {
-  return ReservedStoreImpl<uint64_t>(raw_context, guest_address, host_address,
-                                     value);
-}
-
 }  // namespace
+
+uint32_t A64Backend::ReservedLoad32(ppc::PPCContext* context,
+                                    uint32_t address) {
+  return ReservedLoadImpl<uint32_t>(context, address);
+}
+
+uint64_t A64Backend::ReservedLoad64(ppc::PPCContext* context,
+                                    uint32_t address) {
+  return ReservedLoadImpl<uint64_t>(context, address);
+}
+
+bool A64Backend::ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                                 uint32_t value) {
+  return ReservedStoreImpl<uint32_t>(
+             context, address,
+             reinterpret_cast<uint64_t>(
+                 context->TranslateVirtual<uint32_t*>(address)),
+             xe::byte_swap(value)) != 0;
+}
+
+bool A64Backend::ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                                 uint64_t value) {
+  return ReservedStoreImpl<uint64_t>(
+             context, address,
+             reinterpret_cast<uint64_t>(
+                 context->TranslateVirtual<uint64_t*>(address)),
+             xe::byte_swap(value)) != 0;
+}
 
 // ==========================================================================
 // ResolveFunction — runtime function resolution.
@@ -817,11 +1089,9 @@ bool A64Backend::Initialize(Processor* processor) {
         thunk_emitter.EmitGuestAndHostSynchronizeStackHelper();
   }
 
-  // Wire up reservation helpers used by RESERVED_LOAD/STORE codegen.
-  try_acquire_reservation_helper_ =
-      reinterpret_cast<void*>(&TryAcquireReservationHelper);
-  reserved_store_32_helper = reinterpret_cast<void*>(&ReservedStore32Helper);
-  reserved_store_64_helper = reinterpret_cast<void*>(&ReservedStore64Helper);
+  vrsqrtefp_scalar_helper_ =
+      thunk_emitter.EmitVRsqrtefpHelper(&vrsqrtefp_vector_helper_);
+  frsqrte_helper_ = thunk_emitter.EmitFrsqrteHelper();
 
   // Set the indirection table default to point at the resolve thunk.
   // Use 64-bit encoding: the resolve thunk address is encoded as a rel32
@@ -906,6 +1176,11 @@ void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
   breakpoint->backend_data().clear();
 }
 
+// The backend context is carved out of the allocation granule immediately
+// before the guest context, so it has to stay inside one page.
+static_assert(sizeof(A64BackendContext) < 4096,
+              "A64BackendContext must fit in the granule before the context");
+
 void A64Backend::InitializeBackendContext(void* ctx) {
   auto* a64_ctx = BackendContextForGuestContext(ctx);
   std::memset(a64_ctx, 0, sizeof(A64BackendContext));
@@ -913,8 +1188,48 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   a64_ctx->Ox1000 = 0x1000;
   a64_ctx->fpcr_fpu = DEFAULT_FPU_FPCR;
   a64_ctx->fpcr_vmx = DEFAULT_VMX_FPCR;
+  a64_ctx->fpcr_vmx_daz = DEFAULT_VMX_FPCR;   // never follows NJM
   a64_ctx->flags = (1U << kA64BackendNJMOn);  // NJM on by default
   a64_ctx->guest_tick_count = Clock::GetGuestTickCountPointer();
+
+  auto set_est = [&](int index, float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (int lane = 0; lane < 4; lane++) {
+      a64_ctx->est_consts[index][lane] = bits;
+    }
+  };
+  auto set_est_bits = [&](int index, uint32_t bits) {
+    for (int lane = 0; lane < 4; lane++) {
+      a64_ctx->est_consts[index][lane] = bits;
+    }
+  };
+  // 2^f on [0,1), max relative error 7.7e-08.
+  set_est(kEstExp2Poly + 0, 0.9999999266823865f);
+  set_est(kEstExp2Poly + 1, 0.6931530239113992f);
+  set_est(kEstExp2Poly + 2, 0.24015381838022493f);
+  set_est(kEstExp2Poly + 3, 0.055826172900559086f);
+  set_est(kEstExp2Poly + 4, 0.008989127362479102f);
+  set_est(kEstExp2Poly + 5, 0.0018777841277241077f);
+  // log2(1+u) on [0,1], max absolute error 1.85e-06.
+  set_est(kEstLog2Poly + 0, 1.8456866772102942e-06f);
+  set_est(kEstLog2Poly + 1, 1.4424953159391898f);
+  set_est(kEstLog2Poly + 2, -0.7177910762015521f);
+  set_est(kEstLog2Poly + 3, 0.4565216600899004f);
+  set_est(kEstLog2Poly + 4, -0.2765407398023532f);
+  set_est(kEstLog2Poly + 5, 0.12100223739860312f);
+  set_est(kEstLog2Poly + 6, -0.025691088797142478f);
+  set_est(kEstScale, 2048.0f);
+  set_est(kEstUnscale, 1.0f / 2048.0f);
+  set_est(kEstExp2Max, 128.0f);
+  set_est(kEstExp2Min, -126.0f);
+  set_est_bits(kEstOne, 0x3F800000u);
+  set_est_bits(kEstInt127, 127u);
+  set_est_bits(kEstPosInf, 0x7F800000u);
+  set_est_bits(kEstNegInf, 0xFF800000u);
+  set_est_bits(kEstQNaN, 0x7FC00000u);
+  set_est_bits(kEstMantissaMask, 0x007FFFFFu);
+  set_est_bits(kEstQuietBit, 0x00400000u);
 
   // Allocate stackpoints for longjmp detection.
   if (cvars::a64_enable_host_guest_stack_synchronization) {
@@ -1008,6 +1323,10 @@ void A64Backend::set_trace_data_enabled(bool value) {
 bool A64Backend::trace_func_enabled() const { return GetTraceFuncEnabled(); }
 void A64Backend::set_trace_func_enabled(bool value) {
   SetTraceFuncEnabled(value);
+}
+
+std::string A64Backend::FormatSequenceKey(uint64_t key) const {
+  return a64::FormatSequenceKey(key);
 }
 
 // PPC rounding mode (3-bit) to ARM64 FPCR value.

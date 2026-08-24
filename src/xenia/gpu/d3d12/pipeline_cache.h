@@ -268,6 +268,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     kBlendFactor,
     kInvBlendFactor,
     kSrcAlphaSat,
+    kAlphaFactor,
+    kInvAlphaFactor,
   };
 
   // Update PipelineDescription::kVersion if anything is changed!
@@ -312,6 +314,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // Marks pipelines that use the spirv_to_dxil (Mesa) path so they keep
     // their own cache entries.
     uint32_t use_mesa_dxil : 1;  // 28
+    // Native draw (scale threshold), keeps slope-scale unscaled.
+    uint32_t resolution_scale_native : 1;  // 29
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -326,9 +330,10 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     inline bool operator==(const PipelineDescription& other) const;
-    // Bumped to invalidate caches: vertex/pixel_shader_modification are now the
-    // canonical SPIR-V (spirv_to_dxil) modifications, not DXBC.
-    static constexpr uint32_t kVersion = 0x20260701;
+    // Bumped to invalidate caches: vertex/pixel_shader_modification are now
+    // the canonical SPIR-V (spirv_to_dxil) modifications, not DXBC; then
+    // again for the constant-alpha blend state.
+    static constexpr uint32_t kVersion = 0x20260822;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {

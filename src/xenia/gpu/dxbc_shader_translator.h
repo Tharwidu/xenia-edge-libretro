@@ -114,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260703;
+    static constexpr uint32_t kVersion = 0x20260803;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -196,6 +196,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // match the guest exactly (avoids hardware interpolation noise). Only the
       // HLSL/DXIL backend acts on this (needs SV_Barycentrics).
       uint32_t precise_interpolation : 1;
+      // PsParamGen and the memexport dedup must act like there's no resolution
+      // scaling. Doesn't affect fetch offsets, those follow texture scale, not
+      // from the draw. This is only set when the draw is native because of a
+      // set scale threshold (RTV only).
+      uint32_t resolution_scale_native : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0)
@@ -416,6 +421,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // to turn normalized host samples back into guest integer values.
     // bits 0:3 = component_bits - 1
     // bit 4 = signed
+    // bit 5 = unsigned-biased
     // Zero means no scale.
     uint32_t texture_integer_scale_bits[32];
 
@@ -590,7 +596,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t f32_temp, uint32_t f32_temp_component, uint32_t temp_temp,
       uint32_t temp_temp_component, bool round_to_nearest_even,
       bool remap_from_0_to_0_5);
-  // Converts the 20e4 number in bits [f24_shift, f24_shift + 10) to a 32-bit
+  // Converts the 20e4 number in bits [f24_shift, f24_shift + 24) to a 32-bit
   // float. Two temporaries must be different, but one can be the same as the
   // source. The destination may be anything writable. If remap_to_0_to_0_5 is
   // true, 0...1 in float24 will be remaped to 0...0.5 in float32.
@@ -1041,6 +1047,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+
+  // Scale of the draw being translated. All position-dependent paths use
+  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
 
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.

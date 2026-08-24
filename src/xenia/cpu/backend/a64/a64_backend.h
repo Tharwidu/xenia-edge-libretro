@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 #define XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 
+#include <atomic>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -38,14 +39,23 @@ static constexpr uint32_t GUEST_TRAMPOLINE_MIN_LEN = 8;
 static constexpr uint32_t MAX_GUEST_TRAMPOLINES =
     (GUEST_TRAMPOLINE_END - GUEST_TRAMPOLINE_BASE) / GUEST_TRAMPOLINE_MIN_LEN;
 
-#define A64_RESERVE_BLOCK_SHIFT 16
-#define A64_RESERVE_NUM_ENTRIES \
-  ((1024ULL * 1024ULL * 1024ULL * 4ULL) >> A64_RESERVE_BLOCK_SHIFT)
+// Xenon reservation granule is one 128 byte cache line.
+static constexpr uint32_t A64_RESERVE_GRANULE_SHIFT = 7;
+// A generation counter per granule, hashed. stwcx. bumps its granule to kill
+// other threads' reservations. Colliding granules only cost a spurious failure.
+static constexpr uint32_t A64_RESERVE_ENTRY_BITS = 20;
+static constexpr uint32_t A64_RESERVE_ENTRY_MASK =
+    (1u << A64_RESERVE_ENTRY_BITS) - 1;
+static constexpr uint32_t A64_RESERVE_NUM_ENTRIES = A64_RESERVE_ENTRY_MASK + 1;
 
 struct ReserveHelper {
-  uint64_t blocks[A64_RESERVE_NUM_ENTRIES / 64];
+  std::atomic<uint32_t> generations[A64_RESERVE_NUM_ENTRIES];
 
-  ReserveHelper() { memset(blocks, 0, sizeof(blocks)); }
+  ReserveHelper() {
+    for (auto& generation : generations) {
+      generation.store(0, std::memory_order_relaxed);
+    }
+  }
 };
 
 struct A64BackendStackpoint {
@@ -65,7 +75,28 @@ enum : uint32_t {
 };
 
 // Located prior to the context register (x20) in memory.
+// vexptefp/vlogefp estimate constants, splatted across all four lanes. a64 has
+// no memory operands and only v0-v3 are scratch, so these live in the backend
+// context and load with a single ldr q rather than being materialized.
+enum A64EstConst {
+  kEstExp2Poly = 0,                 // 6 entries, 2^f minimax on [0,1)
+  kEstLog2Poly = kEstExp2Poly + 6,  // 7 entries, log2(1+u) minimax on [0,1]
+  kEstScale = kEstLog2Poly + 7,     // 2048.0f
+  kEstUnscale,                      // 1.0f / 2048.0f
+  kEstExp2Max,                      // 128.0f
+  kEstExp2Min,                      // -126.0f
+  kEstOne,                          // 0x3F800000
+  kEstInt127,                       // 127
+  kEstPosInf,                       // 0x7F800000
+  kEstNegInf,                       // 0xFF800000
+  kEstQNaN,                         // 0x7FC00000
+  kEstMantissaMask,                 // 0x007FFFFF
+  kEstQuietBit,                     // 0x00400000
+  kEstConstCount,
+};
+
 struct A64BackendContext {
+  alignas(16) uint32_t est_consts[kEstConstCount][4];
   // Scratch vectors for helper routines.
   // Using uint8_t[16] instead of NEON intrinsic types to avoid including
   // arm_neon.h in the header.
@@ -78,8 +109,9 @@ struct A64BackendContext {
   uint64_t cached_reserve_value_;
   uint64_t* guest_tick_count;
   A64BackendStackpoint* stackpoints;
-  uint64_t cached_reserve_offset;
-  uint32_t cached_reserve_bit;
+  // address of the live reservation, and its granule generation when taken
+  uint32_t reserve_address;
+  uint32_t reserve_generation;
   unsigned int current_stackpoint_depth;
   unsigned int pending_stackpoint_sync_depth;
   unsigned int fpcr_fpu;
@@ -88,6 +120,8 @@ struct A64BackendContext {
   // bit 1 = got reserve
   unsigned int flags;
   unsigned int Ox1000;  // constant 0x1000
+  // DEFAULT_VMX_FPCR regardless of NJM, for the ops that always flush
+  unsigned int fpcr_vmx_daz;
 };
 
 // Default FPCR for FPU mode (round to nearest, no flush to zero).
@@ -115,6 +149,9 @@ class A64Backend : public Backend {
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
   }
+  void* vrsqrtefp_scalar_helper() const { return vrsqrtefp_scalar_helper_; }
+  void* vrsqrtefp_vector_helper() const { return vrsqrtefp_vector_helper_; }
+  void* frsqrte_helper() const { return frsqrte_helper_; }
 
   bool Initialize(Processor* processor) override;
 
@@ -146,6 +183,13 @@ class A64Backend : public Backend {
   void SetGuestRoundingMode(void* ctx, unsigned int mode) override;
   bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) override;
 
+  uint32_t ReservedLoad32(ppc::PPCContext* context, uint32_t address) override;
+  uint64_t ReservedLoad64(ppc::PPCContext* context, uint32_t address) override;
+  bool ReservedStore32(ppc::PPCContext* context, uint32_t address,
+                       uint32_t value) override;
+  bool ReservedStore64(ppc::PPCContext* context, uint32_t address,
+                       uint64_t value) override;
+
   bool trace_instr_available() const override;
   bool trace_data_available() const override;
   bool trace_func_available() const override;
@@ -155,6 +199,7 @@ class A64Backend : public Backend {
   void set_trace_data_enabled(bool value) override;
   bool trace_func_enabled() const override;
   void set_trace_func_enabled(bool value) override;
+  std::string FormatSequenceKey(uint64_t key) const override;
 
   void RecordMMIOExceptionForGuestInstruction(void* host_address);
 
@@ -171,13 +216,10 @@ class A64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_ = nullptr;
   ResolveFunctionThunk resolve_function_thunk_ = nullptr;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
+  void* vrsqrtefp_scalar_helper_ = nullptr;
+  void* vrsqrtefp_vector_helper_ = nullptr;
+  void* frsqrte_helper_ = nullptr;
 
- public:
-  void* try_acquire_reservation_helper_ = nullptr;
-  void* reserved_store_32_helper = nullptr;
-  void* reserved_store_64_helper = nullptr;
-
- private:
   alignas(64) ReserveHelper reserve_helper_;
   BitMap guest_trampoline_address_bitmap_;
   uint8_t* guest_trampoline_memory_ = nullptr;

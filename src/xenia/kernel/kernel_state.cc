@@ -85,6 +85,10 @@ KernelState::~KernelState() {
 
   ShutdownDispatchThread();
 
+  // Reclaiming leftover fibers releases handles, so run this while the object
+  // table is still alive.
+  guest_scheduler_->Shutdown();
+
   executable_module_.reset();
   user_modules_.clear();
   kernel_modules_.clear();
@@ -595,6 +599,9 @@ object_ref<UserModule> KernelState::LoadUserModule(
     global_lock.unlock();
 
     // Module wasn't loaded, so load it.
+    // TODO: this read, decrypt and decompress stalls the calling fiber's
+    // dispatch thread. Offloading it needs care, it touches kernel state and
+    // guest-thread identity.
     module = object_ref<UserModule>(new UserModule(this));
     X_STATUS status = module->LoadFromFile(path);
     if (XFAILED(status)) {
@@ -840,9 +847,9 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module,
                          xe::countof(args));
   }
 
-  auto iter = std::find_if(
-      user_modules_.begin(), user_modules_.end(),
-      [&module](const auto& e) { return e->path() == module->path(); });
+  auto iter = std::ranges::find_if(user_modules_, [&module](const auto& e) {
+    return e->path() == module->path();
+  });
   assert_true(iter != user_modules_.end());  // Unloading an unregistered module
                                              // is probably really bad
   user_modules_.erase(iter);
@@ -1474,7 +1481,7 @@ void KernelState::InitializeKernelGuestGlobals() {
 
   // init unknown object
 
-  block->XboxKernelDefaultObject.type = DISPATCHER_AUTO_RESET_EVENT;
+  block->XboxKernelDefaultObject.type = EventSynchronizationObject;
   block->XboxKernelDefaultObject.signal_state = 1;
   block->XboxKernelDefaultObject.wait_list.flink_ptr =
       oddobject_offset + offsetof(X_DISPATCH_HEADER, wait_list.flink_ptr);

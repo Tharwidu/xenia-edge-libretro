@@ -234,9 +234,8 @@ dword_result_t XamContentCreateEnumeratorInternal_entry(
     }
 
     // Remove duplicates
-    enumerated_content.erase(
-        std::unique(enumerated_content.begin(), enumerated_content.end()),
-        enumerated_content.end());
+    enumerated_content.erase(std::ranges::unique(enumerated_content).begin(),
+                             enumerated_content.end());
   }
 
   if (!device_info || device_info->device_id == DummyDeviceId::ODD) {
@@ -712,8 +711,8 @@ dword_result_t XamSwapDisc_entry(
     auto kevent = xboxkrnl::xeKeSetEvent(completion_handle, 1, 0);
 
     // Release the completion handle
-    auto object =
-        XObject::GetNativeObject<XObject>(kernel_state(), completion_handle);
+    auto object = XObject::GetNativeObject<XEvent>(
+        kernel_state(), completion_handle, completion_handle->header.type);
     if (object) {
       object->Retain();
     }

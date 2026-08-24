@@ -37,29 +37,6 @@ DEFINE_bool(
     "be minimal if only a small portion of the scene is affected.",
     "GPU");
 
-DEFINE_bool(
-    resolve_check_number_format, false,
-    "Require the destination number format to match before using fast color "
-    "resolves.\n"
-    "Fast resolves copy the exact EDRAM bits. If a title resolves unsigned "
-    "color data to a signed or integer destination, enabling this forces full "
-    "resolves in the shader so the destination gets repacked instead.\n"
-    "This can fix some garbage shading stemming from format mismatches, but "
-    "it's disabled by default because it can worsen performance in some games "
-    "that realistically don't need it.",
-    "GPU");
-
-DEFINE_bool(
-    gamma_decode_pwl_resolve, true,
-    "During 8_8_8_8_GAMMA MSAA color resolves, average the samples in linear "
-    "space instead of averaging the encoded PWL gamma values directly.\n"
-    "This is separate from gamma_render_target_as_unorm16. It only applies "
-    "when a full shader resolve reads an 8_8_8_8_GAMMA EDRAM color source. "
-    "Compatible 8_8_8_8 destinations are written back as PWL gamma.\n"
-    "Leave enabled for games that otherwise look overexposed after gamma "
-    "MSAA resolves. Disable only if it causes a title-specific regression.",
-    "GPU");
-
 namespace xe {
 namespace gpu {
 namespace draw_util {
@@ -899,12 +876,15 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
     }
     uint32_t stream_size_bytes =
         stream.index_count * (format_info.bits_per_pixel >> 3);
+    // Mask to physical like the shader - the guest may use a mirror window.
+    uint32_t stream_base_address_dwords =
+        xenos::CpuToGpu(uint32_t(stream.base_address) << 2) >> 2;
     // Try to reduce the number of shared memory operations when writing
     // different elements into the same buffer through different exports
     // (happens in 4D5307E6).
     bool range_reused = false;
     for (MemExportRange& range : ranges_out) {
-      if (range.base_address_dwords == stream.base_address) {
+      if (range.base_address_dwords == stream_base_address_dwords) {
         range.size_bytes = std::max(range.size_bytes, stream_size_bytes);
         range_reused = true;
         break;
@@ -912,7 +892,7 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
     }
     // Add a new range if haven't expanded an existing one.
     if (!range_reused) {
-      ranges_out.emplace_back(uint32_t(stream.base_address), stream_size_bytes);
+      ranges_out.emplace_back(stream_base_address_dwords, stream_size_bytes);
     }
   }
 }
@@ -1353,8 +1333,7 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
-    color_edram_info.decode_pwl_gamma =
-        cvars::gamma_decode_pwl_resolve ? 1u : 0u;
+    color_edram_info.decode_pwl_gamma = 1;
     if ((fixed_rg16_truncated_to_minus_1_to_1 &&
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
         (fixed_rgba16_truncated_to_minus_1_to_1 &&
@@ -1433,17 +1412,22 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
   ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
   bool source_is_64bpp = !is_depth && color_edram_info.format_is_64bpp != 0;
   // Fast color resolve is a raw copy. If copy_dest_number asks for a different
-  // fixed interpretation, full resolve has to do the repack.
-  if (is_depth || (!copy_dest_info.copy_dest_exp_bias &&
-                   xenos::IsSingleCopySampleSelected(
-                       copy_dest_coordinate_info.copy_sample_select) &&
-                   xenos::IsColorResolveFormatBitwiseEquivalent(
-                       xenos::ColorRenderTargetFormat(color_edram_info.format),
-                       xenos::ColorFormat(copy_dest_info.copy_dest_format)) &&
-                   (!cvars::resolve_check_number_format ||
-                    ColorResolveNumberFormatMatches(
-                        xenos::ColorFormat(copy_dest_info.copy_dest_format),
-                        copy_dest_info.copy_dest_number)))) {
+  // target that'd be decoded to linear by a real hardware resolve, it needs the
+  // full shader conversion. Any title keeping the encoding will re-alias as
+  // 8_8_8_8 before resolving, so any gamma source is always being decoded.
+  bool gamma_decoded_source =
+      !is_depth && xenos::ColorRenderTargetFormat(color_edram_info.format) ==
+                       xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
+  if (is_depth ||
+      (!gamma_decoded_source && !copy_dest_info.copy_dest_exp_bias &&
+       xenos::IsSingleCopySampleSelected(
+           copy_dest_coordinate_info.copy_sample_select) &&
+       xenos::IsColorResolveFormatBitwiseEquivalent(
+           xenos::ColorRenderTargetFormat(color_edram_info.format),
+           xenos::ColorFormat(copy_dest_info.copy_dest_format)) &&
+       ColorResolveNumberFormatMatches(
+           xenos::ColorFormat(copy_dest_info.copy_dest_format),
+           copy_dest_info.copy_dest_number))) {
     if (edram_info.msaa_samples >= xenos::MsaaSamples::k4X) {
       shader = source_is_64bpp ? ResolveCopyShaderIndex::kFast64bpp4xMSAA
                                : ResolveCopyShaderIndex::kFast32bpp4xMSAA;
@@ -1501,6 +1485,15 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
   }
 
   return shader;
+}
+
+uint32_t GetResolveDownscalePixelSizeLog2(
+    reg::RB_COPY_DEST_INFO copy_dest_info) {
+  // copy_dest_format holds a xenos::TextureFormat normalized by GetResolveInfo,
+  // and this is the same size derivation it used for the destination extent.
+  const FormatInfo& dest_format_info = *FormatInfo::Get(
+      xenos::TextureFormat(uint32_t(copy_dest_info.copy_dest_format)));
+  return xe::log2_floor(dest_format_info.bits_per_pixel >> 3);
 }
 
 }  // namespace draw_util

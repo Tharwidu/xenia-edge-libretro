@@ -12,9 +12,6 @@
 #include "xenia/emulator.h"
 
 #include <algorithm>
-#if XE_PLATFORM_LINUX
-#include <fstream>
-#endif
 #include "config.h"
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/apu/audio_system.h"
@@ -102,14 +99,36 @@ DEFINE_bool(allow_game_relative_writes, false,
             "generating test data to compare with original hardware. ",
             "General");
 
-DECLARE_string(gpu);
-DECLARE_string(apu);
+// SetupSubsystems and MountStandardDrives read these, so they live with the
+// Emulator rather than in xenia_main.cc - the trace dumps, trace viewers and
+// demos all host an Emulator without linking the app.
+#if XE_PLATFORM_WIN32
+#define APU_OPTIONS "[xaudio2, sdl, nop]"
+#define GPU_OPTIONS "[d3d12, vulkan, null]"
+DEFINE_string(apu, "xaudio2", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(gpu, "d3d12", "Graphics system. Use: " GPU_OPTIONS, "GPU");
+#elif XE_PLATFORM_MAC
+#define APU_OPTIONS "[sdl, nop]"
+#define GPU_OPTIONS "[metal, vulkan, null]"
+DEFINE_string(apu, "sdl", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(gpu, "metal", "Graphics system. Use: " GPU_OPTIONS, "GPU");
+#else
+#define APU_OPTIONS "[sdl, nop]"
+#define GPU_OPTIONS "[vulkan, null]"
+DEFINE_string(apu, "sdl", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(gpu, "vulkan", "Graphics system. Use: " GPU_OPTIONS, "GPU");
+#endif
 
 DECLARE_bool(allow_plugins);
 
-DECLARE_bool(mount_scratch);
-DECLARE_bool(mount_cache);
-DECLARE_bool(mount_memory_unit);
+DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
+
+DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
+UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
+
+DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
+            "Storage");
+
 DECLARE_bool(force_mount_devkit);
 
 DEFINE_int32(priority_class, 0,
@@ -117,6 +136,8 @@ DEFINE_int32(priority_class, 0,
              "It might affect performance and cause unexpected bugs. Possible "
              "values: 0 - Normal, 1 - Above normal, 2 - High",
              "General");
+
+DECLARE_int32(console_type);
 
 namespace xe {
 using namespace xe::literals;
@@ -279,31 +300,6 @@ X_STATUS Emulator::Setup(
   // logical processors.
   xe::threading::EnableAffinityConfiguration();
 
-#if XE_PLATFORM_LINUX
-  // Check if /dev/shm is mounted with noexec. The code cache uses shm_open
-  // with PROT_EXEC, which will fail with EPERM on noexec tmpfs mounts.
-  {
-    std::ifstream mounts("/proc/mounts");
-    std::string line;
-    while (std::getline(mounts, line)) {
-      if (line.find("/dev/shm") != std::string::npos &&
-          line.find("noexec") != std::string::npos) {
-        XELOGE(
-            "/dev/shm is mounted with noexec, which prevents the code cache "
-            "from allocating executable memory. Please remount it with: "
-            "sudo mount -o remount,exec /dev/shm");
-        xe::ShowSimpleMessageBox(
-            xe::SimpleMessageBoxType::Error,
-            "/dev/shm is mounted with noexec, which prevents Xenia from "
-            "allocating executable memory for the code cache.\n\n"
-            "Please remount it with:\n"
-            "  sudo mount -o remount,exec /dev/shm");
-        return X_STATUS_UNSUCCESSFUL;
-      }
-    }
-  }
-#endif
-
   XELOGI("{}: Initializing Memory...", __func__);
   // Create memory system first, as it is required for other systems.
   memory_ = std::make_unique<Memory>();
@@ -388,7 +384,11 @@ X_STATUS Emulator::Setup(
   // HLE kernel modules.
   LOAD_KERNEL_MODULE(xboxkrnl::XboxkrnlModule);
   LOAD_KERNEL_MODULE(xam::XamModule);
-  LOAD_KERNEL_MODULE(xbdm::XbdmModule);
+
+  // 415608C3 anti-cheat checks if XDBM is loaded.
+  if (cvars::console_type >= 0) {
+    LOAD_KERNEL_MODULE(xbdm::XbdmModule);
+  }
 #undef LOAD_KERNEL_MODULE
   plugin_loader_ = std::make_unique<xe::patcher::PluginLoader>(
       kernel_state_.get(), storage_root() / "plugins");
@@ -421,6 +421,9 @@ X_STATUS Emulator::SetupSubsystems() {
 
   if (graphics_system_) {
     XELOGI("{}: Starting graphics_system...", __func__);
+    // Presentation is requested even without a display window - the windowless
+    // presenter is what offscreen hosts like the trace dump capture guest
+    // output through.
     result = graphics_system_->Setup(
         processor_.get(), kernel_state_.get(),
         display_window_ ? &display_window_->app_context() : nullptr, true);
@@ -478,6 +481,10 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     const std::filesystem::path& path, const std::string_view mount_path) {
   // Must check if the type has changed e.g. XamSwapDisc
   switch (GetFileSignature(path)) {
+    case FileSignatureType::XEX0:
+    case FileSignatureType::XEXQ:
+    case FileSignatureType::XEXH:
+    case FileSignatureType::XEX25:
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
@@ -497,6 +504,7 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     case FileSignatureType::ZAR: {
       return std::make_unique<vfs::DiscZarchiveDevice>(mount_path, path);
     } break;
+    case FileSignatureType::XBE:
     case FileSignatureType::EXE:
     case FileSignatureType::Unknown:
     default:
@@ -596,6 +604,14 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
   fclose(file);
 
   switch (magic_value) {
+    case xe::cpu::kXEX0Signature:
+      return FileSignatureType::XEX0;
+    case xe::cpu::kXEXQSignature:
+      return FileSignatureType::XEXQ;
+    case xe::cpu::kXEXHSignature:
+      return FileSignatureType::XEXH;
+    case xe::cpu::kXEX25Signature:
+      return FileSignatureType::XEX25;
     case xe::cpu::kXEX1Signature:
       return FileSignatureType::XEX1;
     case xe::cpu::kXEX2Signature:
@@ -608,6 +624,8 @@ Emulator::FileSignatureType Emulator::GetFileSignature(
       return FileSignatureType::PIRS;
     case xe::vfs::kXSFSignature:
       return FileSignatureType::XISO;
+    case xe::cpu::kXBESignature:
+      return FileSignatureType::XBE;
     case xe::cpu::kElfSignature:
       return FileSignatureType::ELF;
     default:
@@ -655,6 +673,10 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   X_STATUS mount_result = X_STATUS_SUCCESS;
 
   switch (GetFileSignature(path)) {
+    case FileSignatureType::XEX0:
+    case FileSignatureType::XEXQ:
+    case FileSignatureType::XEXH:
+    case FileSignatureType::XEX25:
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
@@ -670,6 +692,10 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::XISO: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
       return mount_result ? mount_result : LaunchDiscImage(path);
+    } break;
+    case FileSignatureType::XBE: {
+      XELOGE("OG Xbox games are not supported");
+      return X_STATUS_NOT_SUPPORTED;
     } break;
     case FileSignatureType::ZAR: {
       mount_result = MountPath(path, "\\Device\\Cdrom0");
@@ -1325,6 +1351,10 @@ void Emulator::RelaunchTitle(const std::string& host_path,
     }
   }
 
+  // Terminate only marks fiber-backed threads. Stop the scheduler so no fiber
+  // is still executing guest code when the kernel is torn down.
+  kernel_state_->guest_scheduler()->Shutdown();
+
   Shutdown();
   Setup(nullptr, nullptr, require_cpu_backend_, nullptr, nullptr, nullptr);
   MountStandardDrives();
@@ -1626,6 +1656,9 @@ bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
   if (self) {
     self->guest_object<kernel::X_KTHREAD>()->thread_state =
         kernel::KTHREAD_STATE_TERMINATED;
+    // The crash may have landed inside a wait poll, which never unwinds, and a
+    // dead entry gates every other cooperative waiter on that object.
+    kernel::XObject::AbandonCooperativeWait(self);
     auto* scheduler = self->kernel_state()->guest_scheduler();
     scheduler->ForgetThread(self);
     while (true) {
@@ -1676,11 +1709,25 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     // loop, so if a fiber is current halt just that fiber to keep the
     // dispatcher and the other fibers alive.
     if (auto* fiber_self = kernel::XThread::GetCurrentFiberThread()) {
+      // ASLR moves the absolute PC each run, so log a stable module offset that
+      // resolves against the pdb with "ln xenia_edge+<offset>".
+      uint64_t module_base = 0;
+#if XE_PLATFORM_WIN32 == 1
+      module_base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+#endif
+      uint64_t module_offset =
+          (module_base && ex->pc() >= module_base) ? ex->pc() - module_base : 0;
+      // lr names the guest caller that entered the shim.
+      uint32_t guest_lr =
+          fiber_self->thread_state()
+              ? uint32_t(fiber_self->thread_state()->context()->lr)
+              : 0;
       XELOGE(
           "Host-side crash on fiber thread (handle 0x{:08X}, guest tid "
-          "0x{:08X}) at host PC 0x{:016X}. Halting fiber to keep the "
-          "dispatcher alive.",
-          fiber_self->handle(), fiber_self->thread_id(), ex->pc());
+          "0x{:08X}) at host PC 0x{:016X} (module+0x{:X}, guest lr 0x{:08X}). "
+          "Halting fiber to keep the dispatcher alive.",
+          fiber_self->handle(), fiber_self->thread_id(), ex->pc(),
+          module_offset, guest_lr);
       ex->set_resume_pc(reinterpret_cast<uint64_t>(&HaltCrashedFiberThunk));
       return true;
     }
@@ -1804,7 +1851,7 @@ std::string Emulator::RemountAndResolveLaunchPath(
   std::string normalized_path = launch_path;
 #if XE_PLATFORM_LINUX
   // Convert backslashes to forward slashes for consistent paths on Linux
-  std::replace(normalized_path.begin(), normalized_path.end(), '\\', '/');
+  std::ranges::replace(normalized_path, '\\', '/');
 #endif
 
   // Get the current game:\ symbolic link path
@@ -1889,6 +1936,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         });
     return result;
   }
+
+  // Per-title config has been applied by now and no guest code has been
+  // translated yet, which is the only window where this can be picked up.
+  processor_->RefreshTraceCountsEnabled();
 
   // Expose the HDD content partition. Games that resolve saves/DLC to a raw
   // \Device\Harddisk0\Partition1\Content path via XamContentResolve open it

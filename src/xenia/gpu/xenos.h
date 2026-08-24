@@ -616,6 +616,10 @@ constexpr bool IsColorResolveFormatBitwiseEquivalent(
   switch (render_target_format) {
     case ColorRenderTargetFormat::k_8_8_8_8:
     // Shaders fetch data copied from k_8_8_8_8_GAMMA with TextureSign::kGamma.
+    // Gamma sources are decoded to linear by real hardware resolve, so with the
+    // decode enabled, GetCopyShader separately excludes all raw copies. Any
+    // title that keeps the encoding to fetch it back with kGamma re-aliases the
+    // surface as k_8_8_8_8.
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
       // TODO(Triang3l): Investigate k_8_8_8_8_A.
       return color_format == ColorFormat::k_8_8_8_8 ||
@@ -1181,6 +1185,12 @@ constexpr uint32_t kTextureSubresourceAlignmentBytes =
 // Texture fetch constant size field widths.
 constexpr uint32_t kTexture1DMaxWidthLog2 = 24;
 constexpr uint32_t kTexture1DMaxWidth = 1 << kTexture1DMaxWidthLog2;
+// Emulation cap on rows materialized for wide (> 8192) 1D textures mapped to
+// 2D. Games may declare huge index-space widths (2^23 seen in the wild) with
+// only a little real data behind them - materializing the full width would
+// read far past the allocation, even past the 512 MB physical space. Must
+// match between the texture cache and the shader translators.
+constexpr uint32_t kTexture1DWideMaxRows = 64;
 constexpr uint32_t kTexture2DCubeMaxWidthHeightLog2 = 13;
 constexpr uint32_t kTexture2DCubeMaxWidthHeight =
     1 << kTexture2DCubeMaxWidthHeightLog2;
