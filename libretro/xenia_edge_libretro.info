@@ -8,7 +8,7 @@ systemname = "Microsoft Xbox 360"
 systemid = "xbox360"
 license = "BSD-3-Clause"
 permissions = ""
-display_version = "0.2.1"
+display_version = "0.3.0"
 supports_no_game = "false"
 
 # Libretro Features
