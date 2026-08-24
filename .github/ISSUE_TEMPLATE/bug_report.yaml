@@ -1,63 +1,91 @@
 name: Bug report
-description: Template for bug reports.
+description: Something wrong with the libretro core.
 labels: bug
 body:
   - id: disclaimer
     type: markdown
     attributes:
       value: |
-        **THIS IS NOT A SUPPORT FORUM!** For support, first read the wiki: https://github.com/xenia-canary/xenia-canary/wiki
-        If your question wasn't answered there or you need help, proceed to #help in the Discord server: https://discord.gg/Q9mxZf9
+        This tracker is for the **libretro core** — packaging, frontend
+        integration, core options, and anything the core itself does.
 
-        Only file issues specific to Xenia Edge. If you're using Xenia Master, Canary, Netplay, etc. file the issue on those bug trackers.
+        **Please do not take problems with this core to the Xenia project's
+        Discord, forums or issue trackers.** They did not build this and cannot
+        support it. File it here instead.
 
-        DO NOT post issues with the macOS port, it's experimental and many games don't work. Once it reaches higher compatibility it will be better supported, for now it is best effort only.
-        
-        If the issue is for a specific game, ONLY file it here if it is a regression in a particular version of Xenia Edge. This means that
-        YOU need to verify it does not occur in some earlier Xenia Edge build or works correctly in Xenia Canary or another Xenia fork.
-        If none of these apply proceed to https://github.com/xenia-canary/game-compatibility#game-compatibility and file the game-specific
-        problem there (chances are someone else already has).
+        Emulation itself — how a game runs, looks or sounds — comes from Xenia
+        Edge underneath. If the same thing happens in the standalone emulator
+        with this core out of the picture, it is not a core bug, and how a
+        specific title behaves is tracked by the community at
+        https://github.com/xenia-canary/game-compatibility
 
-        If the issue is graphical in nature screenshots or videos help. Make sure your screenshots include the title bar of the app so that the
-        build and main config options are clearly identifiable.
-        
+        Before filing, please read
+        [docs/libretro-configuration.md](https://github.com/Tharwidu/xenia-edge-libretro/blob/ra175-compat/docs/libretro-configuration.md).
+        A per-game `.opt` replacing your global options, or an option missing
+        from `retroarch-core-options.cfg` falling back to the core default,
+        accounts for a good share of "it ignored my setting".
+
   - id: validation
     type: checkboxes
     attributes:
       label: Validation
       options:
-      - label: I've read the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ).
-        required: true
-      - label: The Xenia build used is from a Xenia Edge branch. (not Canary/master/netplay/pull requests, etc)
-        required: true
-      - label: The issue is on Windows or Linux, and NOT macOS which is currently unsupported.
-        required: true
-      - label: This issue isn't for tech support (help with Xenia).
-        required: true
-      - label: If this issue occurs in a specific game, I've identified an earlier build or Xenia fork where the issue does not occur.
-        required: true
-      - label: I've checked if this issue hasn't already been reported.
-        required: true
-      - label: 'My device meets the minimum requirements: https://github.com/xenia-canary/xenia-canary/wiki/Quickstart#system-requirements'
-        required: true
-      - label: '(If building) I have read the building doc: https://github.com/xenia-canary/xenia-canary/blob/master/docs/building.md'
+        - label: This is about the libretro core, not general emulator support.
+          required: true
+        - label: I've read the configuration doc.
+          required: true
+        - label: I've checked this hasn't already been reported.
+          required: true
+
+  - id: version
+    type: input
+    attributes:
+      label: Core version
+      description: From the release zip, or the commit you built.
+      placeholder: v0.3.0
+    validations:
+      required: true
+
+  - id: frontend
+    type: input
+    attributes:
+      label: Frontend and platform
+      description: Which RetroArch build, on which OS, and whether it runs through Wine or Proton.
+      placeholder: RetroArch 1.22.2, Windows 11
+    validations:
+      required: true
+
+  - id: content
+    type: input
+    attributes:
+      label: Game and container format
+      description: Title, and whether it is an ISO, a GOD/SVOD package, XBLA/STFS or ZAR.
+      placeholder: Zuma (XBLA/STFS, launched through a .x360 pointer)
+
   - id: problem
     type: textarea
     attributes:
-      label: Describe what's going wrong
+      label: What happens
     validations:
       required: true
-  - id: what-should-happen
+
+  - id: expected
     type: textarea
     attributes:
-      label: Describe what should happen
+      label: What should happen instead
     validations:
       required: true
-  - id: callstack
-    type: textarea
-    attributes:
-      label: If applicable, provide a callstack here, especially for crashes
+
   - id: logfile
     type: textarea
     attributes:
-      label: If applicable, upload a logfile and link it here
+      label: Log
+      description: |
+        Run RetroArch with `--verbose` and attach the log. The core's own lines
+        are prefixed `[Xenia]` and are only emitted in verbose mode, so a log
+        without them cannot show what the core did.
+
+  - id: callstack
+    type: textarea
+    attributes:
+      label: Callstack, if it crashed
