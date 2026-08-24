@@ -1,0 +1,219 @@
+name: upstream-merge
+
+# Merges has207/xenia-edge into a branch once a month and opens a PR, so the
+# gap never grows to the point where the port drift is a day's work. It does
+# not merge to ra175-compat itself: the failure mode is not conflicts, it is
+# upstream moving something the libretro glue defines or calls, which needs
+# eyes. A clean merge that fails the build is the normal outcome to expect.
+
+on:
+  schedule:
+    # 07:00 UTC on the 1st. Nothing depends on the exact hour.
+    - cron: '0 7 1 * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream ref to merge
+        default: edge
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_URL: https://github.com/has207/xenia-edge.git
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'edge' }}
+  TARGET_BRANCH: ra175-compat
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    outputs:
+      status: ${{ steps.merge.outputs.status }}
+      branch: ${{ steps.merge.outputs.branch }}
+      count: ${{ steps.check.outputs.count }}
+      sha: ${{ steps.check.outputs.sha }}
+      subsystems: ${{ steps.check.outputs.subsystems }}
+      conflicts: ${{ steps.merge.outputs.conflicts }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --no-tags "$UPSTREAM_REF"
+
+      - name: How far behind are we
+        id: check
+        run: |
+          count=$(git rev-list --count HEAD..FETCH_HEAD)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          # Subsystem tallies from the [Tag] prefixes upstream uses, so the PR
+          # says what moved without anyone reading 300 subjects.
+          subsystems=$(git log --format='%s' --no-merges HEAD..FETCH_HEAD \
+            | grep -o '^\[[^]]*\]' | sort | uniq -c | sort -rn | head -12 \
+            | awk '{printf "%s %s\\n", $1, $2}')
+          {
+            echo "subsystems<<EOF"
+            printf '%b' "$subsystems"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "$count commits behind upstream/$UPSTREAM_REF"
+
+      - name: Merge
+        id: merge
+        if: steps.check.outputs.count != '0'
+        run: |
+          branch="upstream-merge/$(date -u +%Y-%m-%d)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          if git merge --no-edit FETCH_HEAD; then
+            git push origin "$branch"
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+          else
+            # Record what collided, then leave the tree alone. Resolving here
+            # would push conflict markers; a human does this locally.
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "status=conflicted" >> "$GITHUB_OUTPUT"
+          fi
+
+  # A clean merge says nothing about whether the core still builds - the last
+  # one moved five cvars out of a file this build excludes and broke the link.
+  # So build the core, and let the PR carry the answer.
+  build:
+    needs: merge
+    if: needs.merge.outputs.status == 'merged'
+    runs-on: ubuntu-24.04
+    outputs:
+      result: ${{ steps.build.outcome }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.merge.outputs.branch }}
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build clang lld libvulkan-dev liblz4-dev \
+            libasound2-dev libpulse-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxfixes-dev libxrender-dev libx11-xcb-dev \
+            libxcb1-dev libgl-dev libfontconfig-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev
+
+      - name: Download Slang shader compiler
+        run: python3 xenia-build.py slang
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DXENIA_BUILD_LIBRETRO=ON
+
+      - name: Generate version.h
+        run: >
+          python3 -c "import importlib.util as u;
+          s = u.spec_from_file_location('xb', 'xenia-build.py');
+          m = u.module_from_spec(s); s.loader.exec_module(m);
+          m.generate_version_h('build-ci')"
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: cmake --build build-ci --target xenia-libretro
+
+  report:
+    needs: [merge, build]
+    if: always() && needs.merge.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Open a PR, or an issue if it would not merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ needs.merge.outputs.status }}
+          BRANCH: ${{ needs.merge.outputs.branch }}
+          COUNT: ${{ needs.merge.outputs.count }}
+          SHA: ${{ needs.merge.outputs.sha }}
+          SUBSYSTEMS: ${{ needs.merge.outputs.subsystems }}
+          CONFLICTS: ${{ needs.merge.outputs.conflicts }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "$COUNT upstream commits since the last merge, up to \`$SHA\`."
+            echo
+            echo '```'
+            printf '%s\n' "$SUBSYSTEMS"
+            echo '```'
+            echo
+          } > body.md
+
+          if [ "$STATUS" = "conflicted" ]; then
+            {
+              echo "**The merge does not apply cleanly.** Conflicted paths:"
+              echo
+              echo '```'
+              printf '%s\n' "$CONFLICTS"
+              echo '```'
+              echo
+              echo "Nothing was pushed. Resolve locally:"
+              echo
+              echo '```sh'
+              echo "git fetch upstream && git checkout -b upstream-merge $TARGET_BRANCH"
+              echo "git merge upstream/$UPSTREAM_REF"
+              echo '```'
+            } >> body.md
+            gh issue create \
+              --title "Upstream merge needs hands ($COUNT commits, $SHA)" \
+              --body-file body.md \
+              --label upstream
+            exit 0
+          fi
+
+          if [ "$BUILD" = "success" ]; then
+            echo "The libretro core builds on this branch." >> body.md
+          else
+            {
+              echo "**The core does not build on this branch.** The merge applied"
+              echo "cleanly, so this is port drift rather than a conflict -"
+              echo "check whether upstream moved something \`libretro/\` defines"
+              echo "or calls. Duplicate cvar definitions are the usual one: a"
+              echo "cvar that moves out of a file this build excludes and into"
+              echo "one it links will collide with the core's own definition."
+            } >> body.md
+          fi
+          {
+            echo
+            echo "Before merging, beyond CI: check the core options still map to"
+            echo "cvars that exist, and run the title matrix - ISO, GOD/SVOD and"
+            echo "XBLA/STFS - against the previous build with the emulator state"
+            echo "wiped between runs."
+          } >> body.md
+
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "Merge upstream xenia-edge ($COUNT commits, $SHA)" \
+            --body-file body.md \
+            --label upstream

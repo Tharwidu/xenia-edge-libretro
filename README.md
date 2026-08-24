@@ -13,6 +13,11 @@ It works across RetroArch versions rather than against one: every frontend
 capability it uses is probed for and has a fallback, so an older build that
 lacks a callback gets the fallback instead of a broken core.
 
+**This project is written with [Claude Code](https://claude.com/claude-code),
+Anthropic's agentic coding tool.** Commits carry a `Co-Authored-By` trailer
+saying so, and every change is reviewed and tested against real games before it
+ships.
+
 [![CI](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml/badge.svg?branch=ra175-compat)](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml)
 
 **[Download the latest release](https://github.com/Tharwidu/xenia-edge-libretro/releases/latest)** — Windows x64 and Linux x64.
