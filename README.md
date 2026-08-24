@@ -120,9 +120,9 @@ also produces the redistributable zips.
 
 Xenia is the work of Ben Vanik and the Xenia contributors; xenia-canary and
 [has207/xenia-edge](https://github.com/has207/xenia-edge) build on it, and this
-core is that fork with a libretro front end attached. The libretro integration
-began as [danprice142](https://github.com/danprice142)'s work; this repository
-is where it is developed now.
+core is that fork with a libretro front end attached. This repository is a fork
+of [danprice142/xenia-edge-libretro](https://github.com/danprice142/xenia-edge-libretro),
+which wrote that front end.
 
 Upstream's own FAQ about the desktop emulator — game compatibility, per-title
 config advice, platform differences — is
