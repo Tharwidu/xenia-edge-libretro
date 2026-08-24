@@ -1,38 +1,150 @@
 <p align="center">
-    <a href="https://github.com/xenia-canary/xenia-canary/tree/canary_experimental/assets/icon">
-        <img height="256px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
-    </a>
+    <img height="200px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
 </p>
 
-<h1 align="center">Xenia Edge - Xbox 360 Emulator</h1>
+<h1 align="center">Xenia Edge — libretro core</h1>
 
-Xenia Edge is yet another experimental fork of the Xenia emulator, originally based on [Xenia Canary](https://github.com/xenia-canary/xenia-canary). The focus is
-on faster iteration, higher default game compatibility, usability and platform support.
+Xbox 360 emulation as a libretro core. This packages
+[has207/xenia-edge](https://github.com/has207/xenia-edge) — an experimental fork
+of [Xenia Canary](https://github.com/xenia-canary/xenia-canary) — as a single
+`xenia_edge_libretro` library that RetroArch loads like any other core.
+
+It exists because [EmuVR](https://www.emuvr.net/) ships RetroArch **1.7.5**, and
+no Xbox 360 core spoke that dialect. The core targets modern RetroArch and 1.7.5
+equally: it probes what the frontend supports and falls back rather than
+assuming.
+
+[![CI](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml/badge.svg?branch=ra175-compat)](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml)
+
+**[Download the latest release](https://github.com/Tharwidu/xenia-edge-libretro/releases/latest)** — Windows x64 and Linux x64.
+
+## What this is, and is not
+
+- **Not a new emulator.** Emulation behaviour, compatibility and performance are
+  upstream xenia-edge's. Bugs in a game are almost always upstream bugs.
+- **Headless by design.** There is no xenia window and no ImGui dialog stack, so
+  the core answers the 360's own system dialogs itself — message boxes, the
+  storage-device picker, sign-in, and the virtual keyboard. Those answers are
+  steerable; see *Configuring*.
+- **A personal build.** It is not on the libretro buildbot and is not distributed
+  through RetroArch's core downloader. Releases here are the channel.
+
+## Install
+
+Download the zip for your platform and copy the pieces where RetroArch expects
+them:
+
+```
+xenia_edge_libretro.dll  ->  RetroArch\cores\
+xenia_edge_libretro.info ->  RetroArch\info\
+config\ (folder)         ->  merge into RetroArch\config\
+D3D12\ (folder)          ->  next to retroarch.exe
+```
+
+The `config` folder holds a per-core override that stops the left analog stick
+doubling as the d-pad — otherwise the stick scrolls menus while you walk. A core
+cannot set that itself; there is no libretro call for it. Merge the folder in
+rather than replacing your own.
+
+The `D3D12` folder is the DirectX Agility runtime. With it, the Direct3D 12
+backend is available and preferred on Windows; without it the core falls back to
+its self-contained Vulkan backend on its own.
+
+On Linux, keep `libSDL3.so.0` beside the `.so` — the core resolves it through an
+`$ORIGIN` rpath.
+
+### EmuVR
+
+Put games in `Games\Xbox 360\` with an `emuvr_core.txt` alongside them:
+
+```
+media = "Xbox 360"
+core = "xenia_edge_libretro"
+```
+
+EmuVR's game scanner reads `Game Scanner\custom_media.txt`, which needs a line
+mapping the system to this core:
+
+```
+Xbox 360 = "xenia_edge_libretro|xenia_libretro"
+```
+
+## Content formats
+
+| Format | How to launch it |
+|---|---|
+| ISO (XGD2/XGD3) | the `.iso` directly |
+| GOD / SVOD | the extension-less package header file, with its `.data` folder beside it |
+| XBLA / STFS | the package file directly |
+| ZAR | the `.zar` directly |
+
+Because GOD and XBLA packages have no file extension, frontends that filter by
+extension cannot see them. Drop a **`.x360` pointer file** next to your library
+instead: a one-line text file containing the absolute path to the package
+header. The core follows it.
+
+## Configuring
+
+Three separate mechanisms change how a game runs, and two of them involve files
+called "config":
+
+| | What it reaches | Where |
+|---|---|---|
+| Core options | the ~38 exposed settings | RetroArch's own config |
+| xenia config | all 251 xenia cvars | `system/xenia/` |
+| Game patches | guest memory, not settings | `<save dir>/patches/` |
+
+Which one wins, how per-title overrides work, and the traps that waste the most
+time are documented in **[docs/libretro-configuration.md](docs/libretro-configuration.md)**.
+Two worth knowing before you start:
+
+- A per-game `.opt` file **replaces** your global core options rather than
+  merging with them, so anything it omits falls back to the *core's* default.
+- An option absent from `retroarch-core-options.cfg` likewise takes the core
+  default, not whatever you set globally.
 
 ## Status
 
-Build (Windows / Linux / macOS): [![CI](https://github.com/has207/xenia-edge/actions/workflows/CI.yml/badge.svg?branch=edge)](https://github.com/has207/xenia-edge/actions/workflows/CI.yml) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/has207/xenia-edge/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+Verified on Windows (RetroArch 1.7.5 under Proton, and 1.22 native): Zuma,
+Viva Piñata, Sonic Unleashed, Halo: Reach, Fable II (including DLC) and Skate 2
+— covering ISO, GOD/SVOD and XBLA/STFS containers, boot to gameplay.
 
-Releases
---------
-[Latest](https://github.com/has207/xenia-edge/releases/latest) ◦ [All](https://github.com/has207/xenia-edge/releases)
+The same set runs on Linux **except Fable II**, which never presents a frame
+there. That failure reproduces on standalone xenia-edge and xenia-canary with
+this core removed entirely, so it is an upstream Linux issue rather than a
+packaging one.
 
-FAQ
----
+Save states are not supported — xenia has no save-state implementation to expose.
 
-- Q: How to tell what options a particular game might need?<br>
-  A: Many games that are not running well by default require one or two simple config changes that make them (near) perfect. To find out, right-click the game in the game list and go to Compatibility. If there is an existing compatibility page there will be a link to Master, Caanary, or both. Prefer information on the Canary page, you will often find the answer there.
+## Building
 
-- Q: Why are translations into language X so bad?<br>
-  A: They're AI-generated, if you speak the language and want to help edit the relevant .po file in the assets directory and submit it. If you don't know how to use git then just open a bug and attach the fixed .po file. Best way to edit those is with a program called Poedit.
+Linux:
 
-- Q: Should I use Vulkan on Windows?<br>
-  A: Probably not, while vulkan is now on par with d3d12 in terms of graphical fidelity it's still less performant.
+```sh
+python3 xenia-build.py slang
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DXENIA_BUILD_LIBRETRO=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+python3 -c "import importlib.util as u; s=u.spec_from_file_location('xb','xenia-build.py'); \
+m=u.module_from_spec(s); s.loader.exec_module(m); m.generate_version_h('build')"
+ninja -C build xenia-libretro
+```
 
-- Q: Should I use the Windows build with wine/proton on Linux?<br>
-  A: While the answer has been "yes" for years it is no longer the case. The native build for Linux is quite competitive with Windows now and is recommened over wine/proton.
+The result is `build/bin/Linux/xenia_edge_libretro.so`. Windows builds go
+through `.github/workflows/libretro-release.yml` (clang-cl, static CRT), which
+also produces the redistributable zips.
 
-- Q: Why is macOS build not as capable as Windows / Linux?<br>
-  A: macOS is the newest port, with a completely different CPU and GPU backends that have not had nearly the amount of testing of the other platforms. Many games will fail on macOS that run on Windows and Linux. This is working as intended for now.
+## Credits
 
+Xenia is the work of Ben Vanik and the Xenia contributors; xenia-canary and
+[has207/xenia-edge](https://github.com/has207/xenia-edge) build on it, and this
+core is that fork with a libretro front end attached. The original libretro
+integration was written by [danprice142](https://github.com/danprice142); this
+repository continues it.
 
+Upstream's own FAQ about the desktop emulator — game compatibility, per-title
+config advice, platform differences — is
+[here](https://github.com/has207/xenia-edge#faq) and applies to the emulation
+underneath this core.
+
+Released under the BSD license; see [LICENSE](LICENSE). Not affiliated with
+Microsoft. Xbox 360 and Xbox LIVE are trademarks of Microsoft Corporation.
