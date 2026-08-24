@@ -9,11 +9,9 @@ Xbox 360 emulation as a libretro core. This packages
 of [Xenia Canary](https://github.com/xenia-canary/xenia-canary) — as a single
 `xenia_edge_libretro` library that RetroArch loads like any other core.
 
-It targets current RetroArch and the older **1.7.5** API equally. Frontends of
-that vintage are still in use and lack most of the environment callbacks a
-modern core assumes, so this one probes for each capability and falls back
-instead of requiring it — core options v2 with a v0 fallback, hardware render
-negotiated when offered and a software presentation path when it is not.
+It works across RetroArch versions rather than against one: every frontend
+capability it uses is probed for and has a fallback, so an older build that
+lacks a callback gets the fallback instead of a broken core.
 
 [![CI](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml/badge.svg?branch=ra175-compat)](https://github.com/Tharwidu/xenia-edge-libretro/actions/workflows/CI.yml)
 
@@ -90,9 +88,9 @@ Two worth knowing before you start:
 
 ## Status
 
-Verified on Windows (RetroArch 1.7.5 and 1.22): Zuma,
-Viva Piñata, Sonic Unleashed, Halo: Reach, Fable II (including DLC) and Skate 2
-— covering ISO, GOD/SVOD and XBLA/STFS containers, boot to gameplay.
+Verified on Windows: Zuma, Viva Piñata, Sonic Unleashed, Halo: Reach, Fable II
+(including DLC) and Skate 2 — covering ISO, GOD/SVOD and XBLA/STFS containers,
+boot to gameplay.
 
 The same set runs on Linux **except Fable II**, which never presents a frame
 there. That failure reproduces on standalone xenia-edge and xenia-canary with
@@ -122,9 +120,9 @@ also produces the redistributable zips.
 
 Xenia is the work of Ben Vanik and the Xenia contributors; xenia-canary and
 [has207/xenia-edge](https://github.com/has207/xenia-edge) build on it, and this
-core is that fork with a libretro front end attached. The original libretro
-integration was written by [danprice142](https://github.com/danprice142); this
-repository continues it.
+core is that fork with a libretro front end attached. The libretro integration
+began as [danprice142](https://github.com/danprice142)'s work; this repository
+is where it is developed now.
 
 Upstream's own FAQ about the desktop emulator — game compatibility, per-title
 config advice, platform differences — is
