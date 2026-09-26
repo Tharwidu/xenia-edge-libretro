@@ -10,6 +10,7 @@
 // Stub file for libretro build - provides empty implementations of DiscSwapUI
 
 #include "xenia/kernel/xam/ui/disc_swap_ui.h"
+
 #include <utility>
 
 #include "xenia/ui/imgui_dialog.h"
