@@ -471,8 +471,9 @@ bool LoadContent(const std::filesystem::path& content,
       xe::to_path(initial_path) == content) {
     current_index = initial_index;
   }
-  DISC_LOG(RETRO_LOG_INFO, "Playlist: %u disc(s), booting disc %u\n",
-           unsigned(images.size()), current_index + 1);
+  DISC_LOG(RETRO_LOG_INFO, "Playlist: %u disc(s), booting entry %u: %s\n",
+           unsigned(images.size()), current_index + 1,
+           LabelFor(images[current_index]).c_str());
   *boot_path = images[current_index];
   return true;
 }
