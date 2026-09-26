@@ -1,0 +1,9 @@
+# Skate 2 (4541087F)
+#
+# With readback on, the game crashes a few seconds after character creation,
+# on the standalone emulator as well as the core: resolve output copied back
+# into guest RAM lands on memory the game's heap has already reused, zeroing a
+# live object's vtable (null call at 823A8854). With it off the game plays
+# through, and renders correctly.
+[GPU]
+readback_resolve = false

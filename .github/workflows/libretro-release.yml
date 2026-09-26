@@ -78,6 +78,12 @@ jobs:
           # BOTH archives or it is only half fixed.
           mkdir -p dist/config
           cp -r libretro/retroarch-config/* dist/config/
+          # Per-title xenia configs for games that need a setting changed to
+          # run at all (see each file's header). They land in
+          # RetroArch/system/xenia/config/, where the core layers them on top
+          # of the base config.
+          mkdir -p dist/system
+          cp -r libretro/system/* dist/system/
           # The .info description points users at this file, so ship it rather
           # than referring them to a repository they may never visit.
           mkdir -p dist/docs
@@ -198,6 +204,8 @@ jobs:
           # The .info notes told users this was bundled; until now it was not.
           New-Item -ItemType Directory dist/config | Out-Null
           Copy-Item -Recurse "libretro/retroarch-config/*" dist/config/ -Force
+          New-Item -ItemType Directory dist/system | Out-Null
+          Copy-Item -Recurse "libretro/system/*" dist/system/ -Force
           # The .info description points users at this document.
           New-Item -ItemType Directory dist/docs | Out-Null
           Copy-Item docs/libretro-configuration.md dist/docs/
@@ -207,7 +215,6 @@ jobs:
           New-Item -ItemType Directory dist/D3D12 | Out-Null
           Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/dxc_2026_05_27.zip" -OutFile dxc.zip
           Expand-Archive dxc.zip -DestinationPath dxc
-          Copy-Item dxc/bin/x64/dxcompiler.dll dist/D3D12/
           Copy-Item dxc/bin/x64/dxil.dll dist/D3D12/
           Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.619.3" -OutFile agility.zip
           Expand-Archive agility.zip -DestinationPath agility
@@ -216,6 +223,7 @@ jobs:
           xenia_edge_libretro.dll  -> RetroArch\cores\
           xenia_edge_libretro.info -> RetroArch\info\
           config\ (folder)         -> merge into RetroArch\config\
+          system\ (folder)         -> merge into RetroArch\system\
           D3D12\ (folder)          -> next to retroarch.exe (RetroArch root)
 
           The config folder holds a per-core override that stops the left stick
@@ -223,6 +231,10 @@ jobs:
           walk). A core cannot set that itself - there is no libretro call for
           it - so it ships as a file. Merge it in; do not replace your existing
           config folder.
+
+          The system folder holds per-game xenia settings for titles that need
+          one to run (system\xenia\config\<TITLEID>.config.toml; each file says
+          why). Merge it in the same way.
 
           The D3D12 folder enables the faster Direct3D 12 backend and is used
           automatically when present. Without it, the core falls back to the
