@@ -1,6 +1,6 @@
 display_name = "Microsoft - Xbox 360 (Xenia Edge)"
 authors = "Xenia Team|danprice142|Tharwidu"
-supported_extensions = "iso|xex|zar|xcp|x360"
+supported_extensions = "iso|xex|zar|xcp|x360|m3u"
 corename = "Xenia Edge"
 manufacturer = "Microsoft"
 categories = "Emulator"

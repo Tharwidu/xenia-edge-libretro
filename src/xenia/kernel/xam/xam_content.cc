@@ -728,6 +728,7 @@ dword_result_t XamSwapDisc_entry(
     return X_ERROR_SUCCESS;
   }
 
+  kernel_state()->emulator()->set_requested_disc_number(disc_number);
   auto filesystem = kernel_state()->file_system();
   // Mount to Cdrom0 so the game: symlink points to the new disc
   auto mount_path = "\\Device\\Cdrom0";

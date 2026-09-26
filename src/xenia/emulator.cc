@@ -1563,6 +1563,12 @@ void Emulator::MountStandardDrives() {
 
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
+  if (!display_window_ && headless_disc_resolver_) {
+    return headless_disc_resolver_(
+        requested_disc_number_,
+        window_message.find("ERROR:") != std::string::npos);
+  }
+
   std::filesystem::path path = "";
 
   uint32_t current_title_id = !title_id_.has_value() ? 0 : title_id_.value();

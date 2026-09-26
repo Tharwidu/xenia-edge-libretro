@@ -135,6 +135,7 @@ DECLARE_bool(disable_context_promotion);
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg.h"
 #include "libretro_audio_driver.h"
+#include "libretro_disc.h"
 #include "libretro_hid.h"
 
 // CVars from xenia_main.cc - libretro core replaces main entry point.
@@ -869,6 +870,10 @@ static void apply_core_options(void) {
     // Anisotropic filtering override
     if ((v = opt_get(XENIA_OPT_ANISOTROPIC_FILTERING)) && !opt_is_auto(v)) {
         cvars::anisotropic_override = atoi(v);
+    }
+
+    if ((v = opt_get(XENIA_OPT_AUTO_DISC_SWAP))) {
+        xe::libretro_disc::SetAutomatic(strcmp(v, "disabled") != 0);
     }
 
     // Async shader compilation
@@ -2062,6 +2067,14 @@ static bool xenia_setup_and_launch(const char *path) {
                 lr_relaunching.store(false, std::memory_order_release);
             });
 
+        // No window means no disc dialog: the core answers disc requests.
+        xenia_emulator->set_headless_disc_resolver(
+            [](uint32_t disc_number, bool retry) {
+                return xe::libretro_disc::Resolve(
+                    disc_number, retry,
+                    xenia_emulator ? xenia_emulator->title_id() : 0);
+            });
+
         // Sign in a profile before launch so the title sees a logged-in user
         // (saves and scores in profile-aware games, XBLA especially). The
         // standalone app does this through its profile dialog; headless we
@@ -2113,6 +2126,8 @@ static bool xenia_setup_and_launch(const char *path) {
 }
 
 static void xenia_shutdown(void) {
+    // Release a disc request parked on the frontend, or teardown waits on it.
+    xe::libretro_disc::Shutdown();
     if (xenia_emulator) {
         xenia_emulator->TerminateTitle();
         xenia_emulator->Shutdown();
@@ -2163,6 +2178,11 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log_cb)) {
         core_state.log_cb = log_cb.log;
     }
+
+    // Disk control must exist before retro_load_game: the frontend chooses
+    // the initial disc of an .m3u through it.
+    xe::libretro_disc::SetLogger(xenia_log);
+    xe::libretro_disc::RegisterDiskControl(cb);
 
     // Publish core options (v2 with legacy SET_VARIABLES fallback for
     // frontends like EmuVR's RetroArch 1.7.5)
@@ -2367,7 +2387,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info) {
     info->library_name     = "Xenia Edge";
     info->library_version  = "0.4.0";
     info->need_fullpath    = true;
-    info->valid_extensions = "iso|xex|zar|xcp|x360";
+    info->valid_extensions = "iso|xex|zar|xcp|x360|m3u";
     info->block_extract    = false;
 }
 
@@ -2399,70 +2419,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     snprintf(core_state.game_path, sizeof(core_state.game_path),
              "%s", info->path);
 
-    // .x360 pointer files: a one-line text file whose content is the path of
-    // the real game (absolute, or relative to the pointer file). Lets file
-    // browsers and frontend scanners see extension-less content like GOD/XBLA
-    // package headers without renaming the library.
+    // An .m3u becomes the disc list and an .x360 pointer file (a one-line
+    // text file naming extension-less GOD/XBLA content) is followed, so from
+    // here on game_path is the disc actually booted.
     {
-        size_t len = strlen(core_state.game_path);
-        const char* ext = len > 5 ? core_state.game_path + len - 5 : "";
-        bool is_ptr = false;
-        if (ext[0] == '.' &&
-            (ext[1] == 'x' || ext[1] == 'X') &&
-            ext[2] == '3' && ext[3] == '6' && ext[4] == '0') {
-            is_ptr = true;
+        std::filesystem::path boot_path;
+        if (!xe::libretro_disc::LoadContent(
+                xe::to_path(std::string(core_state.game_path)), &boot_path)) {
+            return false;
         }
-        if (is_ptr) {
-            FILE* pf = fopen(core_state.game_path, "rb");
-            if (!pf) {
-                xenia_log(RETRO_LOG_ERROR, "Cannot open pointer file %s\n",
-                          core_state.game_path);
-                return false;
-            }
-            char line[sizeof(core_state.game_path)] = {0};
-            if (!fgets(line, sizeof(line), pf)) line[0] = 0;
-            fclose(pf);
-            // Trim trailing whitespace/newline and optional quotes.
-            size_t n = strlen(line);
-            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
-                         line[n - 1] == ' ' || line[n - 1] == '\t'))
-                line[--n] = 0;
-            char* target = line;
-            if (n >= 2 && target[0] == '"' && target[n - 1] == '"') {
-                target[n - 1] = 0;
-                target++;
-            }
-            if (!target[0]) {
-                xenia_log(RETRO_LOG_ERROR, "Pointer file %s is empty\n",
-                          core_state.game_path);
-                return false;
-            }
-            std::error_code ptr_ec;
-            std::filesystem::path resolved(target);
-            if (resolved.is_relative()) {
-                resolved = std::filesystem::path(core_state.game_path)
-                               .parent_path() / resolved;
-            }
-            // Verify the target before handing it to the emulator. Pointer
-            // files routinely hold absolute paths, so moving or renaming a
-            // library silently breaks them; without this check the launch
-            // fails deep inside LaunchPath as a bare 0xC00000BB
-            // (STATUS_NOT_SUPPORTED) that says nothing about the real cause.
-            if (!std::filesystem::exists(resolved, ptr_ec)) {
-                xenia_log(RETRO_LOG_ERROR,
-                          "Pointer file %s targets a path that does not "
-                          "exist: %s\n",
-                          core_state.game_path, resolved.string().c_str());
-                xenia_log(RETRO_LOG_ERROR,
-                          "Edit the pointer file so it contains the full path "
-                          "to the content's current location.\n");
-                return false;
-            }
-            snprintf(core_state.game_path, sizeof(core_state.game_path), "%s",
-                     resolved.string().c_str());
-            xenia_log(RETRO_LOG_INFO, "Pointer file resolved to: %s\n",
-                      core_state.game_path);
-        }
+        snprintf(core_state.game_path, sizeof(core_state.game_path), "%s",
+                 xe::path_to_utf8(boot_path).c_str());
     }
 
     // Load xenia's own config file, if the user has one, BEFORE core options.
