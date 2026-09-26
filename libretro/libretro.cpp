@@ -9,6 +9,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <cstdarg>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "libretro.h"
@@ -191,6 +193,14 @@ static std::unique_ptr<xe::Emulator> xenia_emulator;
 static xe::apu::libretro::LibretroAudioMixer *audio_mixer = nullptr;
 static xe::hid::libretro_hid::LibretroInputDriver *lr_input_driver = nullptr;
 static xe::gpu::GraphicsSystem *lr_graphics = nullptr;
+// A title relaunch (a disc launcher starting its real game, a title reset)
+// tears down and recreates the audio and graphics systems on a guest-spawned
+// thread while the frontend keeps calling retro_run. retro_run holds this
+// mutex while it touches them; the teardown takes it to close the gate, so
+// it waits for the frame in flight and nothing reads a freed subsystem.
+// The input system survives a relaunch, so lr_input_driver stays valid.
+static std::mutex lr_subsystems_mutex;
+static std::atomic<bool> lr_relaunching{false};
 static bool game_loaded = false;
 
 // Upper bound on the video the frontend must be prepared to receive. Declared
@@ -2033,6 +2043,23 @@ static bool xenia_setup_and_launch(const char *path) {
             return false;
         }
 
+        xenia_emulator->on_before_shutdown.AddListener([]() {
+            std::lock_guard<std::mutex> lock(lr_subsystems_mutex);
+            lr_relaunching.store(true, std::memory_order_release);
+            audio_mixer = nullptr;
+            lr_graphics = nullptr;
+            xenia_log(RETRO_LOG_INFO,
+                      "Title relaunch: holding the last frame until the "
+                      "new title starts\n");
+        });
+        // The factories have republished audio_mixer and lr_graphics by the
+        // time the new title launches. No lock here: on the first launch this
+        // fires inside retro_run, which already holds the mutex.
+        xenia_emulator->on_launch.AddListener(
+            [](uint32_t, const std::string_view) {
+                lr_relaunching.store(false, std::memory_order_release);
+            });
+
         // Sign in a profile before launch so the title sees a logged-in user
         // (saves and scores in profile-aware games, XBLA especially). The
         // standalone app does this through its profile dialog; headless we
@@ -2092,6 +2119,7 @@ static void xenia_shutdown(void) {
     audio_mixer = nullptr;
     lr_input_driver = nullptr;
     lr_graphics = nullptr;
+    lr_relaunching.store(false, std::memory_order_release);
     game_loaded = false;
     last_geometry_w = last_geometry_h = 0;
     last_geometry_aspect_x = last_geometry_aspect_y = 0;
@@ -2937,6 +2965,13 @@ RETRO_API void retro_run(void) {
     if (lr_input_driver && core_state.input_state_cb)
         lr_input_driver->UpdateFromLibretro(core_state.input_state_cb,
                                             g_input_bitmasks);
+
+    std::unique_lock<std::mutex> subsystems_lock(lr_subsystems_mutex);
+    if (lr_relaunching.load(std::memory_order_acquire)) {
+        subsystems_lock.unlock();
+        emit_dupe_frame();
+        return;
+    }
 
     // Capture the latest frame via the appropriate video path.
 

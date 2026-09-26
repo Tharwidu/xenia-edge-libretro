@@ -249,9 +249,8 @@ void VulkanPresenter::DestroyGPUBlitResources() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
-  if (gpu_blit_.fence != VK_NULL_HANDLE) {
-    dfn.vkWaitForFences(device, 1, &gpu_blit_.fence, VK_TRUE, UINT64_MAX);
-  }
+  // The blit is submitted through a VulkanGPUCompletionTimeline and awaited
+  // before CaptureGuestOutputGPUBlit returns, so nothing can still be in flight.
   if (gpu_blit_.readback_mapped && gpu_blit_.readback_memory) {
     dfn.vkUnmapMemory(device, gpu_blit_.readback_memory);
   }
@@ -266,9 +265,6 @@ void VulkanPresenter::DestroyGPUBlitResources() {
   }
   if (gpu_blit_.blit_memory) {
     dfn.vkFreeMemory(device, gpu_blit_.blit_memory, nullptr);
-  }
-  if (gpu_blit_.fence) {
-    dfn.vkDestroyFence(device, gpu_blit_.fence, nullptr);
   }
   if (gpu_blit_.cmd_pool) {
     dfn.vkDestroyCommandPool(device, gpu_blit_.cmd_pool, nullptr);
@@ -300,14 +296,6 @@ bool VulkanPresenter::CreateGPUBlitResources(uint32_t w, uint32_t h) {
   if (dfn.vkAllocateCommandBuffers(device, &alloc_info, &gpu_blit_.cmd) !=
       VK_SUCCESS) {
     XELOGE("VulkanPresenter: Failed to allocate GPU blit command buffer");
-    return false;
-  }
-
-  // Fence
-  VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  if (dfn.vkCreateFence(device, &fence_info, nullptr, &gpu_blit_.fence) !=
-      VK_SUCCESS) {
-    XELOGE("VulkanPresenter: Failed to create GPU blit fence");
     return false;
   }
 

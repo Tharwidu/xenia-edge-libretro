@@ -503,7 +503,6 @@ class VulkanPresenter final : public Presenter {
     void* readback_mapped = nullptr;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
     // Blit destination format. B8G8R8A8 is what libretro's XRGB8888 wants
