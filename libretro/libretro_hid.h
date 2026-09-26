@@ -88,6 +88,19 @@ class LibretroInputDriver final : public InputDriver {
   retro_set_rumble_state_t rumble_cb_ = nullptr;
   // Tracks which ports the frontend has assigned a device to.
   bool port_connected_[kMaxPorts] = {true, false, false, false};
+
+  // XInputGetKeystroke turns pad changes into button events; titles that
+  // navigate by them (Minecraft's menus) see no controller without these.
+  // Same algorithm, table and timings as the SDL driver.
+  enum class RepeatState { Idle, Waiting, Repeating };
+  struct KeystrokeState {
+    uint64_t buttons = 0;
+    RepeatState repeat_state = RepeatState::Idle;
+    uint8_t repeat_butt_idx = 0;
+    uint32_t repeat_time = 0;
+  };
+  std::mutex keystroke_mutex_;
+  KeystrokeState keystroke_states_[kMaxPorts];
 };
 
 // Factory function (matches xe::hid::nop::Create pattern).
