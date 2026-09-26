@@ -137,6 +137,7 @@ DECLARE_bool(disable_context_promotion);
 #include "libretro_audio_driver.h"
 #include "libretro_disc.h"
 #include "libretro_hid.h"
+#include "libretro_keyboard.h"
 
 // CVars from xenia_main.cc - libretro core replaces main entry point.
 // apu/gpu and the mount switches moved into emulator.cc upstream, so defining
@@ -243,6 +244,11 @@ static uint32_t last_geometry_w = 0, last_geometry_h = 0;
 static uint32_t last_frame_w = 1280, last_frame_h = 720;
 
 // Repeat the previous frame. Never pass literal dimensions to a NULL frame.
+static int16_t RETRO_CALLCONV idle_input_state(unsigned, unsigned, unsigned,
+                                               unsigned) {
+    return 0;
+}
+
 static inline void emit_dupe_frame(void) {
     core_state.video_cb(nullptr, last_frame_w, last_frame_h,
                         static_cast<size_t>(last_frame_w) * 4);
@@ -870,6 +876,15 @@ static void apply_core_options(void) {
     // Anisotropic filtering override
     if ((v = opt_get(XENIA_OPT_ANISOTROPIC_FILTERING)) && !opt_is_auto(v)) {
         cvars::anisotropic_override = atoi(v);
+    }
+
+    if ((v = opt_get(XENIA_OPT_KEYBOARD_PROMPTS))) {
+        xe::libretro_keyboard::SetMode(
+            strcmp(v, "autofill") == 0
+                ? xe::libretro_keyboard::Mode::kAutoFill
+                : strcmp(v, "ask_empty") == 0
+                      ? xe::libretro_keyboard::Mode::kAskEmpty
+                      : xe::libretro_keyboard::Mode::kAskPrefilled);
     }
 
     if ((v = opt_get(XENIA_OPT_AUTO_DISC_SWAP))) {
@@ -1628,7 +1643,10 @@ static void update_video(void) {
 
     if (got && blit_data && w > 0 && h > 0) {
         report_geometry(w, h);
-        if (is_bgra) {
+        // The on-screen keyboard draws over the frame, which needs a copy:
+        // the BGRA readback below is the presenter's own mapped buffer.
+        const bool keyboard = xe::libretro_keyboard::SuppressGuestInput();
+        if (is_bgra && !keyboard) {
             // The capture already produced XRGB8888, so hand the mapped
             // readback straight to the frontend. This is the normal path: it
             // skips a whole-frame scalar channel swap - 921,600 iterations at
@@ -1646,11 +1664,18 @@ static void update_video(void) {
         if (sw_frame_buf.size() < count) sw_frame_buf.resize(count);
         const uint32_t* src = static_cast<const uint32_t*>(blit_data);
         uint32_t* dst = sw_frame_buf.data();
-        for (size_t i = 0; i < count; i++) {
-            uint32_t v = src[i];
-            dst[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
-                     ((v & 0x000000FFu) << 16);
+        if (is_bgra) {
+            memcpy(dst, src, count * 4);
+        } else {
+            for (size_t i = 0; i < count; i++) {
+                uint32_t v = src[i];
+                dst[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) |
+                         ((v & 0x000000FFu) << 16);
+            }
         }
+        // dst is XRGB8888 either way: B,G,R,X in memory.
+        xe::libretro_keyboard::DrawOverlay(reinterpret_cast<uint8_t*>(dst), w,
+                                           h, size_t(w) * 4, true);
         last_frame_w = w;
         last_frame_h = h;
         core_state.video_cb(dst, w, h, w * 4);
@@ -1706,6 +1731,8 @@ static void update_video_vulkan(void) {
 
     // Copy Xenia readback ??? frontend staging buffer
     memcpy(f.staging_mapped, blit_data, (size_t)w * h * 4);
+    xe::libretro_keyboard::DrawOverlay(static_cast<uint8_t*>(f.staging_mapped),
+                                       w, h, size_t(w) * 4, is_bgra);
 
     // Record commands: staging ??? image, transition to shader-read
     VkCommandBuffer cmd = f.cmd;
@@ -1840,6 +1867,7 @@ static void update_video_d3d12(void) {
     for (uint32_t row = 0; row < h; row++) {
         memcpy(dst + row * dst_pitch, src + row * src_pitch, src_pitch);
     }
+    xe::libretro_keyboard::DrawOverlay(dst, w, h, dst_pitch, is_bgra);
 
     // Record commands
     f.cmd_alloc->Reset();
@@ -2053,6 +2081,7 @@ static bool xenia_setup_and_launch(const char *path) {
         xenia_emulator->on_before_shutdown.AddListener([]() {
             std::lock_guard<std::mutex> lock(lr_subsystems_mutex);
             lr_relaunching.store(true, std::memory_order_release);
+            xe::libretro_keyboard::Cancel();
             audio_mixer = nullptr;
             lr_graphics = nullptr;
             xenia_log(RETRO_LOG_INFO,
@@ -2126,8 +2155,10 @@ static bool xenia_setup_and_launch(const char *path) {
 }
 
 static void xenia_shutdown(void) {
-    // Release a disc request parked on the frontend, or teardown waits on it.
+    // Release a disc request or keyboard prompt parked on the frontend, or
+    // teardown waits on it.
     xe::libretro_disc::Shutdown();
+    xe::libretro_keyboard::Cancel();
     if (xenia_emulator) {
         xenia_emulator->TerminateTitle();
         xenia_emulator->Shutdown();
@@ -2183,6 +2214,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     // the initial disc of an .m3u through it.
     xe::libretro_disc::SetLogger(xenia_log);
     xe::libretro_disc::RegisterDiskControl(cb);
+    xe::libretro_keyboard::Install(cb);
 
     // Publish core options (v2 with legacy SET_VARIABLES fallback for
     // frontends like EmuVR's RetroArch 1.7.5)
@@ -2895,10 +2927,15 @@ RETRO_API void retro_run(void) {
     // Poll input from the frontend
     if (core_state.input_poll_cb) core_state.input_poll_cb();
 
-    // Feed libretro input state into Xenia's HID system
+    // The on-screen keyboard reads the pad first; while it is up (and until
+    // its buttons are released) the guest sees an idle controller.
+    xe::libretro_keyboard::Update(core_state.input_state_cb);
     if (lr_input_driver && core_state.input_state_cb)
-        lr_input_driver->UpdateFromLibretro(core_state.input_state_cb,
-                                            g_input_bitmasks);
+        lr_input_driver->UpdateFromLibretro(
+            xe::libretro_keyboard::SuppressGuestInput()
+                ? idle_input_state
+                : core_state.input_state_cb,
+            g_input_bitmasks);
 
     std::unique_lock<std::mutex> subsystems_lock(lr_subsystems_mutex);
     if (lr_relaunching.load(std::memory_order_acquire)) {

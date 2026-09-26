@@ -9,6 +9,7 @@ add_library(xenia-libretro SHARED
   libretro_graphics_system.cc
   libretro_headless_stubs.cc
   libretro_hid.cc
+  libretro_keyboard.cc
   libretro_vk_presenter.cc
 )
 if(WIN32)

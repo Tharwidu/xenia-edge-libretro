@@ -42,12 +42,16 @@
 #include "xenia/base/string_util.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
+#include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/headless_keyboard.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/xbox.h"
 
@@ -293,6 +297,89 @@ static std::string SignedInGamertag(uint32_t user_index) {
   return profile ? profile->name() : "";
 }
 
+static HeadlessKeyboardHandler headless_keyboard_handler;
+
+void SetHeadlessKeyboardHandler(HeadlessKeyboardHandler handler) {
+  headless_keyboard_handler = std::move(handler);
+}
+
+// Hands the prompt to the host's keyboard UI. Returns false when there is
+// none or it declines, so the caller auto-fills instead.
+static bool ShowHostKeyboard(const HeadlessKeyboardRequest& request,
+                             char16_t* buffer, uint32_t buffer_length,
+                             uint32_t overlapped, X_RESULT* sync_result) {
+  if (!headless_keyboard_handler) {
+    return false;
+  }
+  // Writes the answer into the title's buffer; runs on whichever thread the
+  // host answers from, so nothing here may need a current guest thread.
+  auto write = [buffer, buffer_length](bool accepted,
+                                       const std::string& text) -> X_RESULT {
+    if (!accepted) {
+      return X_ERROR_CANCELLED;
+    }
+    std::u16string text16 = xe::to_utf16(text);
+    if (text16.empty()) {
+      std::memset(buffer, 0, size_t(buffer_length) * 2);
+    } else {
+      string_util::copy_and_swap_truncating(buffer, text16, buffer_length);
+    }
+    return X_ERROR_SUCCESS;
+  };
+
+  if (!overlapped) {
+    struct State {
+      xe::threading::Fence fence;
+      bool accepted = false;
+      std::string text;
+    };
+    auto state = std::make_shared<State>();
+    if (!headless_keyboard_handler(
+            request, [state](bool accepted, const std::string& text) {
+              state->accepted = accepted;
+              state->text = text;
+              state->fence.Signal();
+            })) {
+      return false;
+    }
+    kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
+    GuestScheduler::WaitOnFence(state->fence);
+    *sync_result = write(state->accepted, state->text);
+    NotifyUiShownBriefly();
+    return true;
+  }
+
+  // Mark the overlapped pending now, on the requesting guest thread (the
+  // context its completion routine is queued to), and complete it whenever
+  // the host answers - without holding the kernel dispatch thread meanwhile.
+  auto* ptr = kernel_state()->memory()->TranslateVirtual(overlapped);
+  XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
+    auto ev = kernel_state()->object_table()->LookupObject<XObject>(
+        event_handle);
+    if (ev && ev->type() == XObject::Type::Event) {
+      ev.get<XEvent>()->Reset();
+    }
+  }
+  if (!headless_keyboard_handler(
+          request, [write, overlapped](bool accepted, const std::string& text) {
+            if (!kernel_state()) {
+              return;
+            }
+            X_RESULT result = write(accepted, text);
+            kernel_state()->CompleteOverlappedEx(overlapped, result, result,
+                                                 0);
+            NotifyUiShownBriefly();
+          })) {
+    XOverlappedSetResult(ptr, X_ERROR_SUCCESS);
+    return false;
+  }
+  kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
+  *sync_result = X_ERROR_IO_PENDING;
+  return true;
+}
+
 dword_result_t XamShowKeyboardUI_entry(
     dword_t user_index, dword_t flags, lpu16string_t default_text,
     lpu16string_t title, lpu16string_t description, lpu16string_t buffer,
@@ -323,6 +410,19 @@ dword_result_t XamShowKeyboardUI_entry(
       title ? xe::to_utf8(title.value()) : "",
       description ? xe::to_utf8(description.value()) : "", uint32_t(flags),
       xe::to_utf8(text), prefilled ? "title's own default" : "auto-filled");
+
+  HeadlessKeyboardRequest request;
+  request.title = title ? xe::to_utf8(title.value()) : "";
+  request.description = description ? xe::to_utf8(description.value()) : "";
+  request.default_text = default_text ? xe::to_utf8(default_text.value()) : "";
+  request.suggested_text = xe::to_utf8(text);
+  request.max_length = buffer_length ? uint32_t(buffer_length) - 1 : 0;
+  request.flags = flags;
+  X_RESULT host_result = X_ERROR_SUCCESS;
+  if (ShowHostKeyboard(request, buffer, buffer_length, overlapped.guest_address(),
+                       &host_result)) {
+    return host_result;
+  }
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
   return DispatchHeadless(

@@ -26,6 +26,7 @@ struct xenia_core_state;
 #define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
 #define XENIA_OPT_AUTO_PROFILE          "xenia_auto_profile"
 #define XENIA_OPT_AUTO_DISC_SWAP        "xenia_auto_disc_swap"
+#define XENIA_OPT_KEYBOARD_PROMPTS      "xenia_keyboard_prompts"
 #define XENIA_OPT_MSGBOX_BUTTON         "xenia_messagebox_button"
 #define XENIA_OPT_BOOT_SPLASH           "xenia_boot_splash"
 #define XENIA_OPT_STORE_SHADERS         "xenia_store_shaders"
@@ -686,6 +687,29 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { NULL, NULL }
         },
         "enabled"
+    },
+    {
+        XENIA_OPT_KEYBOARD_PROMPTS,
+        "Keyboard Prompts",
+        "Keyboard Prompts",
+        "What happens when a game asks you to type something (a name, a "
+        "save name, a code).\n"
+        "Ask, Pre-filled: show an on-screen keyboard with the game's "
+        "suggestion or your gamertag already entered - press START to "
+        "accept it or edit it first. Controller: D-pad/stick move, A types, "
+        "B deletes, X space, Y shift, BACK cancels. A keyboard also works "
+        "where the frontend passes it through (RetroArch: Game Focus).\n"
+        "Ask, Empty: the same, starting from the game's own text only.\n"
+        "Auto-Fill: never show the keyboard; enter the suggestion at once.",
+        NULL,
+        "Emulation",
+        {
+            { "ask",       "Ask, Pre-filled" },
+            { "ask_empty", "Ask, Empty" },
+            { "autofill",  "Auto-Fill" },
+            { NULL, NULL }
+        },
+        "ask"
     },
     {
         XENIA_OPT_AUTO_DISC_SWAP,
