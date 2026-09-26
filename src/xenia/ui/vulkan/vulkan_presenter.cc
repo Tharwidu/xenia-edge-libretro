@@ -250,7 +250,8 @@ void VulkanPresenter::DestroyGPUBlitResources() {
   const VkDevice device = vulkan_device_->device();
 
   // The blit is submitted through a VulkanGPUCompletionTimeline and awaited
-  // before CaptureGuestOutputGPUBlit returns, so nothing can still be in flight.
+  // before CaptureGuestOutputGPUBlit returns, so nothing can still be in
+  // flight.
   if (gpu_blit_.readback_mapped && gpu_blit_.readback_memory) {
     dfn.vkUnmapMemory(device, gpu_blit_.readback_memory);
   }
