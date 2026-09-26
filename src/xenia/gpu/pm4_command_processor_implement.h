@@ -689,11 +689,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
           trace_writer_.Close();
           // The guest output now holds exactly the frame that was traced.
           WriteTraceFrameScreenshot();
+        } else if (trace_state_ == TraceState::kDisabled) {
+          trace_writer_.Close();
         }
       } else if (trace_state_ == TraceState::kSingleFrame) {
         // New trace request - we only start tracing at the beginning of a
         // frame.
-        uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
+        auto executable_module = kernel_state_->GetExecutableModule();
+        uint32_t title_id =
+            executable_module ? executable_module->title_id() : 0;
         auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
         auto path = trace_frame_path_ / file_name;
         trace_writer_.Open(path, title_id);
@@ -761,6 +765,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
   if (cvars::memexport_await_fences) {
     COMMAND_PROCESSOR::AwaitMemexportForFence();
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
@@ -878,19 +883,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     } else {
       if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
         // A pending request (non-zero status, cleared by MakeCoherent) is the
-        // guest naming a range it wants made visible to it. Export output
-        // landing there has to have reached guest RAM first, and it is also
-        // what releases held resolve output.
-        if (register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
-          COMMAND_PROCESSOR::NoteResolveCoherency(
+        // guest asking for a range to be made visible to it, so any export
+        // output landing there has to have reached guest RAM first.
+        if (cvars::memexport_await_fences &&
+            register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
+          COMMAND_PROCESSOR::AwaitMemexportForCoherency(
               register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
-              register_file_->values[XE_GPU_REG_COHER_SIZE_HOST],
-              register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]);
-          if (cvars::memexport_await_fences) {
-            COMMAND_PROCESSOR::AwaitMemexportForCoherency(
-                register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
-                register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
-          }
+              register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
         }
         MakeCoherent();
         value = value_ref;
@@ -997,6 +996,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     COMMAND_PROCESSOR::InsertDebugMarker("PM4_MEM_WRITE: 0x%08X (%u dwords)",
                                          write_addr & ~0x3, count - 1);
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
@@ -1050,6 +1050,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
     // Write.
     if (wait_info & 0x100) {
       // Memory.
+      COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
@@ -1110,6 +1111,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   if (cvars::memexport_await_fences) {
     COMMAND_PROCESSOR::AwaitMemexportForFence();
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
@@ -1205,100 +1207,51 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 
   uint32_t report_address =
       register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  uint32_t report_record_base = XenosZPDReport::GetRecordBase(report_address);
-  bool is_begin_record = XenosZPDReport::IsBeginRecord(report_address);
-  bool is_end_record = XenosZPDReport::IsEndRecord(report_address);
+  // RB_SAMPLE_COUNT_CTL is unused by real hardware.
 
-  xe_gpu_depth_sample_counts* report =
-      report_record_base
-          ? memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-                report_record_base)
-          : nullptr;
+  if (!report_address) {
+    return true;
+  }
 
-  // True if the record has the pending D3D sentinel.
-  // Useful as a hint, but not authoritative for report boundaries.
-  // QueryBatch titles can have multiple pending sentinels in a row and don't
-  // necessarily update in an order we currently observe.
-  bool guest_marks_end = report && XenosZPDReport::HasPendingSentinel(report);
-  bool logical_active = zpd_active_segment_.logical_active;
-
-  if (cvars::occlusion_query_log && report) {
+  if (cvars::occlusion_query_log) {
+    const auto* report =
+        memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(report_address);
     XELOGI(
-        "ZPD: EVENT_WRITE_ZPD fields event={} report_address=0x{:08X} "
-        "record=0x{:08X} Total=({:08X},{:08X}) ZFail=({:08X},{:08X}) "
-        "ZPass=({:08X},{:08X}) Stencil=({:08X},{:08X}) pending={}",
-        GetEventName(event_type), report_address, report_record_base,
-        uint32_t(report->Total_A), uint32_t(report->Total_B),
-        uint32_t(report->ZFail_A), uint32_t(report->ZFail_B),
-        uint32_t(report->ZPass_A), uint32_t(report->ZPass_B),
-        uint32_t(report->StencilFail_A), uint32_t(report->StencilFail_B),
-        guest_marks_end);
+        "ZPD: EVENT_WRITE_ZPD event={} address=0x{:08X} Total=({:08X},{:08X}) "
+        "ZFail=({:08X},{:08X}) ZPass=({:08X},{:08X}) Stencil=({:08X},{:08X})",
+        GetEventName(event_type), report_address, uint32_t(report->Total_A),
+        uint32_t(report->Total_B), uint32_t(report->ZFail_A),
+        uint32_t(report->ZFail_B), uint32_t(report->ZPass_A),
+        uint32_t(report->ZPass_B), uint32_t(report->StencilFail_A),
+        uint32_t(report->StencilFail_B));
   }
 
-  // QueryBatch fake fallback, which ignores record layout and just returns an
-  // incrementing sample count on each event.
-  if (cvars::occlusion_query_querybatch_range > 0) {
-    uint32_t sample_count =
-        XenosZPDReport::QueryBatchFakeSamples(querybatch_zpd_sample_count_);
-    if (report) {
-      // Both QueryBatch and conventional fake samples skip elective saturation.
-      XenosZPDReport::WriteSampleCount(report, sample_count, false);
-    }
+  if (zpd_mode_ != ZPDMode::kFake && !zpd_force_fake_fallback_) {
+    // Z-Pass Done (ZPD) facilitates all D3D occlusion queries.
+    // D3D fills the counters (usually ZPass_A + ZPass_B, but some 2005-2006 D3D
+    // versions use ZFail_A + ZFail_B, and sometimes even both counters' B
+    // fields are kept zero) with a swapped 0xFFFFFEED sentinel while counting.
+    // Rather than trying to clumsily infer boundaries here, the command
+    // processor treats each event as a free-running sample counter snapshot.
+    // VIZ_QUERY is a coarse hi-Z visibility test, not strictly an OQ.
+    COMMAND_PROCESSOR::QueueZPDReport(report_address);
     return true;
   }
 
-  if (COMMAND_PROCESSOR::GetZPDMode() != ZPDMode::kFake &&
-      !zpd_force_fake_fallback_) {
-    if (logical_active && is_end_record) {
-      COMMAND_PROCESSOR::EndZPDReport(report_address, false);
-      return true;
-    }
-    if (is_begin_record) {
-      // Clear the record so the game knows the BEGIN was processed and
-      // stale sentinel data from a prior query lifetime doesn't persist.
-      if (report) {
-        std::memset(report, 0, sizeof(xe_gpu_depth_sample_counts));
-      }
-      COMMAND_PROCESSOR::BeginZPDReport(report_address);
-      return true;
-    }
-    if (!logical_active && is_end_record) {
-      // No logical report is active for this slot, so this is likely an
-      // orphaned END. In fast mode, replay the last cached delta so polling
-      // code does not sit on the sentinel forever.
-      if (COMMAND_PROCESSOR::GetZPDMode() == ZPDMode::kFast ||
-          COMMAND_PROCESSOR::GetZPDMode() == ZPDMode::kFastAlt) {
-        uint32_t cached_delta = 1;
-        auto cache_it = fast_zpd_report_cached_values_.find(report_record_base);
-        if (cache_it != fast_zpd_report_cached_values_.end()) {
-          cached_delta = cache_it->second;
-        }
-        COMMAND_PROCESSOR::WriteZPDReport(0, report_record_base, 0,
-                                          cached_delta, false);
-      } else {
-        // In strict mode, just pump in case a previous report has resolved.
-        COMMAND_PROCESSOR::PumpQueryResolves();
-      }
-      return true;
-    }
-    // Address is neither BEGIN nor END (non-standard layout). Fall through
-    // to the fake path so the guest at least gets a result written rather
-    // than leaving the sentinel in place forever.
-  }
-
-  // Conventional fake fallback, which only touches records marked as pending.
-  if (cvars::occlusion_query_fake_lower_threshold < 0 || !report_record_base ||
-      !guest_marks_end) {
+  // Fake / fallback mode.
+  if (cvars::occlusion_query_fake_lower_threshold < 0) {
     return true;
   }
-
   fake_zpd_sample_count_ =
       (fake_zpd_sample_count_ <=
        static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold))
           ? static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold)
           : fake_zpd_sample_count_ - 1;
 
-  XenosZPDReport::WriteSampleCount(report, fake_zpd_sample_count_, false);
+  zpd_speculative_sample_counter_ +=
+      XenosZPDReport::FromNativeQuery(fake_zpd_sample_count_);
+  zpd_sample_counter_ = zpd_speculative_sample_counter_;
+  COMMAND_PROCESSOR::WriteZPDReport(report_address, zpd_sample_counter_);
   return true;
 }
 
@@ -1769,8 +1722,17 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
   // prefetch the wraparound range
   // it likely is already in L3 cache, but in a zen system it may be another
   // chiplets l3
-  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(
-      GetCurrentRingReadCount());
+  uint32_t remaining = GetCurrentRingReadCount();
+  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(remaining);
+
+  // The guest polls the read pointer write-back to see how much ring space it
+  // has, and hardware advances it as the ring drains. Publishing only once the
+  // burst ends leaves the guest waiting on work we have already done, so
+  // republish every RB_BLKSZ dwords on the way through. A zero stride means
+  // the guest never armed the write-back.
+  const uint32_t writeback_stride =
+      read_ptr_update_freq_ * uint32_t(sizeof(uint32_t));
+  uint32_t remaining_at_writeback = remaining;
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -1778,7 +1740,25 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       assert_always();
       break;
     }
-  } while (reader_.read_count());
+    remaining = GetCurrentRingReadCount();
+    // remaining only grows back if a malformed packet ran the read offset past
+    // the end of the burst, and then there is nothing honest to publish.
+    if (writeback_stride && remaining <= remaining_at_writeback &&
+        remaining_at_writeback - remaining >= writeback_stride) {
+      // Re-read the target, the guest can re-point or disable the write-back
+      // from its own thread while we are draining.
+      uint32_t writeback_ptr = read_ptr_writeback_ptr_;
+      if (writeback_ptr) {
+        // Publishing the read pointer hands that ring space back, so it has to
+        // land after our reads of it.
+        std::atomic_thread_fence(std::memory_order_release);
+        xe::store_and_swap<uint32_t>(
+            memory_->TranslatePhysical(writeback_ptr),
+            uint32_t(reader_.read_offset() / sizeof(uint32_t)));
+      }
+      remaining_at_writeback = remaining;
+    }
+  } while (remaining);
 
   COMMAND_PROCESSOR::OnPrimaryBufferEnd();
 

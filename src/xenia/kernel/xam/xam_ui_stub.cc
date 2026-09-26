@@ -500,6 +500,14 @@ dword_result_t XamShowEditProfileUI_entry(dword_t user_index) {
 }
 DECLARE_XAM_EXPORT1(XamShowEditProfileUI, kUserProfiles, kImplemented);
 
+// The XNA launcher asks for an indie game to run. Upstream picks one through
+// a dialog and returns false without a window, which is what headless does.
+bool xeXamChooseIndieGame(std::string* file_name, uint32_t* device_id,
+                          std::string* display_name) {
+  XELOGW("xeXamChooseIndieGame: no picker in the libretro core");
+  return false;
+}
+
 void RegisterUIExports(xe::cpu::ExportResolver* export_resolver,
                        xe::kernel::KernelState* kernel_state) {
   // Individual exports self-register via the DECLARE_XAM_EXPORT macros above.

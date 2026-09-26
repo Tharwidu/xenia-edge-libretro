@@ -10,7 +10,9 @@
 #include "config.h"
 
 #include <algorithm>
+#include <optional>
 #include <sstream>
+#include <string_view>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -111,6 +113,31 @@ void PrintConfigToLog(const std::filesystem::path& file_path) {
   file.close();
 }
 
+// Loads an old value a same-name alias maps to one of the cvar's new type into
+// a game config. True if an alias applied.
+static bool LoadAliasedGameConfigValue(cvar::IConfigVar* config_var,
+                                       const toml::node& node) {
+  std::optional<std::string_view> value = node.value<std::string_view>();
+  if (!value) {
+    return false;
+  }
+  for (const auto& alias : xe::ui::GetCvarAliases()) {
+    if (alias.old_name != config_var->name() ||
+        alias.new_name != alias.old_name || alias.old_value != *value) {
+      continue;
+    }
+    if (dynamic_cast<cvar::ConfigVar<bool>*>(config_var)) {
+      toml::value new_value(alias.new_value == "true");
+      config_var->LoadGameConfigValue(&new_value);
+    } else {
+      toml::value new_value(alias.new_value);
+      config_var->LoadGameConfigValue(&new_value);
+    }
+    return true;
+  }
+  return false;
+}
+
 void MigrateLegacyCvars(const toml::table& config) {
   if (!cvar::ConfigVars) {
     return;
@@ -173,8 +200,20 @@ void MigrateLegacyCvars(const toml::table& config) {
             // If new_value is "*", copy the original value as-is
             std::string final_value =
                 (alias.new_value == "*") ? var_value : alias.new_value;
-            toml::value new_value(final_value);
-            config_var->LoadConfigValue(&new_value);
+            // A bool doesn't load from a string node.
+            if (dynamic_cast<cvar::ConfigVar<bool>*>(config_var)) {
+              toml::value new_value(final_value == "true");
+              config_var->LoadConfigValue(&new_value);
+            } else {
+              toml::value new_value(final_value);
+              config_var->LoadConfigValue(&new_value);
+            }
+            // Loading the old value under the same name, now of another type,
+            // failed before this migrated it.
+            if (alias.old_name == alias.new_name &&
+                cvar::config_type_mismatch_warnings) {
+              std::erase(*cvar::config_type_mismatch_warnings, alias.new_name);
+            }
           }
           break;
         }
@@ -258,7 +297,7 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
     return 0;
   }
 
-  std::string ext = game_path.extension().string();
+  std::string ext = xe::path_to_utf8(game_path.extension());
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return std::tolower(c); });
 
@@ -290,11 +329,12 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
   }
 
   if (title_id == 0) {
-    XELOGI("Could not extract title_id from: {}", game_path.string());
+    XELOGI("Could not extract title_id from: {}", xe::path_to_utf8(game_path));
     return 0;
   }
 
-  XELOGI("Extracted title_id {:08X} from: {}", title_id, game_path.string());
+  XELOGI("Extracted title_id {:08X} from: {}", title_id,
+         xe::path_to_utf8(game_path));
 
   // Load the game config directly into cvars.
   auto title_id_str = fmt::format("{:08X}", title_id);
@@ -326,7 +366,9 @@ uint32_t LoadGameConfigForFile(const std::filesystem::path& game_path) {
 
       const auto config_key_node = config.at_path(config_key);
       if (config_key_node) {
-        config_var->LoadGameConfigValue(config_key_node.node());
+        if (!LoadAliasedGameConfigValue(config_var, *config_key_node.node())) {
+          config_var->LoadGameConfigValue(config_key_node.node());
+        }
         override_count++;
 
         std::stringstream ss;
@@ -484,7 +526,7 @@ toml::table LoadGameConfig(uint32_t title_id) {
   toml::table config_table;
   if (std::filesystem::exists(game_config_path)) {
     try {
-      config_table = toml::parse_file(game_config_path.string());
+      config_table = toml::parse_file(xe::path_to_utf8(game_config_path));
     } catch (const std::exception& e) {
       XELOGE("Failed to parse game config {}: {}",
              xe::path_to_utf8(game_config_path), e.what());

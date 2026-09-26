@@ -32,6 +32,16 @@ DEFINE_bool(
     "GPU");
 #undef XE_GPU_ZERO_COPY_DEFAULT
 
+DEFINE_bool(
+    enable_host_buffer, true,
+    "Import guest RAM as a second GPU buffer, so memexport output and resolve "
+    "readback reach the CPU in place rather than through a staging copy. With "
+    "it off, or where the driver can't import guest RAM, both fall back to "
+    "copying through a staging buffer. Ignored under shared_memory_zero_copy, "
+    "where the only buffer already aliases guest RAM. Applies at title "
+    "launch.",
+    "GPU");
+
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
 
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
@@ -73,10 +83,12 @@ DEFINE_bool(
     "may be used to bypass fetch constant type errors in certain games until "
     "the real reason why they're invalid is found.",
     "GPU");
+// TODO(has207): allocs invalidate stale pages, drop this if nothing regresses.
 DEFINE_bool(
-    gpu_allow_invalid_upload_range, false,
+    gpu_allow_invalid_upload_range, true,
     "Allows games to read data from pages that are marked as no access.",
     "GPU");
+UPDATE_from_bool(gpu_allow_invalid_upload_range, 2026, 9, 12, 12, false);
 
 DEFINE_bool(
     non_seamless_cube_map, true,
@@ -113,22 +125,6 @@ DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
              "GPU");
 DEFINE_bool(occlusion_query_log, false,
             "Log occlusion query lifetime and summary stats.", "GPU");
-DEFINE_int32(occlusion_query_querybatch_range, 0,
-             "Range of fake sample count values to walk for titles using the\n"
-             "D3D QueryBatch standard before wrapping back to\n"
-             "occlusion_query_fake_lower_threshold. This shouldn't be changed\n"
-             "from the default value of 0 (disabled) unless necessary for a\n"
-             "specific title.",
-             "GPU");
-DEFINE_double(
-    occlusion_query_saturation, 1.0,
-    "Compress higher occlusion query sample counts before guest writeback.\n"
-    "This can be useful if effects such as lens flares appear too bright\n"
-    "or too strong.\n"
-    "1.0 = default behavior\n"
-    "0.0 = collapse all nonzero sample counts to 1\n"
-    "Values around 0.90 are a good starting point for subtle tuning.",
-    "GPU");
 
 uint32_t GetGuestVblankRateHz() { return cvars::use_50Hz_mode ? 50 : 60; }
 
@@ -237,14 +233,6 @@ DEFINE_bool(
     "improve image quality in some cases but can break games that rely on "
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
-
-DEFINE_bool(readback_resolve_sync, false,
-            "Stall the GPU after each readback_resolve copy so guest RAM is "
-            "coherent in the same frame, instead of copying asynchronously.\n"
-            "The copies a guest read actually waits on stall on their own, so "
-            "this only adds a stall for the rest.",
-            "GPU");
-UPDATE_from_bool(readback_resolve_sync, 2026, 8, 14, 12, true);
 
 DEFINE_bool(gpu_3d_to_2d_texture, true,
             "Handle shaders that sample 3D textures as 2D by creating a 2D "

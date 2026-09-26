@@ -32,8 +32,9 @@ inline const std::vector<CvarAlias>& GetCvarAliases() {
   static const std::vector<CvarAlias> aliases = {
       {"use_new_decoder", "true", "xma_decoder", "new"},
       {"use_old_decoder", "true", "xma_decoder", "old"},
-      {"readback_resolve", "true", "readback_resolve", "fast"},
-      {"readback_resolve", "false", "readback_resolve", "fast"},
+      {"readback_resolve", "fast", "readback_resolve", "true"},
+      {"readback_resolve", "all", "readback_resolve", "true"},
+      {"readback_resolve", "none", "readback_resolve", "false"},
       {"render_target_path_d3d12", "rtv", "render_target_path", "performance"},
       {"render_target_path_d3d12", "rov", "render_target_path", "accuracy"},
       {"render_target_path_vulkan", "fbo", "render_target_path", "performance"},
@@ -313,8 +314,8 @@ GetKnownEnumOptions() {
 #endif
         {"d3d12_readback_resolve",
          {"kCopy", "kComputeLuminance", "kComputeRGBA16"}},
+        {"media_type", {"auto", "hdd", "odd"}},
         {"occlusion_query", {"fake", "fast", "fast-alt", "strict"}},
-        {"readback_resolve", {"fast", "all", "none"}},
         {"render_target_path", {"performance", "accuracy"}},
         {"postprocess_antialiasing", {"off", "fxaa", "fxaa_extreme"}},
         {"postprocess_scaling_and_sharpening", {"none", "cas", "fsr"}},

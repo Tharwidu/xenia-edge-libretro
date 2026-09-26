@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/base/logging.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/xex_module.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -801,6 +803,32 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
     returned_value |= 1;
   }
 
+  // User mode maps a module from the PowerPC page protection in the low bits,
+  // PP in bits 0-1 and no-execute in bit 2. Only a title that enters user mode
+  // reads them, and bit 0 above means something else to the dashboard.
+  if (kernel_state->memory()->user_virtual_membase()) {
+    for (auto* module : kernel_state->processor()->GetModules()) {
+      auto* xex_module = dynamic_cast<cpu::XexModule*>(module);
+      xex2_section_type section_type;
+      if (!xex_module || xex_module->is_patch() ||
+          !xex_module->GetPageSectionType(address, &section_type)) {
+        continue;
+      }
+      switch (section_type) {
+        case XEX_SECTION_CODE:
+          returned_value = (returned_value & ~0b111u) | 0b011;
+          break;
+        case XEX_SECTION_DATA:
+          returned_value = (returned_value & ~0b111u) | 0b110;
+          break;
+        case XEX_SECTION_READONLY_DATA:
+          returned_value = (returned_value & ~0b111u) | 0b111;
+          break;
+      }
+      break;
+    }
+  }
+
   return returned_value & 0x400FFFFF;  // this is actually the mask it applies
                                        // to the final
   // result before returning it
@@ -808,13 +836,14 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
 DECLARE_XBOXKRNL_EXPORT1(KeGetImagePageTableEntry, kMemory, kStub);
 
 dword_result_t KeLockL2_entry() {
-  // TODO
+  // Since the L2 cache isn't emulated, the XPS range is always backed, so
+  // there's nothing to lock.
   return 0;
 }
-DECLARE_XBOXKRNL_EXPORT1(KeLockL2, kMemory, kStub);
+DECLARE_XBOXKRNL_EXPORT2(KeLockL2, kMemory, kImplemented, kSketchy);
 
 void KeUnlockL2_entry() {}
-DECLARE_XBOXKRNL_EXPORT1(KeUnlockL2, kMemory, kStub);
+DECLARE_XBOXKRNL_EXPORT2(KeUnlockL2, kMemory, kImplemented, kSketchy);
 
 uint32_t xeMmCreateKernelStack(uint32_t stack_size, uint32_t r4) {
   auto stack_size_aligned = (stack_size + 0xFFF) & 0xFFFFF000;

@@ -46,7 +46,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
   // is before the expected end address then the function address range is
   // split up and the second half is treated as another function.
 
-  Memory* memory = frontend_->memory();
+  Module* module = function->module();
 
   LOGPPC("Analyzing function {:08X}...", function->address());
 
@@ -62,8 +62,14 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
   bool in_block = false;
   bool starts_with_mfspr_lr = false;
   while (true) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    // Dynamic code is backed by whatever the guest committed, so stop rather
+    // than read past it. The first page holds the function start.
+    if (!(address & 0xFFF) && !module->ContainsAddress(address)) {
+      LOGPPC("function end {:08X} (outside the module)", address);
+      address -= 4;
+      break;
+    }
+    uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
 
     // If we fetched 0 assume that we somehow hit one of the awesome
     // 'no really we meant to end after that bl' functions.
@@ -290,7 +296,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
 }
 
 std::vector<BlockInfo> PPCScanner::FindBlocks(GuestFunction* function) {
-  Memory* memory = frontend_->memory();
+  Module* module = function->module();
 
   std::map<uint32_t, BlockInfo> block_map;
 
@@ -299,8 +305,7 @@ std::vector<BlockInfo> PPCScanner::FindBlocks(GuestFunction* function) {
   bool in_block = false;
   uint32_t block_start = 0;
   for (uint32_t address = start_address; address <= end_address; address += 4) {
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
     if (!code) {
       continue;
     }

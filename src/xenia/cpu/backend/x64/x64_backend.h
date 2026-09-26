@@ -11,6 +11,7 @@
 #define XENIA_CPU_BACKEND_X64_X64_BACKEND_H_
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -81,9 +82,9 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
 struct X64BackendStackpoint {
   uint64_t host_stack_;
   unsigned guest_stack_;
-  // pad to 16 bytes so we never end up having a 64 bit load/store for
-  // host_stack_ straddling two lines. Consider this field reserved for future
-  // use
+  // Guest lr at the prolog, which a dynamic code return matches against. It
+  // also pads to 16 bytes so we never end up having a 64 bit load/store for
+  // host_stack_ straddling two lines.
   unsigned guest_return_address_;
 };
 enum : uint32_t {
@@ -96,11 +97,31 @@ enum : uint32_t {
   kX64BackendMXCSRDazBit =
       4,  // when the mode bit says vmx, the loaded mxcsr is mxcsr_vmx_daz
 };
+// A resolved guest address that has no indirection slot.
+struct X64DynamicCallCacheEntry {
+  uint32_t guest_address;
+  uint32_t unused;
+  uint64_t host_address;
+};
+constexpr uint32_t kX64DynamicCallCacheSize = 4096;
+// EmitDynamicCallLookup indexes and loads these itself.
+static_assert(sizeof(X64DynamicCallCacheEntry) == 16);
+static_assert(offsetof(X64DynamicCallCacheEntry, host_address) == 8);
+static_assert((kX64DynamicCallCacheSize & (kX64DynamicCallCacheSize - 1)) == 0);
+
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
 // context (somehow placing a global X64BackendCtx prior to membase, so we can
 // negatively index the membase reg)
 struct X64BackendContext {
+  // The fields before the union are only read away from the hot path. Code
+  // addresses this struct back from its end, so they come first to keep the
+  // rest within 8-bit displacements.
+  // allocated by the first dynamic call resolve on this thread
+  X64DynamicCallCacheEntry* dynamic_call_cache;
+  // stackpoint depth a dynamic code return continues at, or 0 when none is
+  // pending. The stack synchronization helper at the target takes it.
+  uint32_t unwind_stackpoint_depth;
   union {
     __m128 helper_scratch_xmms[4];
     uint64_t helper_scratch_u64s[8];
@@ -157,16 +178,6 @@ class X64Backend : public Backend {
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
   }
-  void* synchronize_guest_and_host_stack_helper_for_size(size_t sz) const {
-    switch (sz) {
-      case 1:
-        return synchronize_guest_and_host_stack_helper_size8_;
-      case 2:
-        return synchronize_guest_and_host_stack_helper_size16_;
-      default:
-        return synchronize_guest_and_host_stack_helper_size32_;
-    }
-  }
   bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
@@ -185,6 +196,10 @@ class X64Backend : public Backend {
   virtual void InitializeBackendContext(void* ctx) override;
   virtual void DeinitializeBackendContext(void* ctx) override;
   virtual void PrepareForReentry(void* ctx) override;
+  static X64BackendStackpoint* AllocStackpoints();
+  void* CreateStackpointState() override;
+  void DestroyStackpointState(void* state) override;
+  void SwapStackpointState(void* ctx, void* state) override;
   X64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));
@@ -239,11 +254,6 @@ class X64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_;
   ResolveFunctionThunk resolve_function_thunk_;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
-
-  // loads stack sizes 1 byte, 2 bytes or 4 bytes
-  void* synchronize_guest_and_host_stack_helper_size8_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size16_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size32_ = nullptr;
 
  public:
   void* try_acquire_reservation_helper_ = nullptr;

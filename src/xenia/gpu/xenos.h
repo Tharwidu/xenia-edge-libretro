@@ -129,8 +129,7 @@ enum class TextureSign : uint32_t {
 enum class TextureFilter : uint32_t {
   kPoint = 0,
   kLinear = 1,
-  // Only applicable to the mip filter - like OpenGL minification filters
-  // GL_NEAREST / GL_LINEAR without MIPMAP_NEAREST / MIPMAP_LINEAR.
+  // Only applicable to the mip filter - use the base map without mip filtering.
   kBaseMap = 2,
   kUseFetchConst = 3,
 };
@@ -945,6 +944,9 @@ enum class EdramMode : uint32_t {
   //   from the vertex shader) as no texture alpha cutout is involved.
   // - 5454082B also has kDepthOnly draws with pretty complex shaders clearly
   //   for use only in the color pass - even fetching and filtering a shadowmap.
+  // - D3D itself switches to kDepthOnly when a null pixel shader is set
+  //   (4541096E does it in its own shader state flush) and nothing seems to
+  //   unload the previous PS from the command processor.
   // For now, based on these, let's assume the pixel shader is never used with
   // kDepthOnly.
   kDepthOnly = 5,

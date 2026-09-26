@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <type_traits>
 #include <unordered_map>
@@ -49,10 +50,10 @@ namespace gpu {
 //   However, the max level is not ignored because any mip count can be
 //   specified when creating a texture, and another texture may be placed after
 //   the last one.
-// - If the texture has a mip address, but the base address is 0 or the same as
-//   the mip address, a mipmapped texture is created, but min/max LOD is clamped
-//   to the lower bound of 1 - the game is expected to do that anyway until the
-//   largest LOD is loaded.
+// - If the texture has a mip address, but the base address is 0, a mipmapped
+//   texture is created with the minimum LOD clamped to 1.
+// - If the base and mip addresses are the same with a nonzero minimum mip
+//   level, level 0 is already excluded, so the base upload is skipped.
 // TODO(Triang3l): Attach the largest LOD to existing textures with a valid
 // mip_address but no base ever used yet (no base_address) to save memory
 // because textures are streamed this way anyway.
@@ -106,6 +107,11 @@ class TextureCache {
   // scaled state of the range.
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
                            bool resolution_scaled);
+  // Records that the shared memory buffer also holds the downscaled output of a
+  // scaled resolve, so a CPU write into it can unmark all of it: textures over
+  // the rest of it load from the shared memory buffer correctly then.
+  void MarkScaledResolveMirrored(uint32_t start_unscaled,
+                                 uint32_t length_unscaled);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(
@@ -534,6 +540,7 @@ class TextureCache {
   struct TextureBinding {
     TextureKey key;
     // Packed integer scale, 6 bits per component.
+    // Bit 24 for normalized values.
     uint32_t integer_scale_bits;
     // Destination swizzle merged with guest to host format swizzle.
     uint32_t host_swizzle;
@@ -590,6 +597,13 @@ class TextureCache {
   // 4D5307E6 also expects replicated components in k_8 sprites.
   // DXN is read as RG in 4D5307E6, but as RA in 415607E6.
   // TODO(Triang3l): Find out the correct contents of unused texture components.
+  // Logs the sampler a backend built for one fetch constant.
+  void LogSamplerParameters(uint32_t fetch_constant, uint32_t packed) const;
+
+  // Logs one texture upload with its guest key.
+  void LogTextureLoad(const TextureKey& key, uint32_t load_shader,
+                      bool load_base, bool load_mips) const;
+
   virtual uint32_t GetHostFormatSwizzle(TextureKey key) const = 0;
 
   virtual uint32_t GetMaxHostTextureWidthHeight(
@@ -682,6 +696,9 @@ class TextureCache {
   void ScaledResolveGlobalWatchCallback(
       const global_unique_lock_type& global_lock, uint32_t address_first,
       uint32_t address_last, bool invalidated_by_gpu);
+  // Clears the scaled marks of the pages, returning whether any was set. Under
+  // global_critical_region_.
+  bool UnmarkScaledResolvePages(uint32_t page_first, uint32_t page_last);
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
@@ -701,6 +718,11 @@ class TextureCache {
   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
   // level 2 bits.
   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
+  // First to last page of each scaled resolve also in the shared memory buffer,
+  // by first page, so that a CPU write into one unmarks all of it. Under
+  // global_critical_region_.
+  std::map<uint32_t, uint32_t> scaled_resolve_extents_;
+  static constexpr size_t kMaxScaledResolveExtents = 4096;
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;

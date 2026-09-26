@@ -15,9 +15,11 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,6 +29,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/hash.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -62,7 +65,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
  public:
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
-    kStorageBufferCompute,
+    kStorageBuffer,
+    // Scratch buffer plus the destination image of a texture load, for the
+    // compute blit that replaces vkCmdCopyBufferToImage.
+    kStorageBufferAndStorageImage,
     kCount,
   };
 
@@ -150,6 +156,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
+  void ClearReadbackBuffers() override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -249,6 +256,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
     return descriptor_set_layouts_single_transient_[size_t(
         transient_descriptor_layout)];
   }
+  // Queues an image, its view and its memory for destruction once the
+  // submission using them now has completed. Any of them may be null.
+  void DestroyScratchImageWhenIdle(VkImage image, VkImageView image_view,
+                                   VkDeviceMemory memory);
+
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
       SingleTransientDescriptorLayout transient_descriptor_layout);
@@ -303,22 +315,60 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
 
-  // Copies a held resolve range into guest RAM and waits for it, out of the
-  // shared memory buffer or out of the destination's hold snapshot. Called
-  // from NoteResolveCoherency.
-  void FlushResolveRangeToGuestRam(uint32_t address, uint32_t length,
-                                   bool from_snapshot);
+  // For command_processor_resolve_readwatch.inc.
+  bool EndResolveSubmission() {
+    return !submission_open_ || EndSubmission(false);
+  }
+  uint64_t GetResolveSubmittedThrough() const {
+    return resolve_submitted_through_.load(std::memory_order_acquire);
+  }
+  // Copies resolve output into guest RAM from a fault, on its own command
+  // buffer and fence, as the faulting thread can't use the GPU thread's. With
+  // zero-copy, only waits for the resolve to have written it.
+  bool FaultCopyResolveToGuestRam(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+  void DestroyResolveFaultCopy();
+  bool EnsureResolveFaultReadback(uint32_t size);
+  // The last submission handed to the GPU, for other threads.
+  std::atomic<uint64_t> resolve_submitted_through_{0};
+  VkCommandPool resolve_fault_command_pool_ = VK_NULL_HANDLE;
+  VkCommandBuffer resolve_fault_command_buffer_ = VK_NULL_HANDLE;
+  VkFence resolve_fault_fence_ = VK_NULL_HANDLE;
+  std::vector<VkBufferCopy> resolve_fault_copy_regions_;
 
-  // Hold snapshot storage for command_processor_resolve_readwatch.inc, which
-  // owns the pool itself.
-  struct ResolveHoldSnapshotBuffer {
+  // Staging storage for command_processor_readback_staging.inc, which owns the
+  // pool itself. Used only without the guest RAM host buffer.
+  struct ReadbackStagingBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    uint32_t memory_type = 0;
+    VkDeviceSize memory_size = 0;
   };
-  bool CreateResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer,
-                                       uint32_t size);
-  void DestroyResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer);
-  void PrepareResolveHoldSnapshotEviction();
+  bool CreateReadbackStagingBuffer(ReadbackStagingBuffer& buffer,
+                                   uint32_t size);
+  void DestroyReadbackStagingBuffer(ReadbackStagingBuffer& buffer);
+  // Where a fault copy lands without the guest RAM host buffer. Idle between
+  // fault copies, each of which is awaited.
+  ReadbackStagingBuffer resolve_fault_readback_;
+  uint32_t resolve_fault_readback_size_ = 0;
+  void PrepareReadbackStagingEviction();
+  void InvalidateReadbackStaging(const ReadbackStagingBuffer& buffer);
+  // The staging pool, shared with the D3D12 backend. Included here rather than
+  // with the other fragments because the declarations below name its
+  // ReadbackStagingSlot.
+#include "../command_processor_readback_staging.inc"
+  void OrderReadbackStagingWrite(VkBuffer staging_buffer);
+  void StageMemexportReadback();
+  void FlushMemexportStagingReadback();
+  // Export ranges staged but not yet copied out, in record order - a later
+  // copy of an overlapping range has to win.
+  struct MemexportStagedRange {
+    uint64_t key;
+    uint32_t address;
+    uint32_t length;
+  };
+  std::vector<MemexportStagedRange> memexport_staged_;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -335,6 +385,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
 
   void InitializeTrace() override;
+  bool DumpEdramSnapshotToFile(const std::filesystem::path& path) override;
 
  private:
   struct CommandBuffer {
@@ -487,20 +538,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   // ZPD occlusion queries backend.
   // vkCmdBeginQuery is only valid inside a render pass, so segments split at
-  // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
-  // segment_pending_begin waits for the next. Outside a render pass,
-  // DiscardZPDQuery defers the slot release until the submission completes.
-  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
-  // need to open before a pass begins or split an active pass around the clear.
-
+  // pass end and resume at the next pass begin. If a report starts outside a
+  // pass, segment_pending_begin waits for the next. FSI queries clear a
+  // dedicated counter with vkCmdFillBuffer, so they may need to open before a
+  // pass begins or split an active pass around the clear.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
-    zpd_deferred_releases_.clear();
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_fsi_ = false;
-    zpd_fsi_counter_index_force_update_ = true;
+    zpd_fsi_path_ = false;
+    zpd_counter_index_force_update_ = true;
     if (zpd_host_query_pool_) {
       zpd_host_query_pool_->Shutdown();
     }
@@ -509,11 +558,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool IsZPDQueryPoolReady() const override;
   bool CanOpenZPDQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
-                               bool can_close_submission) override;
+  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle,
                      uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
@@ -587,20 +634,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
     uint32_t scale_area = 1;
-    bool uses_fsi_counter = false;
+    bool fsi = false;
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_fsi_ = false;
-  bool zpd_fsi_counter_index_force_update_ = true;
+  bool zpd_fsi_path_ = false;
+  bool zpd_hybrid_supported_ = false;
+  bool zpd_counter_index_force_update_ = true;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
-  // Fallback buffer for EDRAM descriptor binding 2.
-  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
-  // Currently installed binding 2 buffer.
-  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
-  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+  // Fallback buffer for ZPD counter descriptor binding 1.
+  VkBuffer zpd_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 1 buffer.
+  VkBuffer zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_counter_descriptor_range_ = 0;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
@@ -694,13 +744,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // No specific reason for 32768, just the "too much" descriptor count from
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
-  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBufferAndImage[2];
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator
+      transient_descriptor_allocator_storage_buffer_and_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>,
              size_t(SingleTransientDescriptorLayout::kCount)>
@@ -726,16 +779,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
   std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
-
-  // Deferred query slot releases for discards that happen outside a render
-  // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the
-  // submission containing the stale BeginQuery completes on the GPU.
-  struct DeferredQueryRelease {
-    uint64_t submission;
-    uint32_t query_index;
-    uint32_t query_generation;
-  };
-  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
@@ -933,8 +976,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+  // The bindings are VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, so the infos
+  // describe only the pool page and the size - the offset within the page is
+  // passed when binding and the info offset stays 0.
   VkDescriptorBufferInfo current_constant_buffer_infos_
-      [SpirvShaderTranslator::kConstantBufferCount];
+      [SpirvShaderTranslator::kConstantBufferCount]{};
+  uint32_t current_constant_buffer_dynamic_offsets_
+      [SpirvShaderTranslator::kConstantBufferCount]{};
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
@@ -982,6 +1030,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
 
+  // Host viewport of the previous draw, reused while the inputs it was derived
+  // from stay the same.
+  draw_util::GetViewportInfoArgs previous_viewport_info_args_{};
+  draw_util::ViewportInfo previous_viewport_info_{};
+
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
 
@@ -989,9 +1042,20 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // consumption tracking, shared with the D3D12 backend.
 #include "../command_processor_resolve_readwatch.inc"
   // Per-backend trampoline from the memory read callback into the shared
-  // MarkResolvePagesRead.
+  // MarkResolvePagesRead, PrepareResolvePagesForWrite or DiscardResolvePages.
   static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,
-                                       uint32_t length);
+                                       uint32_t length,
+                                       Memory::PhysicalAccess access);
+  // Downscaling a scaled resolve's output into resolve_downscale_buffer_ for a
+  // copy out of it, and writing it into the shared memory buffer where a native
+  // resolve would have, for a fault to copy it from there. Declared after the
+  // .inc for ScaledResolveReadbackInfo.
+  bool DownscaleScaledResolve(uint32_t written_address,
+                              const ScaledResolveReadbackInfo& scaled_info);
+  bool MirrorScaledResolveToSharedMemory(uint32_t written_address,
+                                         uint32_t written_length,
+                                         reg::RB_COPY_DEST_INFO copy_dest_info,
+                                         uint32_t& mirrored_length_out);
 
   // Debug marker support for RenderDoc/debug tools.
   bool debug_markers_enabled_ = false;

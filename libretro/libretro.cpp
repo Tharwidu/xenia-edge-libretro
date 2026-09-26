@@ -55,7 +55,7 @@ DECLARE_int32(log_level);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
 DECLARE_uint32(framerate_limit);
-DECLARE_string(readback_resolve);
+DECLARE_bool(readback_resolve);
 DECLARE_bool(store_shaders);
 DECLARE_bool(half_pixel_offset);
 DECLARE_bool(gpu_allow_invalid_fetch_constants);
@@ -98,7 +98,6 @@ DECLARE_int32(avpack);
 DECLARE_bool(allow_incompatible_title_update);
 DECLARE_bool(vulkan_sparse_shared_memory);
 DECLARE_bool(tiled_shared_memory);
-DECLARE_bool(readback_resolve_sync);
 #ifdef _WIN32
 // Defined in d3d12_command_processor.cc, and xenia-gpu-d3d12-headless is built
 // only `if os.istarget("windows")` - declaring it unconditionally compiles
@@ -872,11 +871,13 @@ static void apply_core_options(void) {
         cvars::async_shader_compilation = (strcmp(v, "enabled") == 0);
     }
 
-    // Readback resolve. "auto" defers to the config, which is how a single
-    // title can run "none" (much faster where it works - Fable II went from
-    // 22 to 30 guest fps) while others keep the safer default.
+    // Readback resolve. "auto" defers to the config, so a single title can
+    // turn it off where that is faster and still renders correctly. The
+    // fast/all/none values saved by cores before readback became a bool map
+    // the way upstream maps them.
     if ((v = opt_get(XENIA_OPT_READBACK_RESOLVE)) && !opt_is_auto(v)) {
-        cvars::readback_resolve = v;
+        cvars::readback_resolve = strcmp(v, "disabled") != 0 &&
+                                  strcmp(v, "none") != 0;
     }
 
     // Store shaders
@@ -1138,10 +1139,6 @@ static void apply_core_options(void) {
         cvars::d3d12_bindless = (strcmp(v, "enabled") == 0);
     }
 #endif
-
-    if ((v = opt_get(XENIA_OPT_READBACK_SYNC)) && !opt_is_auto(v)) {
-        cvars::readback_resolve_sync = (strcmp(v, "enabled") == 0);
-    }
 
     // =================================================================
     // Debug
@@ -2541,7 +2538,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     xenia_log(RETRO_LOG_INFO, "  render_target_path = %s\n",
               cvars::render_target_path.c_str());
     xenia_log(RETRO_LOG_INFO, "  readback_resolve = %s\n",
-              cvars::readback_resolve.c_str());
+              cvars::readback_resolve ? "true" : "false");
     xenia_log(RETRO_LOG_INFO, "  draw_resolution_scale = %dx%d\n",
               cvars::draw_resolution_scale_x, cvars::draw_resolution_scale_y);
     xenia_log(RETRO_LOG_INFO, "  texture_cache_rt_limit = %u MB\n",

@@ -69,7 +69,6 @@ struct xenia_core_state;
 #define XENIA_OPT_VK_SPARSE_MEMORY      "xenia_vulkan_sparse_shared_memory"
 #define XENIA_OPT_TILED_SHARED_MEMORY   "xenia_tiled_shared_memory"
 #define XENIA_OPT_D3D12_BINDLESS        "xenia_d3d12_bindless"
-#define XENIA_OPT_READBACK_SYNC         "xenia_readback_resolve_sync"
 
 // Core option keys ??? Audio / input additions
 #define XENIA_OPT_VOLUME                "xenia_volume"
@@ -199,20 +198,19 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         XENIA_OPT_READBACK_RESOLVE,
         "Readback Resolve",
         "Readback",
-        "Controls which render-to-texture resolves are copied back into "
-        "guest RAM.\n"
+        "Whether render-to-texture resolves are copied back into guest RAM. "
+        "When enabled, a resolve is copied only once the CPU actually "
+        "touches its pages.\n"
         "Auto: use the config file, so a per-title config can set this.\n"
-        "Fast: copy only resolves the CPU reads back (xenia's default).\n"
-        "All: copy every resolve - slower, needed by a few titles.\n"
-        "None: disable readback completely - much faster where it works, "
-        "but some titles render incorrectly without it.",
+        "Enabled: copy resolves the CPU reads (xenia's default).\n"
+        "Disabled: never copy - faster where it works, but some titles "
+        "render incorrectly without it.",
         NULL,
         "Graphics",
         {
-            { "auto", "Auto (from config)" },
-            { "fast", "Fast" },
-            { "all",  "All (Slower)" },
-            { "none", "None (Fastest)" },
+            { "auto",     "Auto (from config)" },
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
             { NULL, NULL }
         },
         "auto"
@@ -1023,23 +1021,6 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "auto"
     },
 #endif  // _WIN32
-    {
-        XENIA_OPT_READBACK_SYNC,
-        "Readback Resolve Sync",
-        "Readback Sync",
-        "Stall the GPU after each readback copy so guest memory is correct "
-        "before the game reads it. Disabling is faster but can show stale "
-        "data. Only matters when Readback Resolve is not None.",
-        NULL,
-        "Backend Tuning",
-        {
-            { "auto",     "Auto (from config)" },
-            { "enabled",  "Enabled" },
-            { "disabled", "Disabled" },
-            { NULL, NULL }
-        },
-        "auto"
-    },
     /* Terminator */
     { NULL, NULL, NULL, NULL, NULL, NULL, {{0}}, NULL }
 };

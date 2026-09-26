@@ -10,6 +10,7 @@
 #ifndef XENIA_MEMORY_H_
 #define XENIA_MEMORY_H_
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -205,7 +206,10 @@ class BaseHeap {
                        uint32_t* old_protect = nullptr);
 
   // Queries information about the given region of pages.
-  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+  // The region size stops growing once it reaches max_region_size, for a
+  // caller only asking about a range within it.
+  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info,
+                       uint32_t max_region_size = UINT32_MAX);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -216,6 +220,39 @@ class BaseHeap {
   // Queries the current protection mode of the region containing the given
   // address.
   bool QueryProtect(uint32_t address, uint32_t* out_protect);
+
+  // True when no allocation covers any page in the range.
+  virtual bool IsRangeUnallocated(uint32_t address, uint32_t size);
+
+  // The most permissive access of the committed pages covering the
+  // heap-relative range. Doesn't take the global lock, for callers holding it.
+  xe::memory::PageAccess CommittedRangeAccess(uint32_t relative_address,
+                                              uint32_t length) const {
+    uint32_t page_count = uint32_t(page_table_.size());
+    uint32_t page_first = relative_address >> page_size_shift_;
+    if (!length || page_first >= page_count) {
+      return xe::memory::PageAccess::kNoAccess;
+    }
+    uint32_t page_last = (relative_address + (length - 1)) >> page_size_shift_;
+    if (page_last >= page_count) {
+      page_last = page_count - 1;
+    }
+    xe::memory::PageAccess access = xe::memory::PageAccess::kNoAccess;
+    for (uint32_t i = page_first; i <= page_last; ++i) {
+      if (!(page_table_[i].state & kMemoryAllocationCommit)) {
+        continue;
+      }
+      xe::memory::PageAccess page_access =
+          ToPageAccess(page_table_[i].current_protect);
+      if (page_access == xe::memory::PageAccess::kReadWrite) {
+        return xe::memory::PageAccess::kReadWrite;
+      }
+      if (page_access == xe::memory::PageAccess::kReadOnly) {
+        access = xe::memory::PageAccess::kReadOnly;
+      }
+    }
+    return access;
+  }
 
   // Queries the currently strictest readability and writability for the entire
   // range.
@@ -236,6 +273,20 @@ class BaseHeap {
 
   // Rebuilds free_blocks_ by scanning page_table_. Used after Restore.
   void RebuildFreeBlocks();
+
+  // Applies `protect` to the host mapping backing the inclusive guest page
+  // range. Handles a host page larger than the guest page by protecting whole
+  // host pages with the most permissive access any guest page inside one
+  // needs, so a neighbour's protection is never tightened. page_table_ is read
+  // for pages outside the range, so it must still hold their current state.
+  bool ApplyHostProtect(uint32_t start_page_number, uint32_t end_page_number,
+                        uint32_t protect, uint32_t* old_protect);
+
+  // Backs the guest page range on the host at commit time. Equivalent to a
+  // host commit where the guest page size is host-page-aligned, and falls back
+  // to ApplyHostProtect where it is not (4 KB guest pages on a 16 KB host).
+  bool CommitHostPages(uint32_t start_page_number, uint32_t page_count,
+                       uint32_t protect);
 
   // Removes (or splits) the free block covering the given page range.
   void RemoveFreeBlock(uint32_t start_page, uint32_t page_count);
@@ -308,6 +359,8 @@ class PhysicalHeap : public BaseHeap {
                uint32_t* out_region_size = nullptr) override;
   bool Protect(uint32_t address, uint32_t size, uint32_t protect,
                uint32_t* old_protect = nullptr) override;
+  // Also false where another view of the physical memory has it allocated.
+  bool IsRangeUnallocated(uint32_t address, uint32_t size) override;
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications,
@@ -321,11 +374,14 @@ class PhysicalHeap : public BaseHeap {
   // invalidate_unwatched the callbacks are raised even when no watch is armed,
   // for a caller that knows the range is about to change rather than one
   // reacting to a fault.
+  // contents_discarded is for a write that makes the old contents irrelevant,
+  // like a fresh allocation, rather than one that may change only part of them.
   bool TriggerCallbacks(global_unique_lock_type global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length,
                         bool is_write, bool unwatch_exact_range,
                         bool unprotect = true,
-                        bool invalidate_unwatched = false);
+                        bool invalidate_unwatched = false,
+                        bool contents_discarded = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -341,8 +397,10 @@ class PhysicalHeap : public BaseHeap {
   // The most permissive guest access of the guest pages a system page covers.
   // Protection has system page granularity and BaseHeap::Protect resolves a
   // system page the same way, so anything deciding on protection has to agree
-  // with it - the host page can be larger than the guest page. Inline, called
-  // per page in the arming loop.
+  // with it - the host page can be larger than the guest page. The physical
+  // views alias the same memory, so where this view has nothing allocated, the
+  // access is that of the allocation made through another view, which the
+  // guest reaches here too. Inline, called per page in the arming loop.
   xe::memory::PageAccess SystemPageGuestAccess(
       uint32_t system_page_number) const {
     uint32_t offset = host_address_offset();
@@ -362,7 +420,12 @@ class PhysicalHeap : public BaseHeap {
       guest_page_last = guest_page_count - 1;
     }
     xe::memory::PageAccess access = xe::memory::PageAccess::kNoAccess;
+    bool any_unallocated = false;
     for (uint32_t i = guest_page_first; i <= guest_page_last; ++i) {
+      if (!page_table_[i].state) {
+        any_unallocated = true;
+        continue;
+      }
       xe::memory::PageAccess page_access =
           ToPageAccess(page_table_[i].current_protect);
       if (page_access == xe::memory::PageAccess::kReadWrite) {
@@ -370,6 +433,16 @@ class PhysicalHeap : public BaseHeap {
       }
       if (page_access == xe::memory::PageAccess::kReadOnly) {
         access = xe::memory::PageAccess::kReadOnly;
+      }
+    }
+    if (any_unallocated) {
+      uint32_t relative_address =
+          system_base > offset ? system_base - offset : 0;
+      xe::memory::PageAccess parent_access = parent_heap_->CommittedRangeAccess(
+          GetPhysicalAddress(heap_base_) + relative_address,
+          system_last - offset + 1 - relative_address);
+      if (parent_access != xe::memory::PageAccess::kNoAccess) {
+        access = parent_access;
       }
     }
     return access;
@@ -576,14 +649,25 @@ class Memory {
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
 
+  // How a read-watched page is being accessed.
+  enum class PhysicalAccess {
+    kRead,
+    // May change only part of the contents, so the rest has to be current.
+    kWrite,
+    // Makes the old contents irrelevant - a fresh allocation, a release, or
+    // data already written over the range by the host.
+    kDiscard,
+  };
   // Called on the first CPU access of a page armed as a read watch (via
   // EnablePhysicalMemoryAccessCallbacks with data providers). The page is
-  // downgraded and unwatched right after, so it fires once per arm. Must be
-  // lightweight and non-blocking. It runs in the fault handler under the global
-  // critical region.
+  // downgraded and unwatched right after, so it fires once per arm. A write
+  // that drops read watches calls it too, before the write proceeds. It runs in
+  // the fault handler under the global critical region, so it may wait only for
+  // what needs no other thread to progress, like already submitted GPU work.
   typedef void (*PhysicalMemoryReadCallback)(void* context_ptr,
                                              uint32_t physical_address_start,
-                                             uint32_t length);
+                                             uint32_t length,
+                                             PhysicalAccess access);
   void* RegisterPhysicalMemoryReadCallback(PhysicalMemoryReadCallback callback,
                                            void* callback_context);
   void UnregisterPhysicalMemoryReadCallback(void* callback_handle);
@@ -618,6 +702,22 @@ class Memory {
 
   // Frees memory allocated with SystemHeapAlloc.
   void SystemHeapFree(uint32_t address, uint32_t* out_region_size = nullptr);
+
+  // Maps the address space user mode code runs in, which shows 64 KB physical
+  // memory at 0x20000000-0x3FFFFFFF. Titles without user mode never create it.
+  bool EnableUserModeViews();
+
+  // Base of the user mode address space, null until it is created.
+  inline uint8_t* user_virtual_membase() const {
+    return user_virtual_membase_.load(std::memory_order_relaxed);
+  }
+
+  // The kernel address with the same contents as a user mode address.
+  static uint32_t UserModeKernelAddress(uint32_t user_address) {
+    return user_address - kUserAliasBase < kUserAliasSize
+               ? user_address + 0x80000000
+               : user_address;
+  }
 
   // Gets the heap for the address space containing the given address.
   XE_NOALIAS
@@ -654,6 +754,11 @@ class Memory {
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
+  bool MapUserViews(uint8_t* user_membase);
+  void UnmapUserViews();
+
+  static constexpr uint32_t kUserAliasBase = 0x20000000;
+  static constexpr uint32_t kUserAliasSize = 0x20000000;
 
   static uint32_t HostToGuestVirtualThunk(const void* context,
                                           const void* host_address);
@@ -687,6 +792,11 @@ class Memory {
     };
     uint8_t* all_views[9];
   } views_ = {{0}};
+  std::atomic<uint8_t*> user_virtual_membase_{nullptr};
+  struct {
+    uint8_t* base;
+    size_t length;
+  } user_views_[9] = {};
 
   std::unique_ptr<cpu::MMIOHandler> mmio_handler_;
 
@@ -697,6 +807,7 @@ class Memory {
     VirtualHeap v90000000;
 
     VirtualHeap physical;
+    PhysicalHeap v7F000000;
     PhysicalHeap vA0000000;
     PhysicalHeap vC0000000;
     PhysicalHeap vE0000000;

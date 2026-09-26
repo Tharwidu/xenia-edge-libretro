@@ -10,7 +10,10 @@
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
 #include <stddef.h>
+#include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 
@@ -85,7 +88,7 @@ void PPCHIRBuilder::Reset() {
 bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   SCOPE_profile_cpu_f("cpu");
 
-  Memory* memory = frontend_->memory();
+  Module* module = function->module();
 
   function_ = function;
   start_address_ = function_->address();
@@ -122,8 +125,7 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
     trace_info_.dest_count = 0;
-    uint32_t code =
-        xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
     auto opcode = LookupOpcode(code);
     auto& opcode_info = GetOpcodeInfo(opcode);
 
@@ -202,7 +204,37 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   return Finalize();
 }
 
+static const std::vector<uint32_t>& LogLrAddresses() {
+  static const std::vector<uint32_t> addresses = []() {
+    std::vector<uint32_t> out;
+    const std::string& spec = cvars::log_lr_at_instruction;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      std::string token = spec.substr(pos, end - pos);
+      try {
+        out.push_back(uint32_t(std::stoull(token, nullptr, 0)));
+      } catch (const std::exception&) {
+        XELOGW("log_lr_at_instruction: ignoring '{}'", token);
+      }
+      pos = end + 1;
+    }
+    return out;
+  }();
+  return addresses;
+}
+
 void PPCHIRBuilder::MaybeBreakOnInstruction(uint32_t address) {
+  const auto& log_lr_addresses = LogLrAddresses();
+  if (std::find(log_lr_addresses.begin(), log_lr_addresses.end(), address) !=
+      log_lr_addresses.end()) {
+    Comment("--log-lr-at-instruction target");
+    CallExtern(builtins()->log_lr_handler);
+  }
+
   if (address != cvars::break_on_instruction) {
     return;
   }

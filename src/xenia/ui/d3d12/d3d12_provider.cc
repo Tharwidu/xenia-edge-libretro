@@ -91,16 +91,26 @@ const std::string& D3D12Provider::GetAdapterDescription() const {
 
 void D3D12Provider::DumpDeviceRemovedData() const {
   ID3D12DeviceRemovedExtendedData* dred;
-  if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&dred)))) {
+  HRESULT hr = device_->QueryInterface(IID_PPV_ARGS(&dred));
+  if (FAILED(hr)) {
+    XELOGW("DRED: not available on this device (HRESULT 0x{:08X})",
+           uint32_t(hr));
     return;
   }
-  bool any_data = false;
+  // Breadcrumbs and page-fault data are captured independently, so each is
+  // reported on its own - a missing half is itself a finding.
+  bool breadcrumbs_captured = false;
   // Breadcrumbs identify the last GPU operation that ran before the removal.
   D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs;
-  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+  hr = dred->GetAutoBreadcrumbsOutput(&breadcrumbs);
+  if (FAILED(hr)) {
+    XELOGW("DRED: breadcrumbs unavailable (HRESULT 0x{:08X})", uint32_t(hr));
+  } else {
+    uint32_t node_count = 0, unfinished_count = 0;
     for (const D3D12_AUTO_BREADCRUMB_NODE* node =
              breadcrumbs.pHeadAutoBreadcrumbNode;
          node; node = node->pNext) {
+      ++node_count;
       uint32_t op_count = node->BreadcrumbCount;
       uint32_t completed =
           node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
@@ -108,7 +118,7 @@ void D3D12Provider::DumpDeviceRemovedData() const {
         // This command list finished, so it is not where the GPU stopped.
         continue;
       }
-      any_data = true;
+      ++unfinished_count;
       XELOGE(
           "DRED: command list '{}' on queue '{}' stopped after {} of {} ops, "
           "next op was {}",
@@ -118,17 +128,34 @@ void D3D12Provider::DumpDeviceRemovedData() const {
                                         : "<unnamed>",
           completed, op_count, uint32_t(node->pCommandHistory[completed]));
     }
+    breadcrumbs_captured = node_count != 0;
+    if (!node_count) {
+      XELOGW("DRED: the breadcrumb ring is empty - no command list recorded");
+    } else if (!unfinished_count) {
+      XELOGW(
+          "DRED: all {} recorded command lists completed - the fault is not "
+          "in a recorded operation",
+          node_count);
+    }
   }
   // Page-fault data names the allocation a bad GPU address belonged to.
+  bool page_fault_captured = false;
   D3D12_DRED_PAGE_FAULT_OUTPUT page_fault;
-  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) &&
-      page_fault.PageFaultVA) {
-    any_data = true;
+  hr = dred->GetPageFaultAllocationOutput(&page_fault);
+  if (FAILED(hr)) {
+    XELOGW("DRED: page-fault data unavailable (HRESULT 0x{:08X})",
+           uint32_t(hr));
+  } else if (!page_fault.PageFaultVA) {
+    XELOGW("DRED: the removal was not a GPU page fault");
+  } else {
+    page_fault_captured = true;
     XELOGE("DRED: GPU page fault at virtual address 0x{:016X}",
            uint64_t(page_fault.PageFaultVA));
+    uint32_t allocation_count = 0;
     for (const D3D12_DRED_ALLOCATION_NODE* node =
              page_fault.pHeadExistingAllocationNode;
          node; node = node->pNext) {
+      ++allocation_count;
       XELOGE("DRED:   live allocation '{}' (type {})",
              node->ObjectNameA ? node->ObjectNameA : "<unnamed>",
              uint32_t(node->AllocationType));
@@ -136,15 +163,19 @@ void D3D12Provider::DumpDeviceRemovedData() const {
     for (const D3D12_DRED_ALLOCATION_NODE* node =
              page_fault.pHeadRecentFreedAllocationNode;
          node; node = node->pNext) {
+      ++allocation_count;
       XELOGE("DRED:   recently freed allocation '{}' (type {})",
              node->ObjectNameA ? node->ObjectNameA : "<unnamed>",
              uint32_t(node->AllocationType));
     }
+    if (!allocation_count) {
+      XELOGE(
+          "DRED:   no tracked allocation - the address belongs to nothing we "
+          "own");
+    }
   }
-  if (!any_data) {
-    XELOGW(
-        "DRED: no device-removed data; restart with --d3d12_dred to capture "
-        "the faulting operation");
+  if (!breadcrumbs_captured && !page_fault_captured && !cvars::d3d12_dred) {
+    XELOGW("DRED: nothing captured; restart with --d3d12_dred");
   }
   dred->Release();
 }
@@ -209,17 +240,8 @@ D3D12Provider::~D3D12Provider() {
     }
   }
 
-  if (library_dxcompiler_ != nullptr) {
-    FreeLibrary(library_dxcompiler_);
-  }
   if (library_dxil_ != nullptr) {
     FreeLibrary(library_dxil_);
-  }
-  if (library_dxilconv_ != nullptr) {
-    FreeLibrary(library_dxilconv_);
-  }
-  if (library_d3dcompiler_ != nullptr) {
-    FreeLibrary(library_d3dcompiler_);
   }
   if (library_d3d12_ != nullptr) {
     FreeLibrary(library_d3d12_);
@@ -279,116 +301,30 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Load optional D3DCompiler_47.dll.
-  pfn_d3d_disassemble_ = nullptr;
-  library_d3dcompiler_ = LoadLibraryW(L"D3DCompiler_47.dll");
-  if (library_d3dcompiler_) {
-    pfn_d3d_disassemble_ =
-        pD3DDisassemble(GetProcAddress(library_d3dcompiler_, "D3DDisassemble"));
-    if (pfn_d3d_disassemble_ == nullptr) {
-      XELOGD(
-          "Failed to get D3DDisassemble from D3DCompiler_47.dll, DXBC "
-          "disassembly for debugging will be unavailable");
-    }
-  } else {
-    XELOGD(
-        "Failed to load D3DCompiler_47.dll, DXBC disassembly for debugging "
-        "will be unavailable");
-  }
-
-  // Load dxilconv.dll. Despite the "optional" it used to be labelled with,
-  // this is load-bearing: D3D12RenderTargetCache::Initialize needs the DXBC to
-  // DXIL converter for the transfer pixel shaders of the host render target
-  // path, which is what render_target_path=performance selects (and what most
-  // per-title configs ask for). Without it those titles die at their first
-  // real draws. dxilconv is an in-box Windows component and is NOT present
-  // under Wine/Proton, where this is the difference between a working run and
-  // a silent death - so log it loudly enough to be found. It is also not
-  // redistributable through the prebuilt DXC release or a NuGet package, but
-  // it IS buildable from DirectXShaderCompiler's projects/dxilconv (NCSA
-  // licence, HLSL_BUILD_DXILCONV defaults to ON), and it imports nothing but
-  // Win32/UCRT API sets - no D3D12, no DXGI - so a copy of it runs under Wine
-  // like any other CPU library.
-  //
-  // Look in the D3D12 folder next to the executable BEFORE falling back to the
-  // plain-name search, the same way dxcompiler.dll is loaded below. The bare
-  // LoadLibraryW finds an in-box copy on Windows but can never find one we
-  // bundle, so a Wine prefix had no way to be given the DLL short of dropping
-  // it next to the frontend executable.
+  // Load the required DXIL validator (dxil.dll) from the D3D12 folder next to
+  // the executable. It signs every shader Mesa emits, which D3D12 rejects
+  // unsigned, so offer to download it if it's missing.
   auto d3d12_dir = xe::filesystem::GetExecutablePath().parent_path() / "D3D12";
-  pfn_dxilconv_dxc_create_instance_ = nullptr;
-  {
-    auto dxilconv_path_utf16 = xe::path_to_utf16(d3d12_dir / "dxilconv.dll");
-    library_dxilconv_ =
-        LoadLibraryW(reinterpret_cast<LPCWSTR>(dxilconv_path_utf16.c_str()));
-    if (library_dxilconv_) {
-      XELOGI("Loaded dxilconv.dll from the D3D12 directory");
-    } else {
-      library_dxilconv_ = LoadLibraryW(L"dxilconv.dll");
-    }
-  }
-  if (library_dxilconv_) {
-    pfn_dxilconv_dxc_create_instance_ = DxcCreateInstanceProc(
-        GetProcAddress(library_dxilconv_, "DxcCreateInstance"));
-    if (pfn_dxilconv_dxc_create_instance_ == nullptr) {
-      XELOGW(
-          "dxilconv.dll has no DxcCreateInstance - the DXBC to DXIL converter "
-          "is unavailable, so the host render target path "
-          "(render_target_path=performance) will fail. Use "
-          "render_target_path=accuracy, which does not need it.");
-    }
-  } else {
-    XELOGW(
-        "Failed to load dxilconv.dll - the DXBC to DXIL converter is "
-        "unavailable, so the host render target path "
-        "(render_target_path=performance) will fail. It is an in-box Windows "
-        "component and is absent under Wine/Proton. Use "
-        "render_target_path=accuracy, which does not need it, or the Vulkan "
-        "backend.");
-  }
-
-  // Load the required DXIL shader compiler runtime (dxcompiler.dll + dxil.dll)
-  // from the D3D12 folder next to the executable. The D3D12 backend can't run
-  // without it, so offer to download it if it's missing.
-  pfn_dxcompiler_dxc_create_instance_ = nullptr;
   {
     EnsureShaderCompilerRuntime(d3d12_dir);
 
-    // Pre-load dxil.dll by full path so dxcompiler's later plain-name load of
-    // it resolves here. That search skips D3D12/, so without this the DXIL
-    // would be left unsigned.
+    // Load by full path, since the signer's own plain-name load skips D3D12/.
     auto dxil_path_utf16 = xe::path_to_utf16(d3d12_dir / "dxil.dll");
     library_dxil_ =
         LoadLibraryW(reinterpret_cast<LPCWSTR>(dxil_path_utf16.c_str()));
-
-    auto dxcompiler_path_utf16 =
-        xe::path_to_utf16(d3d12_dir / "dxcompiler.dll");
-    library_dxcompiler_ =
-        LoadLibraryW(reinterpret_cast<LPCWSTR>(dxcompiler_path_utf16.c_str()));
-    if (library_dxcompiler_) {
-      XELOGI("Loaded dxcompiler.dll from the D3D12 directory");
+    if (library_dxil_) {
+      XELOGI("Loaded dxil.dll from the D3D12 directory");
     } else {
       // Fall back to the system search path (system-wide, or next to the exe).
-      library_dxcompiler_ = LoadLibraryW(L"dxcompiler.dll");
+      library_dxil_ = LoadLibraryW(L"dxil.dll");
     }
   }
-  if (library_dxcompiler_) {
-    pfn_dxcompiler_dxc_create_instance_ = DxcCreateInstanceProc(
-        GetProcAddress(library_dxcompiler_, "DxcCreateInstance"));
-    if (pfn_dxcompiler_dxc_create_instance_ == nullptr) {
-      XELOGW(
-          "Failed to get DxcCreateInstance from dxcompiler.dll, DXIL shaders "
-          "will be unavailable");
-    } else {
-      XELOGI("dxcompiler.dll loaded successfully");
-    }
-  } else {
-    DWORD error = GetLastError();
+  if (!library_dxil_) {
     XELOGW(
-        "Failed to load dxcompiler.dll (error {}), DXIL shaders will be "
-        "unavailable - download from "
+        "Failed to load dxil.dll (error {}), DXIL shaders will be unavailable "
+        "- download from "
         "https://github.com/microsoft/DirectXShaderCompiler/releases",
-        error);
+        GetLastError());
   }
 
   // The D3D12SDKVersion exports make d3d12.dll load D3D12Core.dll at the first
@@ -481,19 +417,26 @@ bool D3D12Provider::Initialize() {
   bool debug = cvars::d3d12_debug;
   if (debug) {
     ID3D12Debug* debug_interface;
-    if (SUCCEEDED(
-            pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface)))) {
+    HRESULT debug_interface_hr =
+        pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface));
+    if (SUCCEEDED(debug_interface_hr)) {
       debug_interface->EnableDebugLayer();
       // GPU-based validation catches out-of-bounds shader resource access that
       // the CPU-side layer misses, but is very slow, so keep it opt-in.
       bool gpu_validation = false;
       if (cvars::d3d12_gpu_validation) {
         ID3D12Debug1* debug_interface1;
-        if (SUCCEEDED(debug_interface->QueryInterface(
-                IID_PPV_ARGS(&debug_interface1)))) {
+        HRESULT debug_interface1_hr =
+            debug_interface->QueryInterface(IID_PPV_ARGS(&debug_interface1));
+        if (SUCCEEDED(debug_interface1_hr)) {
           debug_interface1->SetEnableGPUBasedValidation(TRUE);
           debug_interface1->Release();
           gpu_validation = true;
+        } else {
+          XELOGW(
+              "GPU-based validation was requested but is unavailable, "
+              "continuing without it (HRESULT 0x{:08X})",
+              uint32_t(debug_interface1_hr));
         }
       }
       debug_interface->Release();
@@ -503,7 +446,8 @@ bool D3D12Provider::Initialize() {
       // The debug layer (D3D12SDKLayers.dll) isn't redistributable on its own.
       // Offer to fetch it from the Agility SDK and restart.
       EnsureDebugLayer(d3d12_dir);
-      XELOGW("Failed to enable the Direct3D 12 debug layer");
+      XELOGW("Failed to enable the Direct3D 12 debug layer (HRESULT 0x{:08X})",
+             uint32_t(debug_interface_hr));
       debug = false;
     }
   }

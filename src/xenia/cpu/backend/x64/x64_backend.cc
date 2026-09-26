@@ -10,6 +10,7 @@
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 #include <cstddef>
+#include <utility>
 
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -66,10 +67,6 @@ class X64HelperEmitter : public X64Emitter {
   GuestToHostThunk EmitGuestToHostThunk();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
-  // 1 for loading byte, 2 for halfword and 4 for word.
-  // these specialized versions save space in the caller
-  void* EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-      void* sync_func, unsigned stack_element_size);
 
   void* EmitTryAcquireReservationHelper();
   void* EmitReservedStoreHelper(bool bit64 = false);
@@ -300,16 +297,6 @@ bool X64Backend::Initialize(Processor* processor) {
   if (cvars::enable_host_guest_stack_synchronization) {
     synchronize_guest_and_host_stack_helper_ =
         thunk_emitter.EmitGuestAndHostSynchronizeStackHelper();
-
-    synchronize_guest_and_host_stack_helper_size8_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 1);
-    synchronize_guest_and_host_stack_helper_size16_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 2);
-    synchronize_guest_and_host_stack_helper_size32_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 4);
   }
   try_acquire_reservation_helper_ =
       thunk_emitter.EmitTryAcquireReservationHelper();
@@ -548,12 +535,17 @@ uint64_t X64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
   }
 }
 
+static constexpr uint8_t kUd2[2] = {0x0F, 0x0B};
+
 void X64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
     assert_true(original_bytes != 0x0F0B);
-    xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
+    if (!code_cache()->PatchCode(ptr, kUd2, sizeof(kUd2))) {
+      assert_always();
+      return;
+    }
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
 }
@@ -573,7 +565,10 @@ void X64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
   auto ptr = reinterpret_cast<void*>(host_address);
   auto original_bytes = xe::load_and_swap<uint16_t>(ptr);
   assert_true(original_bytes != 0x0F0B);
-  xe::store_and_swap<uint16_t>(ptr, 0x0F0B);
+  if (!code_cache()->PatchCode(ptr, kUd2, sizeof(kUd2))) {
+    assert_always();
+    return;
+  }
   breakpoint->backend_data().emplace_back(host_address, original_bytes);
 }
 
@@ -582,7 +577,10 @@ void X64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
     auto ptr = reinterpret_cast<uint8_t*>(pair.first);
     auto instruction_bytes = xe::load_and_swap<uint16_t>(ptr);
     assert_true(instruction_bytes == 0x0F0B);
-    xe::store_and_swap<uint16_t>(ptr, static_cast<uint16_t>(pair.second));
+    // backend_data holds the byte-swapped load, so swap back to memory order.
+    const uint16_t original_bytes =
+        xe::byte_swap(static_cast<uint16_t>(pair.second));
+    code_cache()->PatchCode(ptr, &original_bytes, sizeof(original_bytes));
   }
   breakpoint->backend_data().clear();
 }
@@ -752,6 +750,7 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
   func_info.prolog_stack_alloc_offset =
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = stack_size;
+  func_info.is_host_to_guest_thunk = true;
 
   void* fn = Emplace(func_info);
   return (HostToGuestThunk)fn;
@@ -953,11 +952,30 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
   void* fn = Emplace(func_info);
   return (ResolveFunctionThunk)fn;
 }
-// r11 = size of callers stack, r8 = return address w/ adjustment
 // i'm not proud of this code, but it shouldn't be executed frequently at all
 void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   _code_offsets code_offsets = {};
   code_offsets.prolog = getSize();
+  pop(r8);  // where to resume once the host stack is restored
+
+  Xbyak::Label search_stackpoints{};
+  // ResolveDynamicReturn recorded the frame to continue in.
+  mov(ecx,
+      GetBackendCtxPtr(offsetof(X64BackendContext, unwind_stackpoint_depth)));
+  test(ecx, ecx);
+  jz(search_stackpoints, T_NEAR);
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
+      ecx);
+  mov(rax, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
+  dec(ecx);
+  imul(edx, ecx, sizeof(X64BackendStackpoint));
+  mov(rsp, ptr[rax + rdx + offsetof(X64BackendStackpoint, host_stack_)]);
+  xor_(ecx, ecx);
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, unwind_stackpoint_depth)),
+      ecx);
+  jmp(r8);
+
+  L(search_stackpoints);
   push(rbx);
   mov(rbx, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
   mov(eax,
@@ -980,7 +998,8 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 
   cmp(r10d, r9d);
 
-  jge(loopout, T_NEAR);
+  // Unsigned, to match ResolveLongjmp: guest stacks can be above 0x80000000.
+  jae(loopout, T_NEAR);
 
   inc(r12d);
 
@@ -1039,8 +1058,6 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
     add(ecx, 1);
   }
 
-  sub(rsp, r11);  // adjust stack
-
   mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
       ecx);  // set next stackpoint index to be after the one we restored to
   jmp(r8);
@@ -1058,32 +1075,6 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   // handler?
 
   this->DebugBreak();
-  return EmitCurrentForOffsets(code_offsets);
-}
-
-void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-    void* sync_func, unsigned stack_element_size) {
-  _code_offsets code_offsets = {};
-  code_offsets.prolog = getSize();
-  pop(r8);  // return address
-
-  switch (stack_element_size) {
-    case 4:
-      mov(r11d, ptr[r8]);
-      break;
-    case 2:
-      movzx(r11d, word[r8]);
-      break;
-    case 1:
-      movzx(r11d, byte[r8]);
-      break;
-  }
-  add(r8, stack_element_size);
-  jmp(sync_func, T_NEAR);
-  code_offsets.prolog_stack_alloc = getSize();
-  code_offsets.body = getSize();
-  code_offsets.epilog = getSize();
-  code_offsets.tail = getSize();
   return EmitCurrentForOffsets(code_offsets);
 }
 
@@ -1819,6 +1810,12 @@ void X64HelperEmitter::EmitLoadNonvolatileRegs() {
   vmovups(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
 #endif
 }
+X64BackendStackpoint* X64Backend::AllocStackpoints() {
+  return cvars::enable_host_guest_stack_synchronization
+             ? new X64BackendStackpoint[cvars::max_stackpoints]
+             : nullptr;
+}
+
 void X64Backend::InitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
   bctx->mxcsr_fpu =
@@ -1831,10 +1828,10 @@ void X64Backend::InitializeBackendContext(void* ctx) {
 
   */
 
-  bctx->stackpoints = cvars::enable_host_guest_stack_synchronization
-                          ? new X64BackendStackpoint[cvars::max_stackpoints]
-                          : nullptr;
+  bctx->stackpoints = AllocStackpoints();
   bctx->current_stackpoint_depth = 0;
+  bctx->dynamic_call_cache = nullptr;
+  bctx->unwind_stackpoint_depth = 0;
   bctx->mxcsr_vmx = DEFAULT_VMX_MXCSR;
   bctx->mxcsr_vmx_daz = DEFAULT_VMX_MXCSR;  // never follows NJM
   bctx->flags = (1U << kX64BackendNJMOn);   // NJM on by default
@@ -1850,12 +1847,49 @@ void X64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] bctx->stackpoints;
     bctx->stackpoints = nullptr;
   }
+  delete[] bctx->dynamic_call_cache;
+  bctx->dynamic_call_cache = nullptr;
 }
 
 void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 
   bctx->current_stackpoint_depth = 0;
+  bctx->unwind_stackpoint_depth = 0;
+}
+
+namespace {
+struct X64StackpointState {
+  X64BackendStackpoint* stackpoints = nullptr;
+  unsigned int depth = 0;
+};
+}  // namespace
+
+void* X64Backend::CreateStackpointState() {
+  auto state = new X64StackpointState();
+  state->stackpoints = AllocStackpoints();
+  return state;
+}
+
+void X64Backend::DestroyStackpointState(void* state) {
+  if (!state) {
+    return;
+  }
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  delete[] stackpoint_state->stackpoints;
+  delete stackpoint_state;
+}
+
+void X64Backend::SwapStackpointState(void* ctx, void* state) {
+  if (!state) {
+    return;
+  }
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  std::swap(bctx->stackpoints, stackpoint_state->stackpoints);
+  std::swap(bctx->current_stackpoint_depth, stackpoint_state->depth);
+  // A pending unwind names a frame on the host stack being swapped out.
+  bctx->unwind_stackpoint_depth = 0;
 }
 
 constexpr uint32_t mxcsr_table[8] = {

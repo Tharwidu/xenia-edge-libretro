@@ -58,6 +58,16 @@ DEFINE_uint64(
 // Breakpoints:
 DEFINE_uint64(break_on_instruction, 0,
               "int3 before the given guest address is executed.", "CPU");
+DEFINE_string(log_lr_at_instruction, "",
+              "Comma-separated guest addresses. Logs the link register and "
+              "argument registers each time one of them is executed.",
+              "CPU");
+DEFINE_int32(log_lr_condition_gpr, -1,
+             "Only log a log_lr_at_instruction hit when this GPR holds "
+             "log_lr_condition_value. Negative logs every hit.",
+             "CPU");
+DEFINE_uint64(log_lr_condition_value, 0,
+              "Value log_lr_condition_gpr must hold.", "CPU");
 DEFINE_int32(break_condition_gpr, -1, "GPR compared to", "CPU");
 DEFINE_uint64(break_condition_value, 0, "value compared against", "CPU");
 DEFINE_string(break_condition_op, "eq", "comparison operator", "CPU");

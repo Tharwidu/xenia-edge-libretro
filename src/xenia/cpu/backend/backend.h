@@ -106,6 +106,15 @@ class Backend {
   * */
   virtual void PrepareForReentry(void* ctx) {}
 
+  // Extra stackpoint records for a guest thread that runs on more than one
+  // host stack, or null from a backend that keeps none. Swapping exchanges the
+  // records in the context with the ones in the state, so swaps have to be
+  // undone in reverse before returning to guest code the other set recorded,
+  // and a state has to be swapped out before it is destroyed.
+  virtual void* CreateStackpointState() { return nullptr; }
+  virtual void DestroyStackpointState(void* state) {}
+  virtual void SwapStackpointState(void* ctx, void* state) {}
+
   // returns true if populated st
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {
     return false;
@@ -200,6 +209,8 @@ struct GuestTrampolineGroup
     return _NewTrampoline(proc, false);
   }
 };
+
+uint64_t TrapDebugPrint(void* raw_context);
 
 // Registered by the cooperative scheduler when it starts, null otherwise. A
 // JIT safepoint calls it with the PPCContext once the scheduler has raised the

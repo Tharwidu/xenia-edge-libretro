@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
@@ -34,6 +35,7 @@ DEFINE_string(spirv_version_override, "1.0",
               " 1.6: SPIR-V 1.6 (Vulkan 1.3+)\n"
               " auto: Test for SPIR-V 1.5 support, fall back to 1.0",
               "GPU");
+#include "xenia/gpu/xenos_zpd_report.h"
 
 DEFINE_bool(
     spirv_disable_rounding_mode_rte, false,
@@ -42,7 +44,65 @@ DEFINE_bool(
     "capability.",
     "GPU");
 
-DECLARE_bool(precise_interpolation);
+DEFINE_string(shader_bisect_ps_hash, "",
+              "Ucode hash (hex) of the pixel shader to bisect. Empty disables "
+              "the bisect entirely.",
+              "GPU.Debug");
+
+DEFINE_int32(shader_bisect_instruction, -1,
+             "Guest instruction of the bisected shader to snapshot a register "
+             "at, counted in translation order from 0. -1 disables.",
+             "GPU.Debug");
+
+DEFINE_int32(shader_bisect_register, -1,
+             "Guest register to write to color output 0 at the end of the "
+             "bisected shader, so an intermediate value can be read back. -1 "
+             "leaves the shader's own output alone.",
+             "GPU.Debug");
+
+DEFINE_int32(shader_bisect_probe, 0,
+             "What to write to color 0 for the bisected register, since an 8 "
+             "bit target hides the values that matter most.\n"
+             " 0: the register itself (default)\n"
+             " 1: 1.0 per component that is NaN\n"
+             " 2: 1.0 per component that is infinite\n"
+             " 3: 1.0 per component whose magnitude is at least 1",
+             "GPU.Debug");
+
+DEFINE_bool(shader_bisect_cut, false,
+            "Stop emitting the bisected shader after "
+            "shader_bisect_instruction instead of only snapshotting the "
+            "register there. Cutting also drops the shader's own color and "
+            "depth exports, which changes what the render backend does with "
+            "the pixel.",
+            "GPU.Debug");
+
+DEFINE_bool(spirv_pixel_interlock_only, false,
+            "Use PixelInterlockOrderedEXT even where the device offers sample "
+            "interlock, matching what the D3D12 backend always does. Sample "
+            "granularity asks for the shader to be invoked per sample, which "
+            "changes what every position-dependent value in it sees.",
+            "GPU.Debug");
+
+DEFINE_bool(spirv_disable_signed_zero_inf_nan_preserve, false,
+            "Drop the SignedZeroInfNanPreserve capability from SPIR-V "
+            "shaders, which the D3D12 backend never requests. It governs what "
+            "reciprocal, logarithm and the min/max clamps do with infinities "
+            "and NaNs.",
+            "GPU.Debug");
+
+DEFINE_bool(spirv_fine_derivatives, false,
+            "Compute texture LOD gradients and the guest's getGradients with "
+            "fine derivatives rather than coarse. Which pixels of the quad a "
+            "coarse derivative uses is left to the implementation, so the "
+            "same shader can pick a different LOD on different drivers.",
+            "GPU.Debug");
+
+DEFINE_bool(spirv_no_contraction_all, false,
+            "Decorate every float arithmetic result with NoContraction, "
+            "removing the driver's freedom to fuse a multiply and add into "
+            "one rounding.",
+            "GPU.Debug");
 
 DEFINE_bool(
     spirv_moltenvk_allow_contraction, true,
@@ -215,13 +275,11 @@ uint64_t SpirvShaderTranslator::GetDefaultPixelShaderModification(
   Modification shader_modification;
   shader_modification.pixel.dynamic_addressable_register_count =
       dynamic_addressable_register_count;
-  shader_modification.pixel.precise_interpolation =
-      cvars::precise_interpolation ? 1 : 0;
   return shader_modification.value;
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
-    Modification::DepthStencilMode depth_stencil_mode) {
+    Modification::DepthStencilMode depth_stencil_mode, bool zpd_total) {
   is_depth_only_fragment_shader_ = true;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_fragment_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
@@ -230,11 +288,20 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   shader.AnalyzeUcode(instruction_disassembly_buffer);
   Modification modification(0);
   modification.pixel.depth_stencil_mode = depth_stencil_mode;
+  modification.pixel.set_zpd_total(zpd_total);
   Shader::Translation& translation =
       *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
   is_depth_only_fragment_shader_ = false;
   return translation.translated_binary();
+}
+
+std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
+    xenos::MsaaSamples fsi_msaa_samples) {
+  // The sample count lives in depth_stencil_mode's bits on the FSI path.
+  Modification modification(0);
+  modification.pixel.set_fsi_msaa_samples(fsi_msaa_samples);
+  return CreateDepthOnlyFragmentShader(modification.pixel.depth_stencil_mode);
 }
 
 void SpirvShaderTranslator::Reset() {
@@ -267,6 +334,10 @@ void SpirvShaderTranslator::Reset() {
   texture_bindings_.clear();
 
   main_interface_.clear();
+  bisect_instruction_index_ = 0;
+  bisect_current_instruction_ = UINT32_MAX;
+  bisect_snapshot_emitted_ = false;
+  var_main_bisect_snapshot_ = spv::NoResult;
   var_main_registers_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0;
@@ -285,6 +356,7 @@ void SpirvShaderTranslator::Reset() {
   main_rect_list_loop_vertex_index_next_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  var_main_zpd_coverage_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
@@ -308,11 +380,106 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
              : modification.pixel.dynamic_addressable_register_count;
 }
 
+bool SpirvShaderTranslator::BisectTargetsCurrentShader() const {
+  if (cvars::shader_bisect_ps_hash.empty()) {
+    return false;
+  }
+  uint64_t hash =
+      std::strtoull(cvars::shader_bisect_ps_hash.c_str(), nullptr, 16);
+  return hash && hash == current_shader().ucode_data_hash();
+}
+
+bool SpirvShaderTranslator::BisectSkipsInstruction() {
+  if (!BisectTargetsCurrentShader()) {
+    return false;
+  }
+  bisect_current_instruction_ = bisect_instruction_index_++;
+  return cvars::shader_bisect_cut && cvars::shader_bisect_instruction >= 0 &&
+         bisect_current_instruction_ >
+             uint32_t(cvars::shader_bisect_instruction);
+}
+
+void SpirvShaderTranslator::BisectSnapshotAfterInstruction() {
+  if (var_main_bisect_snapshot_ == spv::NoResult ||
+      cvars::shader_bisect_instruction < 0 ||
+      bisect_current_instruction_ !=
+          uint32_t(cvars::shader_bisect_instruction)) {
+    return;
+  }
+  BisectStoreSnapshot();
+}
+
+void SpirvShaderTranslator::BisectStoreSnapshot() {
+  EnsureBuildPointAvailable();
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(
+      builder_->makeIntConstant(cvars::shader_bisect_register));
+  builder_->createStore(
+      builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_registers_, id_vector_temp_),
+          spv::NoPrecision),
+      var_main_bisect_snapshot_);
+  bisect_snapshot_emitted_ = true;
+}
+
+void SpirvShaderTranslator::BisectOverrideColorOutput() {
+  if (var_main_bisect_snapshot_ == spv::NoResult ||
+      output_or_var_fragment_data_[0] == spv::NoResult) {
+    return;
+  }
+  EnsureBuildPointAvailable();
+  // Past the last instruction the snapshot is the register's final value.
+  if (!bisect_snapshot_emitted_) {
+    BisectStoreSnapshot();
+  }
+  spv::Id value =
+      builder_->createLoad(var_main_bisect_snapshot_, spv::NoPrecision);
+  spv::Id classified = spv::NoResult;
+  switch (cvars::shader_bisect_probe) {
+    case 1:
+      classified = builder_->createUnaryOp(spv::OpIsNan, type_bool4_, value);
+      break;
+    case 2:
+      classified = builder_->createUnaryOp(spv::OpIsInf, type_bool4_, value);
+      break;
+    case 3:
+      classified = builder_->createBinOp(
+          spv::OpFOrdGreaterThanEqual, type_bool4_,
+          builder_->createUnaryBuiltinCall(type_float4_, ext_inst_glsl_std_450_,
+                                           GLSLstd450FAbs, value),
+          const_float4_1_);
+      break;
+    default:
+      break;
+  }
+  if (classified != spv::NoResult) {
+    value = builder_->createTriOp(spv::OpSelect, type_float4_, classified,
+                                  const_float4_1_, const_float4_0_);
+  }
+  builder_->createStore(value, output_or_var_fragment_data_[0]);
+  // The FSI path writes only the colors the shader marked as written.
+  if (var_main_fsi_color_written_ != spv::NoResult) {
+    builder_->createStore(
+        builder_->createBinOp(
+            spv::OpBitwiseOr, type_uint_,
+            builder_->createLoad(var_main_fsi_color_written_, spv::NoPrecision),
+            builder_->makeUintConstant(uint32_t(1))),
+        var_main_fsi_color_written_);
+  }
+  XELOGI("shader_bisect: shader {:016X} {} instruction {} of {}, r{} to oC0",
+         current_shader().ucode_data_hash(),
+         cvars::shader_bisect_cut ? "cut after" : "snapshot after",
+         cvars::shader_bisect_instruction, bisect_instruction_index_,
+         cvars::shader_bisect_register);
+}
+
 void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(
       features_.spirv_version, (kSpirvMagicToolId << 16) | 1, nullptr);
   builder_->SetAllowContraction(features_.allow_float_contraction);
+  builder_->SetNoContractionAll(cvars::spirv_no_contraction_all);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
@@ -460,8 +627,6 @@ void SpirvShaderTranslator::StartTranslation() {
        type_uint2_},
       {"edram_rt_base_dwords_scaled",
        offsetof(SystemConstants, edram_rt_base_dwords_scaled), type_uint4_},
-      {"edram_rt_format_flags",
-       offsetof(SystemConstants, edram_rt_format_flags), type_uint4_},
       {"edram_rt_blend_factors_ops",
        offsetof(SystemConstants, edram_rt_blend_factors_ops), type_uint4_},
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask),
@@ -723,6 +888,13 @@ void SpirvShaderTranslator::StartTranslation() {
       var_main_registers_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                    type_register_array, "xe_var_registers");
+      if (is_pixel_shader() && BisectTargetsCurrentShader() &&
+          cvars::shader_bisect_register >= 0 &&
+          uint32_t(cvars::shader_bisect_register) < register_count()) {
+        var_main_bisect_snapshot_ = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+            "xe_var_bisect_snapshot", const_float4_0_);
+      }
     }
     if (memexport_used) {
       var_main_memexport_address_ = builder_->createVariable(
@@ -1037,7 +1209,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       // to keep coarse early-Z culling possible. Matches SV_DepthLessEqual in
       // the DXBC backend.
       if (!current_shader().writes_depth() && !DSV_IsApplyingPolygonOffset() &&
-          GetSpirvShaderModification().pixel.depth_stencil_mode ==
+          GetHostRtShaderModification().pixel.depth_stencil_mode ==
               Modification::DepthStencilMode::kFloat24Truncating) {
         builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthLess);
       }
@@ -1045,7 +1217,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     if (edram_fragment_shader_interlock_) {
       // Accessing per-sample values, so interlocking just when there's common
       // coverage is enough if the device exposes that.
-      if (features_.fragment_shader_sample_interlock) {
+      if (features_.fragment_shader_sample_interlock &&
+          !cvars::spirv_pixel_interlock_only) {
         builder_->addCapability(
             spv::CapabilityFragmentShaderSampleInterlockEXT);
         builder_->addExecutionMode(function_main_,
@@ -1111,7 +1284,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeDenormFlushToZero, 32);
   }
-  if (features_.signed_zero_inf_nan_preserve_float32) {
+  if (features_.signed_zero_inf_nan_preserve_float32 &&
+      !cvars::spirv_disable_signed_zero_inf_nan_preserve) {
     // Signed zero used to get VFACE from ps_param_gen, also special behavior
     // for infinity in certain instructions (such as logarithm, reciprocal,
     // muls_prev2).
@@ -3082,40 +3256,39 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         type_edram, "xe_edram");
     builder_->addDecoration(buffer_edram_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetSharedMemoryAndEdram));
-    builder_->addDecoration(buffer_edram_, spv::DecorationBinding, 1);
+    builder_->addDecoration(buffer_edram_, spv::DecorationBinding, 2);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffer_edram_);
     }
+  }
 
-    // ZPD FSI counter buffer uint[].
+  if (edram_fragment_shader_interlock_ || IsZpdTotal()) {
+    // ZPD counter buffer uint[], for FSI and hybrid queries.
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
     builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
                             sizeof(uint32_t));
-    spv::Id type_zpd_fsi_counter =
-        builder_->makeStructType(id_vector_temp_, "XeZPDFSICounter");
-    builder_->addMemberName(type_zpd_fsi_counter, 0, "counter");
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationCoherent);
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationRestrict);
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationOffset, 0);
-    builder_->addDecoration(type_zpd_fsi_counter,
+    spv::Id type_zpd_counter =
+        builder_->makeStructType(id_vector_temp_, "XeZPDCounter");
+    builder_->addMemberName(type_zpd_counter, 0, "counter");
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationCoherent);
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationRestrict);
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationOffset,
+                                  0);
+    builder_->addDecoration(type_zpd_counter,
                             features_.spirv_version >= spv::Spv_1_3
                                 ? spv::DecorationBlock
                                 : spv::DecorationBufferBlock);
-    buffer_zpd_fsi_counter_ = builder_->createVariable(
+    buffer_zpd_counter_ = builder_->createVariable(
         spv::NoPrecision,
         features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
                                                 : spv::StorageClassUniform,
-        type_zpd_fsi_counter, "xe_zpd_fsi_counter");
-    builder_->addDecoration(buffer_zpd_fsi_counter_,
-                            spv::DecorationDescriptorSet,
+        type_zpd_counter, "xe_zpd_counter");
+    builder_->addDecoration(buffer_zpd_counter_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetSharedMemoryAndEdram));
-    builder_->addDecoration(buffer_zpd_fsi_counter_, spv::DecorationBinding, 2);
+    builder_->addDecoration(buffer_zpd_counter_, spv::DecorationBinding, 1);
     if (features_.spirv_version >= spv::Spv_1_4) {
-      main_interface_.push_back(buffer_zpd_fsi_counter_);
+      main_interface_.push_back(buffer_zpd_counter_);
     }
   }
 
@@ -3134,8 +3307,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     // Skip barycentric for point primitives - barycentric coordinates are only
     // meaningful for triangles.
     bool use_barycentric_interpolation =
-        shader_modification.pixel.precise_interpolation &&
-        features_.fragment_shader_barycentric &&
+        precise_interpolation_ && features_.fragment_shader_barycentric &&
         !shader_modification.pixel.param_gen_point;
     if (use_barycentric_interpolation) {
       // Add extension and capability for barycentric interpolation.
@@ -3251,7 +3423,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Sample mask input.
-  if (edram_fragment_shader_interlock_) {
+  if (edram_fragment_shader_interlock_ || IsZpdTotal()) {
     // SampleMask depends on SampleRateShading in some SPIR-V revisions.
     builder_->addCapability(spv::CapabilitySampleRateShading);
     input_sample_mask_ = builder_->createVariable(
@@ -3280,7 +3452,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       };
       // Only create outputs for color targets that are both written by the
       // shader and actually bound in the render pass.
-      Modification shader_modification = GetSpirvShaderModification();
+      Modification shader_modification = GetHostRtShaderModification();
       uint32_t color_targets_remaining =
           current_shader().writes_color_targets() &
           shader_modification.pixel.color_targets_used;
@@ -3340,6 +3512,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // doesn't include covered samples of the primitive that correspond to other
   // invocations, so use the sample that's the most friendly to the half-pixel
   // offset).
+
+  // The ZPD Total counter tracks coverage entering the shader until all
+  // pre-depth/stencil tests finish dropping samples.
+  var_main_zpd_coverage_ = spv::NoResult;
+  if (IsZpdTotal()) {
+    assert_true(input_sample_mask_ != spv::NoResult);
+    if (features_.demote_to_helper_invocation) {
+      builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
+      builder_->addCapability(spv::CapabilityDemoteToHelperInvocationEXT);
+    }
+    var_main_zpd_coverage_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                 type_uint_, "xe_var_zpd_coverage");
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    spv::Id sample_mask_element = builder_->createAccessChain(
+        spv::StorageClassInput, input_sample_mask_, id_vector_temp_);
+    builder_->createStore(
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(sample_mask_element, spv::NoPrecision)),
+        var_main_zpd_coverage_);
+  }
 
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
@@ -3421,11 +3616,15 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   }
 
   if (edram_fragment_shader_interlock_ && FSI_IsDepthStencilEarly()) {
-    spv::Id msaa_samples = LoadMsaaSamplesFromFlags();
-    FSI_LoadSampleMask(msaa_samples);
-    FSI_LoadEdramOffsets(msaa_samples);
+    FSI_LoadSampleMask();
+    FSI_LoadEdramOffsets();
     builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
-    FSI_DepthStencilTest(msaa_samples, false);
+    FSI_DepthStencilTest(false);
+    if (zpd_full_counters_) {
+      // Failed samples never reach the end of an early-tested shader, so
+      // they're counted here before the quad can be discarded.
+      FSI_AddMSAASamplesToZPD(false, true);
+    }
     if (!is_depth_only_fragment_shader_) {
       // Skip the rest of the shader if the whole quad (due to derivatives) has
       // failed the depth / stencil test, and there are no depth and stencil
@@ -3492,8 +3691,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // only meaningful for triangles.
   Modification shader_modification = GetSpirvShaderModification();
   bool use_barycentric_interpolation =
-      shader_modification.pixel.precise_interpolation &&
-      features_.fragment_shader_barycentric &&
+      precise_interpolation_ && features_.fragment_shader_barycentric &&
       !shader_modification.pixel.param_gen_point;
   // Barycentric weights splatted to float4 for interpolation.
   // Using only bary.y and bary.z since we anchor on v0 (bary.x = 1 - y - z).
@@ -3926,6 +4124,16 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
     index =
         builder_->createBinOp(spv::OpIAdd, type_int_, index,
                               builder_->makeIntConstant(int(storage_index)));
+  }
+  // a0 and aL are whatever the guest put there, so clamp to the array. Direct3D
+  // 12 binds the float constants as a root CBV, which carries no size to bound
+  // the read, unlike a Vulkan uniform buffer under robust buffer access.
+  uint32_t index_count =
+      is_float_constant ? constant_register_map.float_count : register_count();
+  if (index_count) {
+    index = builder_->createTriBuiltinCall(
+        type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp, index,
+        const_int_0_, builder_->makeIntConstant(int(index_count - 1)));
   }
   return index;
 }

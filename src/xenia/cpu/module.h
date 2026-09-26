@@ -38,6 +38,11 @@ class Module {
 
   virtual bool ContainsAddress(uint32_t address);
 
+  // Where the translator reads the instruction at a guest code address from.
+  virtual const uint8_t* TranslateCode(uint32_t address) const {
+    return memory_->TranslateVirtual<const uint8_t*>(address);
+  }
+
   Symbol* LookupSymbol(uint32_t address, bool wait = true);
   virtual Symbol::Status DeclareFunction(uint32_t address,
                                          Function** out_function);

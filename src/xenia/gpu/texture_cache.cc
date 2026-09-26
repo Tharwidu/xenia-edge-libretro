@@ -17,6 +17,16 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
+DEFINE_bool(log_samplers, false,
+            "Log the sampler parameters each backend derives from a fetch "
+            "constant.",
+            "GPU.Debug");
+
+DEFINE_bool(log_texture_loads, false,
+            "Log every texture upload with its guest key and the load "
+            "shader the backend picked for it.",
+            "GPU.Debug");
+
 DEFINE_int32(
     draw_resolution_scale_x, 1,
     "Integer pixel width scale used for scaling the rendering resolution "
@@ -197,6 +207,36 @@ bool TextureCache::ClampDrawResolutionScaleToMaxSupported(
   return !was_clamped;
 }
 
+void TextureCache::LogSamplerParameters(uint32_t fetch_constant,
+                                        uint32_t packed) const {
+  if (!cvars::log_samplers) {
+    return;
+  }
+  XELOGI(
+      "log_samplers: fetch {}, value 0x{:08X}, clamp {}/{}/{}, border {}, "
+      "linear mag {} min {} mip {}, aniso {}, mip min level {}, base map {}",
+      fetch_constant, packed, packed & 0x7, (packed >> 3) & 0x7,
+      (packed >> 6) & 0x7, (packed >> 9) & 0x3, (packed >> 11) & 0x1,
+      (packed >> 12) & 0x1, (packed >> 13) & 0x1, (packed >> 14) & 0x7,
+      (packed >> 17) & 0xF, (packed >> 21) & 0x1);
+}
+
+void TextureCache::LogTextureLoad(const TextureKey& key, uint32_t load_shader,
+                                  bool load_base, bool load_mips) const {
+  if (!cvars::log_texture_loads) {
+    return;
+  }
+  XELOGI(
+      "log_texture_loads: base 0x{:08X} mips 0x{:08X}, {}x{}x{}, {} mips, "
+      "{}, pitch {}, {}{}{}, load shader {}, loading {}{}",
+      key.base_page << 12, key.mip_page << 12, key.width_minus_1 + 1,
+      key.height_minus_1 + 1, key.depth_or_array_size_minus_1 + 1,
+      key.mip_max_level + 1, FormatInfo::GetName(key.format), key.pitch,
+      key.tiled ? "tiled" : "linear", key.packed_mips ? ", packed mips" : "",
+      key.signed_separate ? ", signed" : "", load_shader,
+      load_base ? "base" : "", load_mips ? " mips" : "");
+}
+
 void TextureCache::ClearCache() { DestroyAllTextures(); }
 
 void TextureCache::CompletedSubmissionUpdated(
@@ -302,11 +342,41 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
         }
       }
     }
+    // What the shared memory buffer holds here isn't any earlier resolve's
+    // output anymore. A scaled resolve mirrored there is recorded again after.
+    for (auto it = scaled_resolve_extents_.begin();
+         it != scaled_resolve_extents_.end() && it->first <= page_last;) {
+      if (it->second >= page_first) {
+        it = scaled_resolve_extents_.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+}
+
+void TextureCache::MarkScaledResolveMirrored(uint32_t start_unscaled,
+                                             uint32_t length_unscaled) {
+  if (!IsDrawResolutionScaled() || !length_unscaled) {
+    return;
+  }
+  start_unscaled &= 0x1FFFFFFF;
+  length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
+  uint32_t page_first = start_unscaled >> 12;
+  uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+  auto global_lock = global_critical_region_.Acquire();
+  // Past the limit, a CPU write unmarks only the pages it writes.
+  if (scaled_resolve_extents_.size() >= kMaxScaledResolveExtents) {
+    scaled_resolve_extents_.clear();
+  }
+  // Resolves at one base with different extents, like a downsampling chain,
+  // keep the largest.
+  auto extent = scaled_resolve_extents_.try_emplace(page_first, page_last);
+  extent.first->second = std::max(extent.first->second, page_last);
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
@@ -800,17 +870,20 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
 // last stored channel the same way the host swizzle expands the formats.
 // (k_16 has a 16 bit width in all four components, k_5_6_5 gives blue in W.)
 // Constant (0/1) lanes, gamma, and non-fixed formats have nothing to rescale
-// and stay 0.
+// and stay 0. Bit 24 for normalized fixed fetches.
 uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
                                            uint32_t num_format,
                                            uint32_t guest_swizzle,
                                            uint8_t swizzled_signs) {
-  // num_format 0 is the normalized/fractional fetch - nothing to rescale.
   const FormatInfo& format_info = *FormatInfo::Get(guest_format);
   uint32_t scale_bits = 0;
 
-  if (!num_format || !format_info.fixed) {
+  if (!format_info.fixed) {
     return 0;
+  }
+
+  if (!num_format) {
+    return swizzled_signs == kSwizzledSignsUnsigned ? UINT32_C(1) << 24 : 0;
   }
 
   uint32_t last_stored_component = 0;
@@ -1111,8 +1184,12 @@ void TextureCache::BindingInfoFromFetchConstant(
   texture_util::GetSubresourcesFromFetchConstant(
       fetch, &width_minus_1, &height_minus_1, &depth_or_array_size_minus_1,
       &base_page, &mip_page, nullptr, &mip_max_level);
-  if (base_page == 0 && mip_page == 0) {
-    // No texture data at all.
+  if (base_page == 0 && mip_page == 0 &&
+      (fetch.swizzle & 0b110110110110) != 0b100100100100) {
+    // No texture data at all. Any header taking every swizzle component from
+    // literal 0s or 1s may still be valid. 4D530919 binds one as the dummy
+    // alpha plane of Bink movies. Such examples get a texture with their
+    // dimensions for LOD queries. Zero extents skip the upload and watches.
     return;
   }
   uint32_t pitch = fetch.pitch;
@@ -1280,8 +1357,28 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   }
   // Mark scaled resolve ranges as non-scaled. Textures themselves will be
   // invalidated by their shared memory watches.
-  uint32_t resolve_page_first = address_first >> 12;
-  uint32_t resolve_page_last = address_last >> 12;
+  uint32_t page_first = address_first >> 12;
+  uint32_t page_last = address_last >> 12;
+  if (!UnmarkScaledResolvePages(page_first, page_last)) {
+    return;
+  }
+  // The rest of any resolve the write lands in too. A texture over it would
+  // otherwise still load from the scaled data, as a range counts as scaled if
+  // any page of it is, and miss what the CPU wrote.
+  for (auto it = scaled_resolve_extents_.begin();
+       it != scaled_resolve_extents_.end() && it->first <= page_last;) {
+    if (it->second < page_first) {
+      ++it;
+      continue;
+    }
+    UnmarkScaledResolvePages(it->first, it->second);
+    it = scaled_resolve_extents_.erase(it);
+  }
+}
+
+bool TextureCache::UnmarkScaledResolvePages(uint32_t resolve_page_first,
+                                            uint32_t resolve_page_last) {
+  bool unmarked = false;
   uint32_t resolve_block_first = resolve_page_first >> 5;
   uint32_t resolve_block_last = resolve_page_last >> 5;
   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
@@ -1309,6 +1406,9 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
         resolve_keep_bits |=
             ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
       }
+      if (scaled_resolve_pages_[resolve_block_index] & ~resolve_keep_bits) {
+        unmarked = true;
+      }
       scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
       if (scaled_resolve_pages_[resolve_block_index] == 0) {
         scaled_resolve_pages_l2_[i] &=
@@ -1316,6 +1416,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       }
     }
   }
+  return unmarked;
 }
 
 }  // namespace gpu

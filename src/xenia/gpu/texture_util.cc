@@ -89,11 +89,11 @@ void GetSubresourcesFromFetchConstant(
                  mip_min_level);
   }
   if (mip_max_level != 0) {
+    if (mip_min_level != 0 && base_page == mip_page) {
+      base_page = 0;
+    }
     if (base_page == 0) {
       mip_min_level = std::max(mip_min_level, uint32_t(1));
-    }
-    if (mip_min_level != 0) {
-      base_page = 0;
     }
   } else {
     mip_page = 0;
@@ -190,8 +190,8 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
     if (offset < 4) {
       // Pack 1x1 Z mipmaps along Z - not reached for 2D.
       uint32_t log2_depth = xe::log2_ceil(depth);
-      if (log2_depth > 1 + packed_mip) {
-        z_blocks = (log2_depth - packed_mip) * 4;
+      if (log2_depth > 1 + mip) {
+        z_blocks = (log2_depth - mip) * 4;
       } else {
         z_blocks = 4;
       }
@@ -243,6 +243,11 @@ TextureGuestLayout GetGuestTextureLayout(
     std::memset(&layout, 0, sizeof(layout));
     return layout;
   }
+  // D3D's FindTextureSize aligns non-base 2D array levels to four slices.
+  uint32_t mip_array_size =
+      dimension == xenos::DataDimension::k2DOrStacked && layout.array_size > 1
+          ? xe::align(layout.array_size, xenos::kTextureTileDepth)
+          : layout.array_size;
 
   // For safety, clamp the maximum level.
   uint32_t max_level_for_dimensions =
@@ -312,7 +317,7 @@ TextureGuestLayout GetGuestTextureLayout(
     // For stride calculation purposes, mip dimensions are always aligned to
     // 32x32x4 blocks (or x1 for the missing dimensions), including for linear
     // textures.
-    // Linear texture rows are 256-byte-aligned.
+    // Linear texture row blocks are aligned to max(256 / block size, 32).
     uint32_t row_pitch_texels_unaligned;
     uint32_t z_slice_stride_texel_rows_unaligned;
     if (is_base) {
@@ -324,19 +329,18 @@ TextureGuestLayout GetGuestTextureLayout(
       z_slice_stride_texel_rows_unaligned =
           std::max(xe::next_pow2(height_texels) >> level, uint32_t(1));
     }
+    uint32_t row_pitch_blocks_alignment = xenos::kTextureTileWidthHeight;
+    if (!is_tiled && !is_base) {
+      row_pitch_blocks_alignment =
+          std::max(xenos::kTextureLinearRowAlignmentBytes / bytes_per_block,
+                   xenos::kTextureTileWidthHeight);
+    }
     uint32_t row_pitch_blocks_tile_aligned = xe::align(
         xe::align(row_pitch_texels_unaligned, format_info->block_width) /
             format_info->block_width,
-        xenos::kTextureTileWidthHeight);
+        row_pitch_blocks_alignment);
     level_layout.row_pitch_bytes =
         row_pitch_blocks_tile_aligned * bytes_per_block;
-    // Assuming the provided pitch is already 256-byte-aligned for linear, but
-    // considering the guest-provided pitch more important (no information about
-    // how the GPU actually handles unaligned rows).
-    if (!is_tiled && !is_base) {
-      level_layout.row_pitch_bytes = xe::align(
-          level_layout.row_pitch_bytes, xenos::kTextureLinearRowAlignmentBytes);
-    }
     level_layout.z_slice_stride_block_rows =
         dimension != xenos::DataDimension::k1D
             ? xe::align(xe::align(z_slice_stride_texel_rows_unaligned,
@@ -348,8 +352,10 @@ TextureGuestLayout GetGuestTextureLayout(
         level_layout.row_pitch_bytes * level_layout.z_slice_stride_block_rows;
     uint32_t z_stride_bytes = level_layout.array_slice_stride_bytes;
     if (dimension == xenos::DataDimension::k3D) {
-      level_layout.array_slice_stride_bytes *=
-          xe::align(depth_or_array_size, xenos::kTextureTileDepth);
+      level_layout.array_slice_stride_bytes *= xe::align(
+          is_base ? depth
+                  : std::max(xe::next_pow2(depth) >> level, uint32_t(1)),
+          xenos::kTextureTileDepth);
     }
     level_layout.array_slice_stride_bytes =
         xe::align(level_layout.array_slice_stride_bytes,
@@ -444,7 +450,7 @@ TextureGuestLayout GetGuestTextureLayout(
           std::max(layout.mips_total_extent_bytes,
                    mip_offset_bytes + level_layout.level_data_extent_bytes);
       mip_offset_bytes +=
-          level_layout.array_slice_stride_bytes * layout.array_size;
+          level_layout.array_slice_stride_bytes * mip_array_size;
     }
   }
 
@@ -550,6 +556,13 @@ uint64_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom,
       // - Pitch = 64, 128, 192...: (Pitch / 64) * 0x1000 + 0xC00
       upper_bound += ((pitch_aligned >> 6) << 12) + 0xC00 +
                      ((pitch_aligned & (1 << 5)) << (10 - 5));
+      // There's one extra case where the last bank sits 0x800 past the base
+      // extent: if pitch and X are both in the second, 32 wide half of their
+      // 64 block wide period, while Z is still in the first 4 slices.
+      if ((pitch_aligned & (1 << 5)) && ((right - 1) & (1 << 5)) &&
+          !((back - 1) & (1 << 2))) {
+        upper_bound += 0x800;
+      }
       break;
     default:
       // 32x32x8 portions have independent addressing.

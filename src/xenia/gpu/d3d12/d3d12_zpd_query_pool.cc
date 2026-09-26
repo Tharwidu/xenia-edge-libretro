@@ -22,15 +22,13 @@ namespace d3d12 {
 
 bool D3D12ZPDQueryPool::EnsureInitialized(
     const ui::d3d12::D3D12Provider& provider, uint32_t requested_capacity,
-    bool can_recreate, bool initialize_rov_counter) {
-  bool rtv_initialized = is_initialized();
-  bool rov_initialized = rov_counter_initialized();
-  if (rtv_initialized && (!initialize_rov_counter || rov_initialized) &&
+    bool can_recreate, bool initialize_counter) {
+  if (rtv_initialized() && (!initialize_counter || counter_initialized()) &&
       (capacity_ == requested_capacity || !can_recreate)) {
     return true;
   }
 
-  if (rtv_initialized && capacity_ != requested_capacity) {
+  if (rtv_initialized() && capacity_ != requested_capacity) {
     if (!can_recreate) {
       requested_capacity = capacity_;
     } else {
@@ -38,14 +36,12 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
       // backing resources under pending resolve or copy work.
       assert_true(!has_pending_resolve_batch());
       Shutdown();
-      rtv_initialized = false;
-      rov_initialized = false;
     }
   }
 
   ID3D12Device* device = provider.GetDevice();
 
-  if (!rtv_initialized) {
+  if (!rtv_initialized()) {
     D3D12_QUERY_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
     heap_desc.Count = requested_capacity;
@@ -93,10 +89,8 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
     readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
     capacity_ = requested_capacity;
 
-    resolve_batch_pending_.assign(requested_capacity, 0);
     resolve_batch_indices_.clear();
-    rov_counter_resolve_batch_pending_.assign(requested_capacity, 0);
-    rov_counter_resolve_batch_indices_.clear();
+    counter_resolve_batch_indices_.clear();
     resolve_batch_ranges_.clear();
 
     free_indices_.clear();
@@ -107,98 +101,103 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
     index_generations_.assign(requested_capacity, 0);
   }
 
-  if (!initialize_rov_counter || rov_initialized) {
+  if (!initialize_counter || counter_initialized()) {
     return true;
   }
 
-  if (rov_counter_readback_mapping_ && rov_counter_readback_buffer_) {
+  if (counter_readback_mapping_ && counter_readback_buffer_) {
     D3D12_RANGE written_range = {0, 0};
-    rov_counter_readback_buffer_->Unmap(0, &written_range);
+    counter_readback_buffer_->Unmap(0, &written_range);
   }
-  rov_counter_readback_mapping_ = nullptr;
-  rov_counter_readback_buffer_.Reset();
-  rov_counter_buffer_.Reset();
-  rov_counter_resolve_batch_pending_.assign(requested_capacity, 0);
-  rov_counter_resolve_batch_indices_.clear();
+  counter_readback_mapping_ = nullptr;
+  counter_readback_buffer_.Reset();
+  counter_buffer_.Reset();
+  counter_resolve_batch_indices_.clear();
 
   D3D12_RESOURCE_DESC counter_buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(
-      counter_buffer_desc, sizeof(uint32_t) * requested_capacity,
+      counter_buffer_desc,
+      XenosZPDReport::kCounterSizeBytes * requested_capacity,
       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault,
           provider.GetHeapFlagCreateNotZeroed(), &counter_buffer_desc,
           D3D12_RESOURCE_STATE_COMMON, nullptr,
-          IID_PPV_ARGS(&rov_counter_buffer_)))) {
-    XELOGW("D3D12ZPDQueryPool: Failed to allocate the ZPD ROV counter buffer.");
+          IID_PPV_ARGS(&counter_buffer_)))) {
+    XELOGW(
+        "D3D12ZPDQueryPool: Failed to create the ZPD counter "
+        "buffer, falling back to fake sample counts.");
     return false;
   }
-  rov_counter_buffer_->SetName(L"ZPD ROV Counter Buffer");
-  rov_counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
-  rov_counter_buffer_state_submission_ = UINT64_MAX;
+  counter_buffer_->SetName(L"ZPD Counter Buffer");
+  counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  counter_buffer_state_submission_ = UINT64_MAX;
 
   D3D12_RESOURCE_DESC readback_buffer_desc;
-  ui::d3d12::util::FillBufferResourceDesc(readback_buffer_desc,
-                                          sizeof(uint32_t) * requested_capacity,
-                                          D3D12_RESOURCE_FLAG_NONE);
+  ui::d3d12::util::FillBufferResourceDesc(
+      readback_buffer_desc,
+      XenosZPDReport::kCounterSizeBytes * requested_capacity,
+      D3D12_RESOURCE_FLAG_NONE);
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesReadback,
           provider.GetHeapFlagCreateNotZeroed(), &readback_buffer_desc,
           D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-          IID_PPV_ARGS(&rov_counter_readback_buffer_)))) {
+          IID_PPV_ARGS(&counter_readback_buffer_)))) {
     XELOGW(
-        "D3D12ZPDQueryPool: Failed to allocate the ZPD ROV counter readback "
-        "buffer.");
-    rov_counter_buffer_.Reset();
+        "D3D12ZPDQueryPool: Failed to create the ZPD counter readback "
+        "buffer, falling back to fake sample counts.");
+    counter_buffer_.Reset();
     return false;
   }
-  rov_counter_readback_buffer_->SetName(L"ZPD ROV Counter Readback Buffer");
+  counter_readback_buffer_->SetName(L"ZPD Counter Readback Buffer");
 
   D3D12_RANGE read_range = {};
   read_range.Begin = 0;
-  read_range.End = sizeof(uint32_t) * requested_capacity;
+  read_range.End = XenosZPDReport::kCounterSizeBytes * requested_capacity;
 
   void* mapping = nullptr;
-  if (FAILED(rov_counter_readback_buffer_->Map(0, &read_range, &mapping))) {
+  if (FAILED(counter_readback_buffer_->Map(0, &read_range, &mapping))) {
     XELOGW(
-        "D3D12ZPDQueryPool: Failed to map the ZPD ROV counter readback "
-        "buffer.");
-    rov_counter_readback_buffer_.Reset();
-    rov_counter_buffer_.Reset();
+        "D3D12ZPDQueryPool: Failed to map the ZPD counter readback "
+        "buffer, falling back to fake sample counts.");
+    counter_readback_buffer_.Reset();
+    counter_buffer_.Reset();
     return false;
   }
 
-  rov_counter_readback_mapping_ = reinterpret_cast<uint32_t*>(mapping);
+  counter_readback_mapping_ = reinterpret_cast<uint32_t*>(mapping);
   return true;
 }
 
 void D3D12ZPDQueryPool::Shutdown() {
-  resolve_batch_pending_.clear();
   resolve_batch_indices_.clear();
   resolve_batch_ranges_.clear();
-  rov_counter_resolve_batch_pending_.clear();
-  rov_counter_resolve_batch_indices_.clear();
+  counter_resolve_batch_indices_.clear();
   free_indices_.clear();
   index_generations_.clear();
 
   capacity_ = 0;
 
   if (readback_mapping_ && readback_buffer_) {
-    // CPU never writes to this READBACK buffer — empty written range.
+    // CPU never writes to this READBACK buffer - empty written range.
     D3D12_RANGE written_range = {0, 0};
     readback_buffer_->Unmap(0, &written_range);
-  }
-  if (rov_counter_readback_mapping_ && rov_counter_readback_buffer_) {
-    D3D12_RANGE written_range = {0, 0};
-    rov_counter_readback_buffer_->Unmap(0, &written_range);
   }
 
   readback_mapping_ = nullptr;
   readback_buffer_.Reset();
   query_heap_.Reset();
-  rov_counter_readback_mapping_ = nullptr;
-  rov_counter_readback_buffer_.Reset();
-  rov_counter_buffer_.Reset();
+
+  if (counter_readback_mapping_ && counter_readback_buffer_) {
+    D3D12_RANGE written_range = {0, 0};
+    counter_readback_buffer_->Unmap(0, &written_range);
+  }
+
+  counter_readback_mapping_ = nullptr;
+  counter_readback_buffer_.Reset();
+  counter_buffer_.Reset();
+  counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  counter_buffer_state_submission_ = UINT64_MAX;
 }
 
 bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
@@ -221,10 +220,6 @@ bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
 
 void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
                                           uint32_t query_generation) {
-  if (query_index >= capacity_) {
-    return;
-  }
-
   if (!GenerationMatches(query_index, query_generation)) {
     XELOGW("D3D12ZPDQueryPool: stale release index={} gen={}", query_index,
            query_generation);
@@ -244,105 +239,85 @@ bool D3D12ZPDQueryPool::GenerationMatches(uint32_t query_index,
 
 void D3D12ZPDQueryPool::BeginQuery(DeferredCommandList& deferred_command_list,
                                    uint32_t query_index) const {
-  if (!query_heap_ || query_index >= capacity_) {
-    return;
-  }
-
+  assert_true(query_heap_ && query_index < capacity_);
   deferred_command_list.D3DBeginQuery(query_heap_.Get(),
                                       D3D12_QUERY_TYPE_OCCLUSION, query_index);
 }
 
 void D3D12ZPDQueryPool::EndQuery(DeferredCommandList& deferred_command_list,
                                  uint32_t query_index) const {
-  if (!query_heap_ || query_index >= capacity_) {
-    return;
-  }
-
+  assert_true(query_heap_ && query_index < capacity_);
   deferred_command_list.D3DEndQuery(query_heap_.Get(),
                                     D3D12_QUERY_TYPE_OCCLUSION, query_index);
 }
 
-void D3D12ZPDQueryPool::QueueQueryResolve(uint32_t query_index,
-                                          bool uses_rov_counter) {
-  if (query_index >= capacity_) {
+void D3D12ZPDQueryPool::QueueQueryResolve(uint32_t query_index, bool counter) {
+  assert_true(query_index < capacity_);
+  if (counter) {
+    counter_resolve_batch_indices_.push_back(query_index);
     return;
   }
-
-  // Guard against duplicates. Split paths can touch the same index twice before
-  // the batch drains at EndSubmission.
-  if (uses_rov_counter) {
-    if (!rov_counter_resolve_batch_pending_[query_index]) {
-      rov_counter_resolve_batch_pending_[query_index] = 1;
-      rov_counter_resolve_batch_indices_.push_back(query_index);
-    }
-    return;
-  }
-
-  if (!resolve_batch_pending_[query_index]) {
-    resolve_batch_pending_[query_index] = 1;
-    resolve_batch_indices_.push_back(query_index);
-  }
+  resolve_batch_indices_.push_back(query_index);
 }
 
-void D3D12ZPDQueryPool::TransitionROVCounterBuffer(
+void D3D12ZPDQueryPool::TransitionCounterBuffer(
     DeferredCommandList& deferred_command_list, uint64_t submission,
     D3D12_RESOURCE_STATES new_state) {
   // The buffer decayed to COMMON when the previous submission finished, so
   // start each submission from COMMON regardless of the last tracked state.
-  if (submission != rov_counter_buffer_state_submission_) {
-    rov_counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
-    rov_counter_buffer_state_submission_ = submission;
+  if (submission != counter_buffer_state_submission_) {
+    counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+    counter_buffer_state_submission_ = submission;
   }
-  if (rov_counter_buffer_state_ == new_state) {
+  if (counter_buffer_state_ == new_state) {
     return;
   }
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier.Transition.pResource = rov_counter_buffer_.Get();
+  barrier.Transition.pResource = counter_buffer_.Get();
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barrier.Transition.StateBefore = rov_counter_buffer_state_;
+  barrier.Transition.StateBefore = counter_buffer_state_;
   barrier.Transition.StateAfter = new_state;
   deferred_command_list.D3DResourceBarrier(1, &barrier);
-  rov_counter_buffer_state_ = new_state;
+  counter_buffer_state_ = new_state;
 }
 
-void D3D12ZPDQueryPool::ClearROVCounter(
-    DeferredCommandList& deferred_command_list, uint64_t submission,
-    uint32_t query_index) {
-  if (!rov_counter_initialized() || query_index >= capacity_) {
-    return;
-  }
-
+void D3D12ZPDQueryPool::ClearCounter(DeferredCommandList& deferred_command_list,
+                                     uint64_t submission,
+                                     uint32_t query_index) {
+  assert_true(counter_initialized() && query_index < capacity_);
   // WriteBufferImmediate writes as a copy, so the buffer must be in COPY_DEST.
   // The transition also orders this reset after any atomic adds from the
   // previous query that owned the same slot.
-  TransitionROVCounterBuffer(deferred_command_list, submission,
-                             D3D12_RESOURCE_STATE_COPY_DEST);
+  TransitionCounterBuffer(deferred_command_list, submission,
+                          D3D12_RESOURCE_STATE_COPY_DEST);
 
-  // Only the selected 32 bit slot needs to be reset.
-  deferred_command_list.D3DWriteBufferImmediate(
-      rov_counter_buffer_->GetGPUVirtualAddress() +
-          static_cast<uint64_t>(query_index) * sizeof(uint32_t),
-      0u);
+  // Only the selected slot needs to be reset.
+  D3D12_GPU_VIRTUAL_ADDRESS counter_address =
+      counter_buffer_->GetGPUVirtualAddress() +
+      static_cast<uint64_t>(query_index) * XenosZPDReport::kCounterSizeBytes;
+  for (uint32_t i = 0; i < XenosZPDReport::kCount; ++i) {
+    deferred_command_list.D3DWriteBufferImmediate(
+        counter_address + i * sizeof(uint32_t), 0u);
+  }
 
   // Return to UNORDERED_ACCESS for the pixel shader atomic adds. This also
   // orders the reset before them so the next query sees the cleared value.
-  TransitionROVCounterBuffer(deferred_command_list, submission,
-                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  TransitionCounterBuffer(deferred_command_list, submission,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
 void D3D12ZPDQueryPool::FlushResolveBatch(
     DeferredCommandList& deferred_command_list, uint64_t submission,
     bool submission_open) {
   if (!submission_open || (resolve_batch_indices_.empty() &&
-                           rov_counter_resolve_batch_indices_.empty())) {
+                           counter_resolve_batch_indices_.empty())) {
     return;
   }
 
-  // Sorts indices, coalesces contiguous runs into resolve_batch_ranges_, resets
-  // pending flags, and clears the index list.
-  auto build_ranges = [this](std::vector<uint32_t>& indices,
-                             std::vector<uint8_t>& pending) {
+  // Sorts indices, coalesces contiguous runs into resolve_batch_ranges_, and
+  // clears the index list.
+  auto build_ranges = [this](std::vector<uint32_t>& indices) {
     std::ranges::sort(indices);
     resolve_batch_ranges_.clear();
     uint32_t range_start = 0;
@@ -364,78 +339,66 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
     if (range_count != 0) {
       resolve_batch_ranges_.push_back({range_start, range_count});
     }
-    for (uint32_t index : indices) {
-      pending[index] = 0;
-    }
     indices.clear();
   };
 
   if (!resolve_batch_indices_.empty()) {
-    if (!is_initialized()) {
-      for (uint32_t index : resolve_batch_indices_) {
-        resolve_batch_pending_[index] = 0;
-      }
-      resolve_batch_indices_.clear();
-    } else {
-      build_ranges(resolve_batch_indices_, resolve_batch_pending_);
-      for (const ResolveRange& range : resolve_batch_ranges_) {
-        deferred_command_list.D3DResolveQueryData(
-            query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, range.start,
-            range.count, readback_buffer_.Get(),
-            range.start * sizeof(uint64_t));
-      }
+    assert_true(rtv_initialized());
+    build_ranges(resolve_batch_indices_);
+    for (const ResolveRange& range : resolve_batch_ranges_) {
+      deferred_command_list.D3DResolveQueryData(
+          query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, range.start,
+          range.count, readback_buffer_.Get(), range.start * sizeof(uint64_t));
     }
   }
 
-  if (rov_counter_resolve_batch_indices_.empty()) {
+  if (counter_resolve_batch_indices_.empty()) {
     return;
   }
 
-  if (!rov_counter_initialized()) {
-    for (uint32_t index : rov_counter_resolve_batch_indices_) {
-      rov_counter_resolve_batch_pending_[index] = 0;
-    }
-    rov_counter_resolve_batch_indices_.clear();
-    return;
-  }
+  assert_true(counter_initialized());
 
   // The shader path writes counters through UAV atomics, so resolve on
-  // this path means copying the finished 32 bit slots out of the UAV buffer.
+  // this path means copying the finished slots out of the UAV buffer.
   // The whole buffer is transitioned for the copy and then returned to
   // UNORDERED_ACCESS since D3D12 state is tracked per resource, not per range.
-  TransitionROVCounterBuffer(deferred_command_list, submission,
-                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  TransitionCounterBuffer(deferred_command_list, submission,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-  build_ranges(rov_counter_resolve_batch_indices_,
-               rov_counter_resolve_batch_pending_);
+  build_ranges(counter_resolve_batch_indices_);
   for (const ResolveRange& range : resolve_batch_ranges_) {
-    uint64_t offset = static_cast<uint64_t>(range.start) * sizeof(uint32_t);
-    uint64_t size = static_cast<uint64_t>(range.count) * sizeof(uint32_t);
-    deferred_command_list.D3DCopyBufferRegion(
-        rov_counter_readback_buffer_.Get(), offset, rov_counter_buffer_.Get(),
-        offset, size);
+    uint64_t offset =
+        static_cast<uint64_t>(range.start) * XenosZPDReport::kCounterSizeBytes;
+    uint64_t size =
+        static_cast<uint64_t>(range.count) * XenosZPDReport::kCounterSizeBytes;
+    deferred_command_list.D3DCopyBufferRegion(counter_readback_buffer_.Get(),
+                                              offset, counter_buffer_.Get(),
+                                              offset, size);
   }
 
-  TransitionROVCounterBuffer(deferred_command_list, submission,
-                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  TransitionCounterBuffer(deferred_command_list, submission,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
-uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index,
-                                                  bool uses_rov_counter) const {
-  if (query_index >= capacity_) {
-    return 0;
+XenosZPDReport D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index,
+                                                        bool counter,
+                                                        bool hybrid) const {
+  assert_true(query_index < capacity_ && readback_mapping_);
+  const uint32_t* counter_slot =
+      counter_readback_mapping_
+          ? counter_readback_mapping_ + query_index * XenosZPDReport::kCount
+          : nullptr;
+  if (counter) {
+    assert_not_null(counter_slot);
+    return XenosZPDReport::FromCounterSlot(counter_slot);
   }
-
-  if (uses_rov_counter) {
-    // ROV queries read back a translated 32 bit sample count. Widen here so
-    // paths feed the uint64_t resolve.
-    return rov_counter_readback_mapping_
-               ? static_cast<uint64_t>(
-                     rov_counter_readback_mapping_[query_index])
-               : 0;
+  uint64_t passed = readback_mapping_[query_index];
+  if (hybrid) {
+    assert_not_null(counter_slot);
+    return XenosZPDReport::FromNativeQueryAndTotal(
+        passed, counter_slot[XenosZPDReport::kTotal]);
   }
-
-  return readback_mapping_ ? readback_mapping_[query_index] : 0;
+  return XenosZPDReport::FromNativeQuery(passed);
 }
 
 }  // namespace d3d12

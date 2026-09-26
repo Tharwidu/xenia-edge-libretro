@@ -10,6 +10,8 @@
 // Stub file for libretro build - provides empty implementations of DiscSwapUI
 
 #include "xenia/kernel/xam/ui/disc_swap_ui.h"
+#include <utility>
+
 #include "xenia/ui/imgui_dialog.h"
 
 namespace xe {
@@ -18,17 +20,20 @@ namespace xam {
 namespace ui {
 
 DiscSwapUI::DiscSwapUI(xe::ui::ImGuiDrawer* imgui_drawer,
+                       xe::hid::InputSystem* input_system,
                        const std::string& message,
-                       const std::vector<DiscInfo>& discs, bool show_error)
-    : XamDialog(imgui_drawer),
-      discs_(discs),
+                       const std::vector<DiscInfo>& discs, bool show_error,
+                       std::string title, std::string list_prompt,
+                       bool allow_browse)
+    : XamGamepadDialog(imgui_drawer, input_system),
+      title_(std::move(title)),
+      message_(message),
+      error_message_(show_error ? message : ""),
+      list_prompt_(std::move(list_prompt)),
       show_error_(show_error),
-      result_(DiscSwapResult::kCancelled) {
-  // Stub implementation - always cancelled
-  title_ = "Disc Swap (Libretro Stub)";
-  has_opened_ = false;
-  message_ = message;
-  error_message_ = show_error ? message : "";
+      allow_browse_(allow_browse),
+      discs_(discs) {
+  // Stub implementation - never drawn, always cancelled.
 }
 
 void DiscSwapUI::OnDraw(ImGuiIO& io) {

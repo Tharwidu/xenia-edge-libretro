@@ -11,6 +11,7 @@
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/base/threading.h"
@@ -22,6 +23,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xam/xam_ui.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_error.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_modules.h"
@@ -298,6 +300,50 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
 }
 DECLARE_XAM_EXPORT1(XamGetCachedTitleName, kNone, kImplemented);
 
+dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
+                                   dword_t user_index, dword_t string_out_ptr,
+                                   lpdword_t string_size_ptr,
+                                   pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!string_out_ptr || id == 0xFFFF) {
+    return X_E_INVALIDARG;
+  }
+
+  if (!string_size_ptr) {
+    return X_E_INSUFFICIENT_BUFFER;
+  }
+
+  auto run = [=](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    X_STATUS result = X_ERROR_SUCCESS;
+
+    // 584111F7 reads leaderboard strings
+    const std::u16string localized_string = xe::to_utf16(
+        kernel_state()->emulator()->game_info_database()->GetLocalizedString(
+            static_cast<uint32_t>(id)));
+
+    const size_t str_buffer_size = *string_size_ptr;
+
+    char16_t* str_buffer =
+        kernel_memory()->TranslateVirtual<char16_t*>(string_out_ptr);
+
+    xe::string_util::copy_and_swap_truncating(str_buffer, localized_string,
+                                              str_buffer_size);
+
+    extended_error = X_HRESULT_FROM_WIN32(result);
+    length = 0;
+
+    return result;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error, length = 0;
+    return run(extended_error, length);
+  }
+
+  kernel_state()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+  return X_ERROR_IO_PENDING;
+}
+DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
+
 dword_result_t XamGetSystemVersion_entry() {
   // eh, just picking one. If we go too low we may break new games, but
   // this value seems to be used for conditionally loading symbols and if
@@ -352,15 +398,59 @@ dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
 }
 DECLARE_XAM_EXPORT1(XamGetExecutionId, kNone, kImplemented);
 
+void XamLoaderRegisterLaunchRequestCallback_entry(dword_t callback) {
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  if (xam) {
+    xam->SetLaunchCallback(callback);
+  }
+}
+DECLARE_XAM_EXPORT1(XamLoaderRegisterLaunchRequestCallback, kNone, kStub);
+
+static std::string HexBytes(const std::vector<uint8_t>& data,
+                            size_t max_bytes) {
+  const size_t shown = std::min(data.size(), max_bytes);
+  std::string hex;
+  hex.reserve(shown * 2 + 3);
+  for (size_t i = 0; i < shown; ++i) {
+    hex += fmt::format("{:02X}", data[i]);
+  }
+  if (shown < data.size()) {
+    hex += "...";
+  }
+  return hex;
+}
+
+static constexpr size_t kLaunchDataLogBytes = 64;
+
 dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   loader_data.launch_data_present = size ? true : false;
   loader_data.launch_data.resize(size);
   std::memcpy(loader_data.launch_data.data(), data, size);
+  XELOGI("XamLoaderSetLaunchData: size={} data={}", uint32_t(size),
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return 0;
 }
 DECLARE_XAM_EXPORT1(XamLoaderSetLaunchData, kNone, kSketchy);
+
+// Stands in for the dashboard, which names the game in launch data.
+static void ChooseIndieGameLaunchData(XamModule::LoaderData& loader_data) {
+  std::string file_name;
+  uint32_t device_id = 0;
+  std::string display_name;
+  if (!xeXamChooseIndieGame(&file_name, &device_id, &display_name)) {
+    return;
+  }
+  auto& data = loader_data.launch_data;
+  data.assign(0x34, 0);
+  xe::store_and_swap<uint32_t>(data.data(), 0xCAFEBABE);
+  std::memcpy(data.data() + 4, file_name.data(),
+              std::min<size_t>(file_name.size(), 0x2A));
+  xe::store_and_swap<uint32_t>(data.data() + 0x30, device_id);
+  loader_data.launch_data_present = true;
+  kernel_state()->emulator()->SetTitleName(display_name);
+}
 
 dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
   if (!size_ptr) {
@@ -369,12 +459,20 @@ dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
+  if (loader_data.launch_data.empty() &&
+      kernel_state()->title_id() == kXN_2002) {
+    ChooseIndieGameLaunchData(loader_data);
+  }
   if (loader_data.launch_data.empty()) {
     *size_ptr = 0;
+    XELOGI("XamLoaderGetLaunchDataSize: none");
     return X_ERROR_NOT_FOUND;
   }
 
-  *size_ptr = uint32_t(xam->loader_data().launch_data.size());
+  const uint32_t size = uint32_t(loader_data.launch_data.size());
+  *size_ptr = size;
+  XELOGI("XamLoaderGetLaunchDataSize: size={} data={}", size,
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchDataSize, kNone, kSketchy);
@@ -384,15 +482,36 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   if (!loader_data.launch_data_present) {
+    XELOGI("XamLoaderGetLaunchData: none");
     return X_ERROR_NOT_FOUND;
   }
 
   uint32_t copy_size =
       std::min(uint32_t(loader_data.launch_data.size()), uint32_t(buffer_size));
   std::memcpy(buffer_ptr, loader_data.launch_data.data(), copy_size);
+  XELOGI("XamLoaderGetLaunchData: buffer_size={} copied={} data={}",
+         uint32_t(buffer_size), copy_size,
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
+
+// Guest paths are case-insensitive so a title's spelling of a name may not
+// match the file on disk. Look the real one up in the directory.
+static std::filesystem::path ResolveHostFileName(
+    const std::filesystem::path& path) {
+  const auto dir = path.parent_path();
+  const std::string name = xe::path_to_utf8(path.filename());
+  if (dir.empty() || name.empty()) {
+    return path;
+  }
+  for (const auto& info : xe::filesystem::ListFiles(dir)) {
+    if (xe::utf8::equal_case(xe::path_to_utf8(info.name), name)) {
+      return dir / info.name;
+    }
+  }
+  return path;
+}
 
 void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
@@ -423,7 +542,7 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 
     if (host_path.extension() == ".xex") {
       host_path.remove_filename();
-      host_path = host_path / launch_path;
+      host_path = ResolveHostFileName(host_path / launch_path);
       launch_path = "";
     }
 
@@ -465,10 +584,8 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
     }
 #endif  // !XE_PLATFORM_MAC
 
-    std::string launch_data_hex;
-    for (uint8_t byte : loader_data.launch_data) {
-      launch_data_hex += fmt::format("{:02X}", byte);
-    }
+    const std::string launch_data_hex =
+        HexBytes(loader_data.launch_data, loader_data.launch_data.size());
 
     auto on_launch_new_title =
         kernel_state()->emulator()->on_launch_new_title();
@@ -952,7 +1069,19 @@ DECLARE_XAM_EXPORT1(XamSetDvrStorage, kNone, kStub);
 dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
   return 0;
 }
-DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
+DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kStub);
+
+dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
+  if (error_code == 0x80300034) {
+    // uses second unk for some function
+    return X_ERROR_SUCCESS;
+  } else if (error_code == 0x80300035) {
+    // uses second unk for some function
+    return X_ERROR_SUCCESS;
+  }
+  return X_E_NOT_IMPLEMENTED;
+}
+DECLARE_XAM_EXPORT1(XamLogLocalizationEtx, kNone, kStub);
 
 }  // namespace xam
 }  // namespace kernel

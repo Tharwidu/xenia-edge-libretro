@@ -18,11 +18,17 @@
 
 DECLARE_bool(dump_xex);
 
+DEFINE_bool(dump_module_images, false,
+            "Dump each loaded module's decrypted image to "
+            "<name>.<base_address>.bin in the current directory",
+            "Kernel");
+
 namespace xe {
 namespace kernel {
 
+// Host object: the loader owns module handles, not the title's namespace.
 UserModule::UserModule(KernelState* kernel_state)
-    : XModule(kernel_state, ModuleType::kUserModule) {}
+    : XModule(kernel_state, ModuleType::kUserModule, true) {}
 
 UserModule::~UserModule() { Unload(); }
 
@@ -266,9 +272,33 @@ X_STATUS UserModule::LoadContinue() {
 
   ldr_data->entry_point = entry_point_;
 
+  if (cvars::dump_module_images) {
+    DumpImage();
+  }
+
   OnLoad();
 
   return X_STATUS_SUCCESS;
+}
+
+// The image as the guest sees it. Disassembly addresses then match the log.
+void UserModule::DumpImage() {
+  auto* xex = xex_module();
+  const uint32_t base = xex->base_address();
+  const uint32_t size = xex->image_size();
+  if (!base || !size) {
+    return;
+  }
+  auto dump_name = fmt::format("{}.{:08X}.bin", name_, base);
+  auto dump_file = xe::filesystem::OpenFile(dump_name, "wb");
+  if (!dump_file) {
+    XELOGE("Failed to open {} for a module image dump", dump_name);
+    return;
+  }
+  fwrite(memory()->TranslateVirtual(base), 1, size, dump_file);
+  fclose(dump_file);
+  XELOGI("Dumped image of '{}' at {:08X} ({} bytes) to {}", name_, base, size,
+         dump_name);
 }
 
 X_STATUS UserModule::Unload() {

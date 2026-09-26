@@ -32,16 +32,15 @@ class DeferredCommandList;
 // results are copied to a persistent readback buffer via ResolveQueryData.
 //
 // D3D12 requires BeginQuery and EndQuery to be recorded in the same command
-// list, so segments split at EndSubmission. Discarded queries still need a
-// paired EndQuery or the heap slot may become undefined on some drivers.
+// list, so segments split at EndSubmission.
 //
 // FlushResolveBatch coalesces pending indices into contiguous ranges to cut
 // down on ResolveQueryData call count.
 //
 // ROV queries use a separate path instead of normal D3D12 results. They write
-// surviving MSAA coverage into a dedicated buffer, one slot per active query.
-// QueueQueryResolve + ClearROVCounter are used instead of BeginQuery and
-// EndQuery.
+// depth/stencil outcomes into a dedicated buffer, one slot per active query.
+// QueueQueryResolve + ClearCounter are used instead of BeginQuery and EndQuery.
+// Hybrid RTV queries use both, adding pre-test coverage to the slot's Total.
 class D3D12ZPDQueryPool {
  public:
   D3D12ZPDQueryPool() = default;
@@ -51,10 +50,10 @@ class D3D12ZPDQueryPool {
 
   bool EnsureInitialized(const ui::d3d12::D3D12Provider& provider,
                          uint32_t requested_capacity, bool can_recreate,
-                         bool initialize_rov_counter);
+                         bool initialize_counter);
   void Shutdown();
 
-  bool is_initialized() const {
+  bool rtv_initialized() const {
     return query_heap_ && readback_buffer_ && readback_mapping_ != nullptr &&
            capacity_ != 0;
   }
@@ -63,17 +62,15 @@ class D3D12ZPDQueryPool {
 
   bool has_pending_resolve_batch() const {
     return !resolve_batch_indices_.empty() ||
-           !rov_counter_resolve_batch_indices_.empty();
+           !counter_resolve_batch_indices_.empty();
   }
 
-  bool rov_counter_initialized() const {
-    return rov_counter_buffer_ && rov_counter_readback_buffer_ &&
-           rov_counter_readback_mapping_ != nullptr && capacity_ != 0;
+  bool counter_initialized() const {
+    return counter_buffer_ && counter_readback_buffer_ &&
+           counter_readback_mapping_ != nullptr && capacity_ != 0;
   }
 
-  ID3D12Resource* rov_counter_buffer() const {
-    return rov_counter_buffer_.Get();
-  }
+  ID3D12Resource* counter_buffer() const { return counter_buffer_.Get(); }
 
   bool has_free_indices() const { return !free_indices_.empty(); }
 
@@ -85,23 +82,23 @@ class D3D12ZPDQueryPool {
                   uint32_t query_index) const;
   void EndQuery(DeferredCommandList& deferred_command_list,
                 uint32_t query_index) const;
-  void QueueQueryResolve(uint32_t query_index, bool uses_rov_counter);
-  void ClearROVCounter(DeferredCommandList& deferred_command_list,
-                       uint64_t submission, uint32_t query_index);
+  void QueueQueryResolve(uint32_t query_index, bool counter);
+  void ClearCounter(DeferredCommandList& deferred_command_list,
+                    uint64_t submission, uint32_t query_index);
 
   void FlushResolveBatch(DeferredCommandList& deferred_command_list,
                          uint64_t submission, bool submission_open);
 
-  uint64_t GetQueryReadbackValue(uint32_t query_index,
-                                 bool uses_rov_counter) const;
+  XenosZPDReport GetQueryReadbackValue(uint32_t query_index, bool counter,
+                                       bool hybrid) const;
 
  private:
-  // Transitions rov_counter_buffer_ to new_state through the tracked state,
+  // Transitions counter_buffer_ to new_state through the tracked state,
   // starting from COMMON on the first use in each submission (buffers decay to
   // COMMON when the previous submission's command list finishes).
-  void TransitionROVCounterBuffer(DeferredCommandList& deferred_command_list,
-                                  uint64_t submission,
-                                  D3D12_RESOURCE_STATES new_state);
+  void TransitionCounterBuffer(DeferredCommandList& deferred_command_list,
+                               uint64_t submission,
+                               D3D12_RESOURCE_STATES new_state);
 
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap_;
 
@@ -109,15 +106,15 @@ class D3D12ZPDQueryPool {
   Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer_;
   uint64_t* readback_mapping_ = nullptr;
 
-  Microsoft::WRL::ComPtr<ID3D12Resource> rov_counter_buffer_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> rov_counter_readback_buffer_;
-  uint32_t* rov_counter_readback_mapping_ = nullptr;
-  // rov_counter_buffer_ is written as a copy (WriteBufferImmediate needs
+  Microsoft::WRL::ComPtr<ID3D12Resource> counter_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> counter_readback_buffer_;
+  uint32_t* counter_readback_mapping_ = nullptr;
+  // counter_buffer_ is written as a copy (WriteBufferImmediate needs
   // COPY_DEST), through pixel shader UAV atomics (UNORDERED_ACCESS), and read
   // out for resolve (COPY_SOURCE). The tracked state is only valid within the
-  // submission recorded in rov_counter_buffer_state_submission_.
-  D3D12_RESOURCE_STATES rov_counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
-  uint64_t rov_counter_buffer_state_submission_ = UINT64_MAX;
+  // submission recorded in counter_buffer_state_submission_.
+  D3D12_RESOURCE_STATES counter_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  uint64_t counter_buffer_state_submission_ = UINT64_MAX;
 
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
@@ -125,12 +122,8 @@ class D3D12ZPDQueryPool {
   // Bumped on each acquire so stale readbacks from a recycled slot get dropped.
   std::vector<uint32_t> index_generations_;
 
-  std::vector<uint8_t> resolve_batch_pending_;
-  // Active indices with resolve_batch_pending_[i] == 1, so flush iterates
-  // only the active entries instead of scanning the full capacity.
   std::vector<uint32_t> resolve_batch_indices_;
-  std::vector<uint8_t> rov_counter_resolve_batch_pending_;
-  std::vector<uint32_t> rov_counter_resolve_batch_indices_;
+  std::vector<uint32_t> counter_resolve_batch_indices_;
   // Reusable scratch for coalesced contiguous ranges during flush.
   std::vector<ResolveRange> resolve_batch_ranges_;
 };
