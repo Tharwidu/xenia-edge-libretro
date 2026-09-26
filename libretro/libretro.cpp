@@ -818,6 +818,11 @@ static bool primary_gpu_is_amd() {
 // still downstream in vkd3d-proton and still not ours to fix. It does mean the
 // cost of that closure is higher than recorded, and it belongs in the docs.
 //
+// UPDATE 2026-09-25: upstream xenia-edge now generates the transfer and EDRAM
+// shaders from SPIR-V and no longer uses dxilconv or DXBC at all, so the exact
+// shaders that broke vkd3d-proton are gone. Until D3D12 is re-tested under
+// Proton the default stays Vulkan; if it renders, this gate can go.
+//
 // Not permanent, and not a ban: the bug is upstream in vkd3d-proton and already
 // partly fixed between Proton 10 and 11. xenia_gpu_backend=d3d12 still forces
 // it, which is how this gets re-tested as vkd3d improves. When it is fixed,
@@ -831,9 +836,9 @@ static const char* d3d12_auto_unusable_reason() {
     // Context 4. Keyed on the host because cases 3 and 4 are indistinguishable
     // any other way, not because Wine is unsupported.
     if (running_under_wine()) {
-        return "vkd3d-proton cannot translate the DXIL that dxilconv produces "
-               "for xenia's transfer pixel shaders (asserts on Proton 10, "
-               "deadlocks on 11); Vulkan already runs at full speed on Linux";
+        return "D3D12 under Wine/Proton is not yet validated (the old DXBC "
+               "transfer shaders hung vkd3d-proton); Vulkan runs at full "
+               "speed on Linux";
     }
     return nullptr;
 }
@@ -2694,41 +2699,6 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                           int(d3d12_probe->GetTiledResourcesTier()),
                           int(d3d12_probe->GetResourceBindingTier()));
 
-                // The caps above were where the Proton failure was hunted for,
-                // and they say nothing - vkd3d-proton reports the same or
-                // better than native. This is the line that matters. dxilconv
-                // is an in-box Windows DLL with no redistributable source, and
-                // without it the host render target path cannot build its
-                // transfer pixel shaders, so the title dies at its first real
-                // draws having logged nothing but a debug-level note. Treat a
-                // missing converter as a failed probe unless the pixel shader
-                // interlock path is both selected and supported, since that
-                // path doesn't use the transfer shaders.
-                const bool have_dxilconv =
-                    d3d12_probe->IsDxbcConverterAvailable();
-                const bool interlock_usable =
-                    cvars::render_target_path == "accuracy" &&
-                    d3d12_probe->AreRasterizerOrderedViewsSupported();
-                xenia_log(RETRO_LOG_INFO,
-                          "D3D12 dxilconv (DXBC->DXIL transfer shaders): %s\n",
-                          have_dxilconv ? "available"
-                                        : "MISSING - host render target path "
-                                          "cannot work");
-                if (!have_dxilconv) {
-                    if (interlock_usable) {
-                        xenia_log(RETRO_LOG_WARN,
-                                  "Staying on D3D12 without dxilconv because "
-                                  "render_target_path=accuracy uses the pixel "
-                                  "shader interlock path, which does not need "
-                                  "it\n");
-                    } else {
-                        d3d12_fail_reason =
-                            "dxilconv.dll is unavailable, so the host render "
-                            "target path cannot build its transfer shaders "
-                            "(an in-box Windows component; absent under "
-                            "Wine/Proton)";
-                    }
-                }
             }
         }
         if (d3d12_fail_reason) {

@@ -1,3 +1,3 @@
-static const AVCodecParser * const parser_list[] = {
+static const FFCodecParser * const parser_list[] = {
     &ff_mpegaudio_parser,
     NULL };
