@@ -61,29 +61,121 @@ bool IsExtension(const std::filesystem::path& p, const char* ext) {
   return true;
 }
 
-// What a candidate's package header says about it. ISOs have no header the
-// core can read cheaply, so they report is_container = false.
+// Which disc of which title a candidate is. known is false when it could
+// not be read, and the candidate is then judged by name or playlist order.
 struct Probe {
-  bool is_container = false;
+  bool known = false;
   uint32_t disc_number = 0;
   uint32_t title_id = 0;
 };
+
+uint32_t ReadBE32(const uint8_t* p) {
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 |
+         p[3];
+}
+uint32_t ReadLE32(const uint8_t* p) {
+  return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 |
+         uint32_t(p[3]) << 24;
+}
+
+// A disc image: find default.xex in the XDVDFS game partition and read the
+// disc number and title id from its execution info header, which XEX keeps
+// unencrypted.
+bool ProbeIso(const std::filesystem::path& path, Probe* probe) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+  auto read_at = [&](uint64_t offset, void* dst, size_t size) {
+    file.seekg(std::streamoff(offset));
+    return bool(file.read(static_cast<char*>(dst), std::streamsize(size)));
+  };
+  constexpr uint64_t kSector = 2048;
+  static const char kMagic[] = "MICROSOFT*XBOX*MEDIA";
+  // Game partition offsets: plain XDVDFS, XGD2, XGD3, XGD1.
+  uint64_t partition = UINT64_MAX;
+  uint8_t volume[28];
+  for (uint64_t offset : {0x0ull, 0xFD90000ull, 0x2080000ull, 0x18300000ull}) {
+    if (read_at(offset + 32 * kSector, volume, sizeof(volume)) &&
+        std::memcmp(volume, kMagic, 20) == 0) {
+      partition = offset;
+      break;
+    }
+  }
+  if (partition == UINT64_MAX) return false;
+  const uint32_t root_sector = ReadLE32(volume + 20);
+  const uint32_t root_size = ReadLE32(volume + 24);
+  if (!root_size || root_size > 16 * 1024 * 1024) return false;
+  std::vector<uint8_t> dir(root_size);
+  if (!read_at(partition + uint64_t(root_sector) * kSector, dir.data(),
+               dir.size())) {
+    return false;
+  }
+  // Directory entries form a binary tree; offsets are in 4-byte units.
+  uint32_t xex_sector = 0, xex_size = 0;
+  std::vector<uint32_t> stack = {0};
+  while (!stack.empty() && !xex_size) {
+    size_t at = size_t(stack.back()) * 4;
+    stack.pop_back();
+    if (at + 14 > dir.size()) continue;
+    const uint8_t* e = dir.data() + at;
+    uint16_t left = uint16_t(e[0] | e[1] << 8);
+    uint16_t right = uint16_t(e[2] | e[3] << 8);
+    if (left == 0xFFFF) continue;
+    size_t name_len = e[13];
+    if (at + 14 + name_len > dir.size()) continue;
+    std::string name(reinterpret_cast<const char*>(e + 14), name_len);
+    for (char& ch : name) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (name == "default.xex") {
+      xex_sector = ReadLE32(e + 4);
+      xex_size = ReadLE32(e + 8);
+    }
+    if (left) stack.push_back(left);
+    if (right) stack.push_back(right);
+  }
+  if (xex_size < 0x18) return false;
+  const uint64_t xex = partition + uint64_t(xex_sector) * kSector;
+  uint8_t head[0x18];
+  if (!read_at(xex, head, sizeof(head)) || std::memcmp(head, "XEX2", 4) != 0) {
+    return false;
+  }
+  const uint32_t header_size = std::min(ReadBE32(head + 8), xex_size);
+  const uint32_t count = ReadBE32(head + 0x14);
+  if (header_size > 1024 * 1024 || 0x18 + uint64_t(count) * 8 > header_size) {
+    return false;
+  }
+  std::vector<uint8_t> hdr(header_size);
+  if (!read_at(xex, hdr.data(), hdr.size())) return false;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t* h = hdr.data() + 0x18 + i * 8;
+    if (ReadBE32(h) != 0x00040006) continue;  // XEX_HEADER_EXECUTION_INFO
+    const uint32_t offset = ReadBE32(h + 4);
+    if (offset + 0x14 > hdr.size()) return false;
+    const uint8_t* info = hdr.data() + offset;
+    probe->title_id = ReadBE32(info + 0x0C);
+    probe->disc_number = info[0x12];
+    probe->known = true;
+    return true;
+  }
+  return false;
+}
 
 Probe ProbeDisc(const std::filesystem::path& path) {
   Probe probe;
   std::error_code ec;
   if (!std::filesystem::is_regular_file(path, ec)) return probe;
   auto header = vfs::XContentContainerDevice::ReadContainerHeader(path);
-  if (!header || !header->content_header.is_magic_valid()) return probe;
-  const auto& info = header->content_metadata.execution_info;
-  probe.is_container = true;
-  probe.disc_number = info.disc_number;
-  probe.title_id = info.title_id;
+  if (header && header->content_header.is_magic_valid()) {
+    const auto& info = header->content_metadata.execution_info;
+    probe.known = true;
+    probe.disc_number = info.disc_number;
+    probe.title_id = info.title_id;
+    return probe;
+  }
+  ProbeIso(path, &probe);
   return probe;
 }
 
 bool Matches(const Probe& probe, uint32_t disc, uint32_t title_id) {
-  return probe.is_container && probe.disc_number == disc &&
+  return probe.known && probe.disc_number == disc &&
          (!title_id || probe.title_id == title_id);
 }
 
@@ -149,10 +241,10 @@ int FindDiscLocked(uint32_t disc, uint32_t title_id) {
     if (Matches(ProbeDisc(images[i]), disc, title_id)) return int(i);
   }
   if (from_m3u) {
-    // A playlist of ISOs cannot be checked, so trust its order - unless that
-    // entry is a package that says it is some other disc.
+    // An entry that could not be identified is trusted by its position -
+    // unless it identifies as some other disc.
     size_t i = disc - 1;
-    if (disc >= 1 && i < images.size() && !ProbeDisc(images[i]).is_container) {
+    if (disc >= 1 && i < images.size() && !ProbeDisc(images[i]).known) {
       return int(i);
     }
     return -1;
@@ -160,9 +252,10 @@ int FindDiscLocked(uint32_t disc, uint32_t title_id) {
   if (!automatic || images.empty()) return -1;
   for (const auto& candidate : SiblingCandidates(images[0], disc)) {
     Probe probe = ProbeDisc(candidate);
-    // A package must prove it is the right disc; an ISO is taken on its name.
-    if (probe.is_container ? !Matches(probe, disc, title_id)
-                           : !IsExtension(candidate, ".iso")) {
+    // A disc that identifies itself must be the right one; one that cannot
+    // be read is taken on its name, if it is an ISO.
+    if (probe.known ? !Matches(probe, disc, title_id)
+                    : !IsExtension(candidate, ".iso")) {
       continue;
     }
     images.push_back(candidate);
