@@ -249,6 +249,22 @@ static int16_t RETRO_CALLCONV idle_input_state(unsigned, unsigned, unsigned,
     return 0;
 }
 
+// The on-screen keyboard is painted over a copy of the frame in ordinary
+// memory: the upload/staging buffers it would otherwise go straight into are
+// write-combined, where reading pixels back to dim them costs ~100 ms a frame.
+// Returns the frame to upload - the original when no prompt is open.
+static std::vector<uint8_t> keyboard_frame_buf;
+static const void* keyboard_frame(const void* frame, uint32_t w, uint32_t h,
+                                  bool bgra) {
+    if (!xe::libretro_keyboard::SuppressGuestInput()) return frame;
+    const size_t size = size_t(w) * h * 4;
+    keyboard_frame_buf.resize(size);
+    memcpy(keyboard_frame_buf.data(), frame, size);
+    xe::libretro_keyboard::DrawOverlay(keyboard_frame_buf.data(), w, h,
+                                       size_t(w) * 4, bgra);
+    return keyboard_frame_buf.data();
+}
+
 static inline void emit_dupe_frame(void) {
     core_state.video_cb(nullptr, last_frame_w, last_frame_h,
                         static_cast<size_t>(last_frame_w) * 4);
@@ -1730,9 +1746,8 @@ static void update_video_vulkan(void) {
     }
 
     // Copy Xenia readback ??? frontend staging buffer
-    memcpy(f.staging_mapped, blit_data, (size_t)w * h * 4);
-    xe::libretro_keyboard::DrawOverlay(static_cast<uint8_t*>(f.staging_mapped),
-                                       w, h, size_t(w) * 4, is_bgra);
+    memcpy(f.staging_mapped, keyboard_frame(blit_data, w, h, is_bgra),
+           (size_t)w * h * 4);
 
     // Record commands: staging ??? image, transition to shader-read
     VkCommandBuffer cmd = f.cmd;
@@ -1861,13 +1876,13 @@ static void update_video_d3d12(void) {
     device->GetCopyableFootprints(&tex_desc, 0, 1, 0, &layout, nullptr, nullptr, nullptr);
 
     uint8_t *dst = (uint8_t *)f.upload_mapped + layout.Offset;
-    const uint8_t *src = (const uint8_t *)blit_data;
+    const uint8_t *src =
+        (const uint8_t *)keyboard_frame(blit_data, w, h, is_bgra);
     uint32_t src_pitch = w * 4;
     uint32_t dst_pitch = layout.Footprint.RowPitch;
     for (uint32_t row = 0; row < h; row++) {
         memcpy(dst + row * dst_pitch, src + row * src_pitch, src_pitch);
     }
-    xe::libretro_keyboard::DrawOverlay(dst, w, h, dst_pitch, is_bgra);
 
     // Record commands
     f.cmd_alloc->Reset();
