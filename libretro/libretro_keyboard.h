@@ -28,6 +28,11 @@ enum class Mode {
 
 void SetMode(Mode mode);
 
+// Message boxes: true shows them as a list of the title's buttons, starting
+// on the button the auto-answer would pick; false auto-answers (old
+// behaviour).
+void SetAskMessageBoxes(bool ask);
+
 // Registers the prompt handler with the XAM stub and the keyboard callback
 // with the frontend.
 void Install(retro_environment_t environ_cb);

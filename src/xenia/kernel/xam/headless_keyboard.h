@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace xe {
 namespace kernel {
@@ -43,6 +44,25 @@ using HeadlessKeyboardHandler = std::function<bool(
     const HeadlessKeyboardRequest& request, HeadlessKeyboardDone done)>;
 
 void SetHeadlessKeyboardHandler(HeadlessKeyboardHandler handler);
+
+// The same for message boxes (XamShowMessageBoxUI/Ex).
+struct HeadlessMessageBoxRequest {
+  std::string title;
+  std::string text;
+  std::vector<std::string> buttons;
+  // What the auto-answer would pick: the title's focused button, steered for
+  // recognised save/online prompts.
+  uint32_t suggested_button = 0;
+};
+
+// accepted == false means the player backed out (the title sees a cancel).
+using HeadlessMessageBoxDone =
+    std::function<void(bool accepted, uint32_t button)>;
+
+using HeadlessMessageBoxHandler = std::function<bool(
+    const HeadlessMessageBoxRequest& request, HeadlessMessageBoxDone done)>;
+
+void SetHeadlessMessageBoxHandler(HeadlessMessageBoxHandler handler);
 
 }  // namespace xam
 }  // namespace kernel

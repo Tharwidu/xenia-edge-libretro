@@ -28,6 +28,7 @@
 // message box's steered button, the keyboard's gamertag), because a title that
 // gets an empty answer tends to ask again forever.
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -197,6 +198,16 @@ static int32_t FindAutoButton(const std::string& title_lower,
   return -1;
 }
 
+using HostFinish = std::function<X_RESULT()>;
+static bool RunHostPrompt(
+    const std::function<bool(std::function<void(HostFinish)>)>& start,
+    uint32_t overlapped, X_RESULT* sync_result);
+static HeadlessMessageBoxHandler headless_message_box_handler;
+
+void SetHeadlessMessageBoxHandler(HeadlessMessageBoxHandler handler) {
+  headless_message_box_handler = std::move(handler);
+}
+
 static dword_result_t ShowMessageBoxUi(
     dword_t user_index, lpu16string_t title_ptr, lpu16string_t text_ptr,
     dword_t button_count, lpdword_t button_ptrs, dword_t active_button,
@@ -206,20 +217,24 @@ static dword_result_t ShowMessageBoxUi(
   std::string title = title_ptr ? xe::to_utf8(title_ptr.value()) : "";
   std::string text = text_ptr ? xe::to_utf8(text_ptr.value()) : "";
   std::string buttons;
+  std::vector<std::string> labels;
   std::vector<std::string> buttons_lower;
   for (uint32_t i = 0; i < button_count; ++i) {
     auto b = xe::load_and_swap<std::u16string>(
         kernel_state()->memory()->TranslateVirtual(button_ptrs[i]));
     std::string label = xe::to_utf8(b);
     buttons += (i ? " | " : "") + label;
+    labels.push_back(label);
     buttons_lower.push_back(xe::utf8::lower_ascii(label));
   }
 
   // Default to the game's focused button; a per-game override lets the user
   // steer prompts that need a specific choice (e.g. "continue without saving").
   uint32_t chosen = static_cast<uint32_t>(active_button);
-  if (cvars::headless_messagebox_button >= 0 &&
-      cvars::headless_messagebox_button < static_cast<int32_t>(button_count)) {
+  const bool forced =
+      cvars::headless_messagebox_button >= 0 &&
+      cvars::headless_messagebox_button < static_cast<int32_t>(button_count);
+  if (forced) {
     chosen = static_cast<uint32_t>(cvars::headless_messagebox_button);
   } else {
     // In auto mode, steer recognized save/storage and Xbox LIVE / online
@@ -236,6 +251,34 @@ static dword_result_t ShowMessageBoxUi(
       "Headless message box: title='{}' text='{}' buttons=[{}] active={} -> "
       "answering button {}",
       title, text, buttons, uint32_t(active_button), chosen);
+
+  // Let the player choose, starting on that answer, unless a button was
+  // forced for this title.
+  if (!forced && headless_message_box_handler && button_count) {
+    HeadlessMessageBoxRequest request;
+    request.title = title;
+    request.text = text;
+    request.buttons = labels;
+    request.suggested_button = std::min(chosen, uint32_t(button_count) - 1);
+    X_RESULT host_result = X_ERROR_SUCCESS;
+    if (RunHostPrompt(
+            [&](std::function<void(HostFinish)> complete) {
+              return headless_message_box_handler(
+                  request, [complete, result_ptr](bool accepted,
+                                                  uint32_t button) {
+                    complete([=]() -> X_RESULT {
+                      if (!accepted) {
+                        return X_ERROR_CANCELLED;
+                      }
+                      result_ptr->ButtonPressed = button;
+                      return X_ERROR_SUCCESS;
+                    });
+                  });
+            },
+            overlapped.guest_address(), &host_result)) {
+      return host_result;
+    }
+  }
 
   return DispatchHeadless(
       [result_ptr, chosen]() -> X_RESULT {
@@ -303,55 +346,35 @@ void SetHeadlessKeyboardHandler(HeadlessKeyboardHandler handler) {
   headless_keyboard_handler = std::move(handler);
 }
 
-// Hands the prompt to the host's keyboard UI. Returns false when there is
-// none or it declines, so the caller auto-fills instead.
-static bool ShowHostKeyboard(const HeadlessKeyboardRequest& request,
-                             char16_t* buffer, uint32_t buffer_length,
-                             uint32_t overlapped, X_RESULT* sync_result) {
-  if (!headless_keyboard_handler) {
-    return false;
-  }
-  // Writes the answer into the title's buffer; runs on whichever thread the
-  // host answers from, so nothing here may need a current guest thread.
-  auto write = [buffer, buffer_length](bool accepted,
-                                       const std::string& text) -> X_RESULT {
-    if (!accepted) {
-      return X_ERROR_CANCELLED;
-    }
-    std::u16string text16 = xe::to_utf16(text);
-    if (text16.empty()) {
-      std::memset(buffer, 0, size_t(buffer_length) * 2);
-    } else {
-      string_util::copy_and_swap_truncating(buffer, text16, buffer_length);
-    }
-    return X_ERROR_SUCCESS;
-  };
-
+// A prompt answered by the host's own UI. start() hands the request over and
+// returns false if the host declines; otherwise it calls complete() exactly
+// once, from any thread, with a finish() that writes the answer into guest
+// memory and returns the result. A synchronous call parks its guest thread
+// until then. An overlapped one is marked pending on the requesting guest
+// thread (the context its completion routine is queued to) and completed when
+// the host answers, without holding the kernel dispatch thread meanwhile.
+static bool RunHostPrompt(
+    const std::function<bool(std::function<void(HostFinish)>)>& start,
+    uint32_t overlapped, X_RESULT* sync_result) {
   if (!overlapped) {
     struct State {
       xe::threading::Fence fence;
-      bool accepted = false;
-      std::string text;
+      HostFinish finish;
     };
     auto state = std::make_shared<State>();
-    if (!headless_keyboard_handler(
-            request, [state](bool accepted, const std::string& text) {
-              state->accepted = accepted;
-              state->text = text;
-              state->fence.Signal();
-            })) {
+    if (!start([state](HostFinish finish) {
+          state->finish = std::move(finish);
+          state->fence.Signal();
+        })) {
       return false;
     }
     kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
     GuestScheduler::WaitOnFence(state->fence);
-    *sync_result = write(state->accepted, state->text);
+    *sync_result = state->finish();
     NotifyUiShownBriefly();
     return true;
   }
 
-  // Mark the overlapped pending now, on the requesting guest thread (the
-  // context its completion routine is queued to), and complete it whenever
-  // the host answers - without holding the kernel dispatch thread meanwhile.
   auto* ptr = kernel_state()->memory()->TranslateVirtual(overlapped);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
@@ -362,22 +385,51 @@ static bool ShowHostKeyboard(const HeadlessKeyboardRequest& request,
       ev.get<XEvent>()->Reset();
     }
   }
-  if (!headless_keyboard_handler(
-          request, [write, overlapped](bool accepted, const std::string& text) {
-            if (!kernel_state()) {
-              return;
-            }
-            X_RESULT result = write(accepted, text);
-            kernel_state()->CompleteOverlappedEx(overlapped, result, result,
-                                                 0);
-            NotifyUiShownBriefly();
-          })) {
+  if (!start([overlapped](HostFinish finish) {
+        if (!kernel_state()) {
+          return;
+        }
+        X_RESULT result = finish();
+        kernel_state()->CompleteOverlappedEx(overlapped, result, result, 0);
+        NotifyUiShownBriefly();
+      })) {
     XOverlappedSetResult(ptr, X_ERROR_SUCCESS);
     return false;
   }
   kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
   *sync_result = X_ERROR_IO_PENDING;
   return true;
+}
+
+// Hands a keyboard prompt to the host's UI. Returns false when there is none
+// or it declines, so the caller auto-fills instead.
+static bool ShowHostKeyboard(const HeadlessKeyboardRequest& request,
+                             char16_t* buffer, uint32_t buffer_length,
+                             uint32_t overlapped, X_RESULT* sync_result) {
+  if (!headless_keyboard_handler) {
+    return false;
+  }
+  return RunHostPrompt(
+      [&](std::function<void(HostFinish)> complete) {
+        return headless_keyboard_handler(
+            request, [complete, buffer, buffer_length](
+                         bool accepted, const std::string& text) {
+              complete([=]() -> X_RESULT {
+                if (!accepted) {
+                  return X_ERROR_CANCELLED;
+                }
+                std::u16string text16 = xe::to_utf16(text);
+                if (text16.empty()) {
+                  std::memset(buffer, 0, size_t(buffer_length) * 2);
+                } else {
+                  string_util::copy_and_swap_truncating(buffer, text16,
+                                                        buffer_length);
+                }
+                return X_ERROR_SUCCESS;
+              });
+            });
+      },
+      overlapped, sync_result);
 }
 
 dword_result_t XamShowKeyboardUI_entry(

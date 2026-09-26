@@ -49,10 +49,18 @@ constexpr int kRepeatRate = 5;
 std::mutex mutex;
 Mode mode = Mode::kAskPrefilled;
 
+bool ask_message_boxes = true;
+
+// One prompt at a time: the keyboard, or a message box's list of buttons.
+enum class Kind { kKeyboard, kChoice };
 bool active = false;
+Kind kind = Kind::kKeyboard;
 xam::HeadlessKeyboardRequest request;
 xam::HeadlessKeyboardDone done;
 std::string text;
+xam::HeadlessMessageBoxRequest choice;
+xam::HeadlessMessageBoxDone choice_done;
+int selected = 0;
 int row = 1, col = 0;
 bool shift = false;
 bool held[kButtonCount] = {};
@@ -66,12 +74,23 @@ void Finish(bool accepted) {
   if (!active) return;
   active = false;
   wait_for_release = true;
+  // The callbacks write guest memory and complete the title's request. They
+  // never call back into this module, so running them under our lock is safe.
+  if (kind == Kind::kChoice) {
+    auto callback = std::move(choice_done);
+    choice_done = nullptr;
+    if (callback) callback(accepted, uint32_t(selected));
+    return;
+  }
   auto callback = std::move(done);
   std::string answer = text;
   done = nullptr;
-  // The callback writes guest memory and completes the title's request. It
-  // never calls back into this module, so running it under our lock is safe.
   if (callback) callback(accepted, answer);
+}
+
+void MoveChoice(int d) {
+  int n = int(choice.buttons.size());
+  if (n) selected = (selected + d + n) % n;
 }
 
 void Type(char c) {
@@ -222,12 +241,65 @@ std::string Printable(const std::string& s) {
   return out;
 }
 
+// A message box: title, text, and its buttons as a list. Mutex held.
+constexpr int kChoiceTextLines = 10;
+void DrawChoice(const Canvas& c) {
+  const size_t chars = size_t(kGridW / kFontWidth);
+  auto lines = Wrap(Printable(choice.text), chars, kChoiceTextLines);
+  const int n = int(choice.buttons.size());
+  const int panel_h = kMargin + kLine + 6 + int(lines.size()) * kLine + 10 +
+                      n * (kKeyH + kGap) + kLine + kMargin;
+  int s = std::max(1, std::min(c.w / (kPanelW + 20), c.h / (panel_h + 20)));
+  c.Dim();
+  int px = (c.w - kPanelW * s) / 2, py = (c.h - panel_h * s) / 2;
+  c.Fill(px - 2 * s, py - 2 * s, (kPanelW + 4) * s, (panel_h + 4) * s, 16, 124,
+         16);
+  c.Fill(px, py, kPanelW * s, panel_h * s, 28, 28, 34);
+
+  int x = px + kMargin * s, y = py + kMargin * s;
+  std::string title = Printable(choice.title);
+  if (title.empty()) title = "Message";
+  c.Text(x, y, Wrap(title, chars, 1)[0], s, 255, 255, 255);
+  y += (kLine + 6) * s;
+  for (const auto& line : lines) {
+    c.Text(x, y, line, s, 200, 200, 210);
+    y += kLine * s;
+  }
+  y += 10 * s;
+  for (int i = 0; i < n; ++i) {
+    bool sel = i == selected;
+    c.Fill(x, y, kGridW * s, kKeyH * s, sel ? 16 : 58, sel ? 124 : 58,
+           sel ? 16 : 66);
+    auto wrapped = Wrap(Printable(choice.buttons[i]), chars - 2, 1);
+    std::string label =
+        wrapped.empty() ? "Button " + std::to_string(i + 1) : wrapped[0];
+    c.Text(x + 8 * s, y + (kKeyH - kFontHeight) * s / 2, label, s, 255, 255,
+           255);
+    y += (kKeyH + kGap) * s;
+  }
+  c.Text(x, y + 2 * s, "D-pad choose  A select  B back", s, 150, 150, 160);
+}
+
 // ---- handler / keyboard callback -------------------------------------------
+
+bool HandleMessageBox(const xam::HeadlessMessageBoxRequest& req,
+                      xam::HeadlessMessageBoxDone callback) {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!ask_message_boxes || active || req.buttons.empty()) return false;
+  choice = req;
+  choice_done = std::move(callback);
+  selected = int(std::min<size_t>(req.suggested_button,
+                                  req.buttons.size() - 1));
+  kind = Kind::kChoice;
+  active = true;
+  return true;
+}
 
 bool HandleRequest(const xam::HeadlessKeyboardRequest& req,
                    xam::HeadlessKeyboardDone callback) {
   std::lock_guard<std::mutex> lock(mutex);
   if (mode == Mode::kAutoFill || active) return false;
+  kind = Kind::kKeyboard;
   request = req;
   done = std::move(callback);
   text = Printable(mode == Mode::kAskPrefilled ? req.suggested_text
@@ -245,6 +317,19 @@ void RETRO_CALLCONV OnKey(bool down, unsigned keycode, uint32_t character,
   if (!down) return;
   std::lock_guard<std::mutex> lock(mutex);
   if (!active) return;
+  if (kind == Kind::kChoice) {
+    switch (keycode) {
+      case RETROK_UP:
+      case RETROK_LEFT: MoveChoice(-1); break;
+      case RETROK_DOWN:
+      case RETROK_RIGHT: MoveChoice(1); break;
+      case RETROK_RETURN:
+      case RETROK_KP_ENTER: Finish(true); break;
+      case RETROK_ESCAPE: Finish(false); break;
+      default: break;
+    }
+    return;
+  }
   switch (keycode) {
     case RETROK_BACKSPACE: Backspace(); return;
     case RETROK_RETURN:
@@ -264,8 +349,14 @@ void SetMode(Mode m) {
   mode = m;
 }
 
+void SetAskMessageBoxes(bool ask) {
+  std::lock_guard<std::mutex> lock(mutex);
+  ask_message_boxes = ask;
+}
+
 void Install(retro_environment_t environ_cb) {
   xam::SetHeadlessKeyboardHandler(HandleRequest);
+  xam::SetHeadlessMessageBoxHandler(HandleMessageBox);
   static struct retro_keyboard_callback keyboard = {OnKey};
   environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &keyboard);
 }
@@ -311,6 +402,13 @@ void Update(retro_input_state_t input_state) {
     if (!any) wait_for_release = false;
     return;
   }
+  if (kind == Kind::kChoice) {
+    if (Pressed(kUp, true) || Pressed(kLeft, true)) MoveChoice(-1);
+    if (Pressed(kDown, true) || Pressed(kRight, true)) MoveChoice(1);
+    if (Pressed(kA, false) || Pressed(kStart, false)) Finish(true);
+    if (Pressed(kB, false) || Pressed(kBack, false)) Finish(false);
+    return;
+  }
   if (Pressed(kUp, true)) Move(-1, 0);
   if (Pressed(kDown, true)) Move(1, 0);
   if (Pressed(kLeft, true)) Move(0, -1);
@@ -328,6 +426,10 @@ void DrawOverlay(uint8_t* pixels, uint32_t width, uint32_t height,
   std::lock_guard<std::mutex> lock(mutex);
   if (!active || !pixels) return;
   Canvas c{pixels, int(width), int(height), pitch, bgra};
+  if (kind == Kind::kChoice) {
+    DrawChoice(c);
+    return;
+  }
   int s = std::max(1, std::min(int(width) / (kPanelW + 20),
                                int(height) / (kPanelH + 20)));
   c.Dim();

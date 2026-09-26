@@ -903,6 +903,10 @@ static void apply_core_options(void) {
                       : xe::libretro_keyboard::Mode::kAskPrefilled);
     }
 
+    if ((v = opt_get(XENIA_OPT_MESSAGE_BOXES))) {
+        xe::libretro_keyboard::SetAskMessageBoxes(strcmp(v, "auto") != 0);
+    }
+
     if ((v = opt_get(XENIA_OPT_AUTO_DISC_SWAP))) {
         xe::libretro_disc::SetAutomatic(strcmp(v, "disabled") != 0);
     }

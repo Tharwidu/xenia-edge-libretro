@@ -27,6 +27,7 @@ struct xenia_core_state;
 #define XENIA_OPT_AUTO_PROFILE          "xenia_auto_profile"
 #define XENIA_OPT_AUTO_DISC_SWAP        "xenia_auto_disc_swap"
 #define XENIA_OPT_KEYBOARD_PROMPTS      "xenia_keyboard_prompts"
+#define XENIA_OPT_MESSAGE_BOXES         "xenia_message_boxes"
 #define XENIA_OPT_MSGBOX_BUTTON         "xenia_messagebox_button"
 #define XENIA_OPT_BOOT_SPLASH           "xenia_boot_splash"
 #define XENIA_OPT_STORE_SHADERS         "xenia_store_shaders"
@@ -707,6 +708,27 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
             { "ask",       "Ask, Pre-filled" },
             { "ask_empty", "Ask, Empty" },
             { "autofill",  "Auto-Fill" },
+            { NULL, NULL }
+        },
+        "ask"
+    },
+    {
+        XENIA_OPT_MESSAGE_BOXES,
+        "Message Boxes",
+        "Message Boxes",
+        "What happens when a game shows a system message box (\"Exit to "
+        "the main menu?\", \"No save data found\").\n"
+        "Ask: show the game's buttons and let you choose, starting on the "
+        "one the core would have picked. D-pad/stick move, A selects, B "
+        "backs out.\n"
+        "Auto: answer at once with the game's default button, steered "
+        "for save and Xbox LIVE prompts. \"Message Box Button\" set to a "
+        "specific button always answers automatically.",
+        NULL,
+        "Emulation",
+        {
+            { "ask",  "Ask" },
+            { "auto", "Auto" },
             { NULL, NULL }
         },
         "ask"
