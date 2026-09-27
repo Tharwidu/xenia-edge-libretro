@@ -328,6 +328,10 @@ static bool d3d12_hw_render_active = false;
 static bool d3d12_hw_render_active = false;
 #endif
 
+// Reported as library_version and logged at load, so a log says which build
+// produced it.
+static const char kCoreVersion[] = "0.4.1";
+
 /* ================================================================== */
 /*  Logging                                                            */
 /* ================================================================== */
@@ -2436,7 +2440,7 @@ RETRO_API void retro_deinit(void) {
 RETRO_API void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
     info->library_name     = "Xenia Edge";
-    info->library_version  = "0.4.1";
+    info->library_version  = kCoreVersion;
     info->need_fullpath    = true;
     info->valid_extensions = "iso|xex|zar|xcp|x360|m3u";
     info->block_extract    = false;
@@ -2463,6 +2467,7 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info *info) {
+    xenia_log(RETRO_LOG_INFO, "Xenia Edge %s\n", kCoreVersion);
     if (!info || !info->path) {
         xenia_log(RETRO_LOG_ERROR, "No game path supplied\n");
         return false;
