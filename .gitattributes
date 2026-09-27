@@ -12,3 +12,7 @@ src/**/shaders/bytecode/** linguist-generated=true
 # Preserve CRLF for generated shader headers
 src/xenia/gpu/shaders/bytecode/d3d12_5_1/*.h text eol=crlf
 src/**/testing/** linguist-detectable=false
+
+# Shipped into users' RetroArch folders; keep LF whatever the checkout.
+libretro/retroarch-config/** text eol=lf
+libretro/system/** text eol=lf
