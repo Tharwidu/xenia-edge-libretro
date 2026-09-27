@@ -278,6 +278,32 @@ std::string LabelFor(const std::filesystem::path& path) {
   return utf8(path.filename());
 }
 
+// States the "(Disc N)" siblings of single loaded content, so the set is
+// known at load time rather than at the first swap. Nothing is added to
+// images: the search runs again, with the title's own id, when a disc is
+// requested. Caller holds the mutex.
+void LogDiscSetLocked() {
+  const Probe base = ProbeDisc(images[0]);
+  std::string found;
+  for (uint32_t disc = 1; disc <= 9; ++disc) {
+    if (base.known && base.disc_number == disc) continue;
+    for (const auto& candidate : SiblingCandidates(images[0], disc)) {
+      if (candidate == images[0]) continue;
+      Probe probe = ProbeDisc(candidate);
+      if (probe.known ? !Matches(probe, disc, base.known ? base.title_id : 0)
+                      : !IsExtension(candidate, ".iso")) {
+        continue;
+      }
+      found += (found.empty() ? " disc " : "; disc ") +
+               std::to_string(disc) + " = " + utf8(candidate);
+      break;
+    }
+  }
+  if (found.empty()) return;
+  DISC_LOG(RETRO_LOG_INFO, "Sibling discs of %s:%s\n",
+           LabelFor(images[0]).c_str(), found.c_str());
+}
+
 bool CopyOut(const std::string& s, char* dst, size_t len) {
   if (!dst || !len) return false;
   std::snprintf(dst, len, "%s", s.c_str());
@@ -385,8 +411,12 @@ void RegisterDiskControl(retro_environment_t environ_cb) {
   }
 }
 
-bool ResolveContentPath(const std::filesystem::path& in,
+bool ResolveContentPath(const std::filesystem::path& content,
                         std::filesystem::path* out) {
+  // Frontends pass forward slashes on Windows too; sibling discs are built
+  // with operator/, so without this the paths (and the log) mix separators.
+  std::filesystem::path in = content;
+  in.make_preferred();
   if (!IsExtension(in, ".x360")) {
     *out = in;
     return true;
@@ -408,6 +438,7 @@ bool ResolveContentPath(const std::filesystem::path& in,
   }
   std::filesystem::path target = xe::to_path(line);
   if (target.is_relative()) target = in.parent_path() / target;
+  target.make_preferred();
   // Pointer files routinely hold absolute paths, so a moved library breaks
   // them; without this check the launch fails deep inside LaunchPath as a bare
   // 0xC00000BB that says nothing about the cause.
@@ -445,6 +476,7 @@ bool LoadContent(const std::filesystem::path& content,
     if (!ResolveContentPath(content, &resolved)) return false;
     images.push_back(resolved);
     *boot_path = resolved;
+    LogDiscSetLocked();
     return true;
   }
 
