@@ -330,7 +330,7 @@ static bool d3d12_hw_render_active = false;
 
 // Reported as library_version and logged at load, so a log says which build
 // produced it.
-static const char kCoreVersion[] = "0.4.1";
+static const char kCoreVersion[] = "0.4.2";
 
 /* ================================================================== */
 /*  Logging                                                            */
