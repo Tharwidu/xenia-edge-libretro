@@ -22,6 +22,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
 
 namespace xe::net::secure {
 namespace {
@@ -38,11 +39,22 @@ udp::endpoint ToAsio(UdpEndpoint endpoint) {
   return {asio::ip::address_v4(endpoint.address), endpoint.port};
 }
 
-// Windows reports an ICMP port unreachable for an earlier send as a failed
-// receive. Nothing is wrong with the socket.
+// Windows reports an ICMP error for an earlier send as a failed receive.
+// Nothing is wrong with the socket.
 bool Transient(const asio::error_code& ec) {
+#if XE_PLATFORM_WIN32
+  // Overlapped receives give the unreachables as Win32 codes.
+  if (ec.category() == asio::system_category() &&
+      (ec.value() == ERROR_NETWORK_UNREACHABLE ||
+       ec.value() == ERROR_HOST_UNREACHABLE)) {
+    return true;
+  }
+#endif
   return ec == asio::error::connection_reset ||
-         ec == asio::error::connection_refused;
+         ec == asio::error::connection_refused ||
+         ec == asio::error::network_reset ||
+         ec == asio::error::network_unreachable ||
+         ec == asio::error::host_unreachable;
 }
 
 class UdpSocket {
