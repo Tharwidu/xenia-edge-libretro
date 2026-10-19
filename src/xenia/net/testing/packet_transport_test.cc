@@ -21,11 +21,16 @@
 
 #include <asio.hpp>
 
+#include "xenia/base/platform.h"
 #include "xenia/net/host_interfaces.h"
 #include "xenia/net/packet_transport.h"
 #include "xenia/net/system_link.h"
 
 #include "third_party/catch/include/catch.hpp"
+
+#if !XE_PLATFORM_WIN32
+#include <net/if.h>
+#endif
 
 namespace xe::net::secure::test {
 namespace {
@@ -85,6 +90,21 @@ struct Peer {
 uint16_t FreePort() {
   Peer probe;
   return probe.port();
+}
+
+HostInterface Loopback() {
+  HostInterface host;
+  host.address = kLoopback;
+  host.mask = 0xFF000000;
+  host.mac = kMacA;
+#if XE_PLATFORM_WIN32
+  host.index = 1;
+#elif XE_PLATFORM_MAC
+  host.index = if_nametoindex("lo0");
+#else
+  host.index = if_nametoindex("lo");
+#endif
+  return host;
 }
 
 }  // namespace
@@ -213,7 +233,8 @@ TEST_CASE("Transports stop waiting for a frame when woken",
   std::unique_ptr<PacketTransport> transports[] = {
       OpenUdpTunnelTransport(kMacA, FreePort(), {{kLoopback, FreePort()}},
                              error),
-      OpenKaiTransport(kMacA, {kLoopback, engine.port()}, error)};
+      OpenKaiTransport(kMacA, {kLoopback, engine.port()}, error),
+      OpenHostTransport(Loopback(), FreePort(), error)};
   for (auto& transport : transports) {
     REQUIRE(transport);
     for (bool before : {true, false}) {
@@ -234,6 +255,65 @@ TEST_CASE("Transports stop waiting for a frame when woken",
     }
     CHECK(transport->healthy());
   }
+}
+
+TEST_CASE("Host transport keeps a wake across a port change",
+          "[net][transport]") {
+  std::string error;
+  auto transport = OpenHostTransport(Loopback(), FreePort(), error);
+  REQUIRE(transport);
+  transport->Wake();
+  REQUIRE(transport->SetPort(FreePort()));
+  auto waiting = std::async(std::launch::async, [&] {
+    std::vector<uint8_t> frame;
+    return transport->Receive(frame, 10000);
+  });
+  REQUIRE(waiting.wait_for(std::chrono::seconds(1)) ==
+          std::future_status::ready);
+  CHECK_FALSE(waiting.get());
+}
+
+TEST_CASE("Host transport carries datagrams as cross-platform frames",
+          "[net][transport]") {
+  const auto host = Loopback();
+  CrossPlatform addressing{host.address, host.mask, FreePort()};
+  std::string error;
+  auto transport = OpenHostTransport(host, addressing.port, error);
+  REQUIRE(transport);
+  CHECK(transport->identity() == kMacA);
+  auto frame = [&](std::vector<uint8_t> payload) {
+    auto encoded = EncodeFrame(
+        {IpMachine(kLoopback), IpMachine(kLoopback), false, std::move(payload)},
+        addressing);
+    REQUIRE(encoded);
+    return *encoded;
+  };
+
+  // Peers only send from the System Link port.
+  Peer stranger;
+  stranger.SendTo(std::string_view("\0\0\0\0stray", 9),
+                  {asio::ip::address_v4::loopback(), addressing.port});
+  const auto exchange = frame({0, 0, 0, 0, 1, 2, 3});
+  REQUIRE(transport->Send(exchange) == static_cast<int>(exchange.size()));
+  std::vector<uint8_t> received;
+  REQUIRE(transport->Receive(received, 1000));
+  CHECK(received == exchange);
+
+  // Only broadcasts use the broadcast keys.
+  REQUIRE(transport->Send(frame({0x87, 0, 0, 0, 1, 2, 3})) > 0);
+  REQUIRE(transport->Receive(received, 1000));
+  REQUIRE(received.size() > 34);
+  CHECK(std::all_of(received.begin(), received.begin() + 6,
+                    [](uint8_t byte) { return byte == 255; }));
+  CHECK(std::all_of(received.begin() + 30, received.begin() + 34,
+                    [](uint8_t byte) { return byte == 255; }));
+
+  addressing.port = FreePort();
+  REQUIRE(transport->SetPort(addressing.port));
+  const auto moved = frame({0, 0, 0, 0, 4, 5, 6});
+  REQUIRE(transport->Send(moved) > 0);
+  REQUIRE(transport->Receive(received, 1000));
+  CHECK(received == moved);
 }
 
 TEST_CASE("Host interfaces skip loopback", "[net][transport]") {

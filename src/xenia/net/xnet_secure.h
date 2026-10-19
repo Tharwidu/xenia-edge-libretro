@@ -125,6 +125,9 @@ struct Frame {
   std::vector<uint8_t> payload;
 };
 
+// Whether a frame's payload uses the broadcast keys, which only broadcasts do.
+bool BroadcastPayload(std::span<const uint8_t> payload);
+
 std::optional<std::vector<uint8_t>> EncodeFrame(
     const Frame& frame,
     const std::optional<CrossPlatform>& cross_platform = std::nullopt);

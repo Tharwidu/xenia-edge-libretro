@@ -97,6 +97,11 @@ Mac Machine(const Address& address, bool cross_platform) {
   return mac;
 }
 
+bool BroadcastPayload(std::span<const uint8_t> payload) {
+  return payload.size() >= 4 && payload[0] && !payload[1] && !payload[2] &&
+         !payload[3];
+}
+
 std::optional<std::vector<uint8_t>> EncodeFrame(
     const Frame& frame, const std::optional<CrossPlatform>& cross_platform) {
   if (!Unicast(frame.source) ||

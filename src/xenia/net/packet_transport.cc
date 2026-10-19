@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -23,6 +24,11 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+
+#if !XE_PLATFORM_WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#endif
 
 namespace xe::net::secure {
 namespace {
@@ -123,6 +129,10 @@ class UdpSocket {
 
   // Whether Wake() was called since the last call.
   bool TakeWake() { return woken_.exchange(false); }
+
+  udp::socket::native_handle_type native_handle() {
+    return socket_.native_handle();
+  }
 
  private:
   asio::io_context io_;
@@ -430,6 +440,158 @@ class UdpTunnelTransport final : public PacketTransport {
   std::atomic<bool> healthy_{true};
 };
 
+class HostTransport final : public PacketTransport {
+ public:
+  explicit HostTransport(const HostInterface& host) : host_(host) {}
+
+  bool Open(uint16_t port, std::string& error) {
+    socket_ = OpenSocket(port, error);
+    port_ = port;
+    return socket_ != nullptr;
+  }
+
+  Mac identity() const override { return host_.mac; }
+  uint32_t mtu() const override { return kMtu; }
+  bool healthy() const override { return healthy_; }
+
+  int Send(std::span<const uint8_t> frame) override {
+    // EncodeFrame puts the IPv4 header right after the Ethernet one and the
+    // UDP header after that.
+    constexpr size_t kPayloadOffset = kEthernetHeaderSize + 28;
+    if (frame.size() < kPayloadOffset) {
+      return -1;
+    }
+    const auto ip = frame.subspan(kEthernetHeaderSize + 16, 4);
+    const uint32_t destination = uint32_t(ip[0]) << 24 | uint32_t(ip[1]) << 16 |
+                                 uint32_t(ip[2]) << 8 | ip[3];
+    auto [socket, port] = Current();
+    if (auto ec = socket->SendTo(frame.subspan(kPayloadOffset),
+                                 ToAsio({destination, port}));
+        ec && !Transient(ec)) {
+      return -1;
+    }
+    return static_cast<int>(frame.size());
+  }
+
+  bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) override {
+    auto [socket, port] = Current();
+    const uint64_t deadline = Now() + timeout_ms;
+    while (healthy_) {
+      if (socket->TakeWake()) {
+        return false;
+      }
+      const uint64_t now = Now();
+      if (now >= deadline) {
+        return false;
+      }
+      std::span<const uint8_t> data;
+      udp::endpoint sender;
+      auto ec = socket->ReceiveFor(data, sender, uint32_t(deadline - now));
+      if (!ec || Transient(*ec)) {
+        continue;
+      }
+      if (*ec) {
+        XELOGE("System Link: receive on UDP port {} failed: {}", port,
+               ec->message());
+        healthy_ = false;
+        break;
+      }
+      // Peers only send from the System Link port.
+      if (sender.port() != port) {
+        continue;
+      }
+      // A datagram doesn't tell where it was sent but only broadcasts use
+      // the broadcast keys.
+      Frame wrapped;
+      wrapped.source = IpMachine(sender.address().to_v4().to_uint());
+      wrapped.broadcast = BroadcastPayload(data);
+      wrapped.destination = wrapped.broadcast
+                                ? Mac{255, 255, 255, 255, 255, 255}
+                                : IpMachine(host_.address);
+      wrapped.payload.assign(data.begin(), data.end());
+      auto encoded = EncodeFrame(wrapped, CrossPlatform{.port = port});
+      if (!encoded) {
+        continue;
+      }
+      frame = std::move(*encoded);
+      return true;
+    }
+    return false;
+  }
+
+  void Wake() override { Current().first->Wake(); }
+
+  bool SetPort(uint16_t port) override {
+    std::string error;
+    auto socket = OpenSocket(port, error);
+    if (!socket) {
+      XELOGE("System Link: {}", error);
+      return false;
+    }
+    std::shared_ptr<UdpSocket> previous;
+    {
+      std::lock_guard lock(mutex_);
+      previous = std::exchange(socket_, socket);
+      port_ = port;
+    }
+    // A wake no receive has seen yet still ends the next one.
+    const bool woken = previous->TakeWake();
+    previous->Wake();
+    if (woken) {
+      socket->Wake();
+    }
+    return true;
+  }
+
+ private:
+  std::pair<std::shared_ptr<UdpSocket>, uint16_t> Current() const {
+    std::lock_guard lock(mutex_);
+    return {socket_, port_};
+  }
+
+  std::shared_ptr<UdpSocket> OpenSocket(uint16_t port,
+                                        std::string& error) const {
+    auto socket = std::make_shared<UdpSocket>();
+#if XE_PLATFORM_WIN32
+    // Windows sends limited broadcasts out of the interface a socket is bound
+    // to and still hands it the broadcasts that arrive there.
+    const uint32_t address = host_.address;
+#else
+    // Only sockets bound to any address get broadcasts.
+    const uint32_t address = 0;
+#endif
+    if (!socket->Open(address, port, false, error)) {
+      return nullptr;
+    }
+#if XE_PLATFORM_MAC
+    const int index = int(host_.index);
+    if (setsockopt(socket->native_handle(), IPPROTO_IP, IP_BOUND_IF, &index,
+                   sizeof(index))) {
+      error = fmt::format("UDP port {}: cannot keep to interface {}", port,
+                          host_.index);
+      return nullptr;
+    }
+#elif XE_PLATFORM_LINUX
+    // Limited broadcasts follow the default route unless told otherwise. The
+    // index goes in network byte order.
+    const uint32_t index = htonl(host_.index);
+    if (setsockopt(socket->native_handle(), IPPROTO_IP, IP_UNICAST_IF, &index,
+                   sizeof(index))) {
+      error = fmt::format("UDP port {}: cannot keep to interface {}", port,
+                          host_.index);
+      return nullptr;
+    }
+#endif
+    return socket;
+  }
+
+  HostInterface host_;
+  mutable std::mutex mutex_;
+  std::shared_ptr<UdpSocket> socket_;
+  uint16_t port_ = 0;
+  std::atomic<bool> healthy_{true};
+};
+
 }  // namespace
 
 std::unique_ptr<PacketTransport> OpenKaiTransport(const Mac& mac,
@@ -447,6 +609,16 @@ std::unique_ptr<PacketTransport> OpenUdpTunnelTransport(
     std::string& error) {
   auto transport =
       std::make_unique<UdpTunnelTransport>(mac, std::move(destinations));
+  if (!transport->Open(port, error)) {
+    return nullptr;
+  }
+  return transport;
+}
+
+std::unique_ptr<PacketTransport> OpenHostTransport(const HostInterface& host,
+                                                   uint16_t port,
+                                                   std::string& error) {
+  auto transport = std::make_unique<HostTransport>(host);
   if (!transport->Open(port, error)) {
     return nullptr;
   }

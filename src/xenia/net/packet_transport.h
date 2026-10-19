@@ -35,6 +35,8 @@ class PacketTransport {
   // Ends the Receive waiting on another thread, or the next one if none is.
   // Thread safe.
   virtual void Wake() = 0;
+  // Moves a transport on the host network to another UDP port.
+  virtual bool SetPort(uint16_t port) { return false; }
 };
 
 // Host byte order.
@@ -57,6 +59,13 @@ std::unique_ptr<PacketTransport> OpenKaiTransport(const Mac& mac,
 std::unique_ptr<PacketTransport> OpenUdpTunnelTransport(
     const Mac& mac, uint16_t port, std::vector<UdpEndpoint> destinations,
     std::string& error);
+
+// Sends the datagram of each cross-platform frame on the host network from
+// |host|'s address, on UDP |port| both ways, and receives the datagrams that
+// arrive there as frames.
+std::unique_ptr<PacketTransport> OpenHostTransport(const HostInterface& host,
+                                                   uint16_t port,
+                                                   std::string& error);
 
 }  // namespace xe::net::secure
 
