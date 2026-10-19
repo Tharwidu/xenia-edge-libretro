@@ -402,12 +402,13 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // Allow port reuse so that in-process relaunches can rebind ports
-  // immediately without waiting for TIME_WAIT to expire.  Duplicate active
-  // binds are caught by the object-table check in Bind() instead.
-  int reuse = 1;
-  setsockopt(static_cast<int>(native_handle()), SOL_SOCKET, SO_REUSEADDR,
-             reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  // Lets a relaunched title listen on a port its closed connections still
+  // hold in TIME_WAIT.
+  if (type == Type::X_SOCK_STREAM) {
+    int reuse = 1;
+    setsockopt(static_cast<int>(native_handle()), SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -523,8 +524,8 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
   }
 
   // SO_EXCLUSIVEADDRUSE. Bind already refuses a port another socket holds.
-  // Windows refuses the option next to the SO_REUSEADDR kept for relaunches
-  // and other hosts have no such option.
+  // Windows refuses the option next to the SO_REUSEADDR of stream sockets and
+  // other hosts have no such option.
   if (level == 0xFFFF && optname == ~0x0004u) {
     return X_STATUS_SUCCESS;
   }
@@ -838,7 +839,7 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
   uint16_t port = name->sin_port;
 
   // Reject duplicate active binds (Xbox 360 behaviour).  SO_REUSEADDR is set
-  // on the OS socket for TIME_WAIT reclaiming, but games expect a second bind
+  // on stream sockets for TIME_WAIT reclaiming but games expect a second bind
   // to the same port to fail with WSAEADDRINUSE.  Query the kernel's live
   // object table so the check is naturally correct across in-process relaunches
   // (Shutdown destroys the old object table).
