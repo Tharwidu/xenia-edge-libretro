@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "xenia/net/host_interfaces.h"
 #include "xenia/net/xnet_secure.h"
 
 namespace xe::net::secure {

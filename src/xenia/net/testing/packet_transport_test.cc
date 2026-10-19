@@ -21,8 +21,8 @@
 
 #include <asio.hpp>
 
+#include "xenia/net/host_interfaces.h"
 #include "xenia/net/packet_transport.h"
-#include "xenia/net/subnet_broadcast.h"
 #include "xenia/net/system_link.h"
 
 #include "third_party/catch/include/catch.hpp"
@@ -234,6 +234,24 @@ TEST_CASE("Transports stop waiting for a frame when woken",
     }
     CHECK(transport->healthy());
   }
+}
+
+TEST_CASE("Host interfaces skip loopback", "[net][transport]") {
+  for (const auto& host : HostInterfaces()) {
+    CHECK(host.address >> 24 != 127);
+  }
+}
+
+TEST_CASE("Host interfaces are found by name", "[net][transport]") {
+  const auto names = HostInterfaceNames();
+  for (const auto& host : HostInterfaces()) {
+    CHECK_FALSE(host.name.empty());
+    CHECK(std::ranges::count(names, host.name) == 1);
+    const auto found = FindHostInterface(host.name);
+    REQUIRE(found);
+    CHECK(found->name == host.name);
+  }
+  CHECK_FALSE(FindHostInterface("no such interface"));
 }
 
 TEST_CASE("Subnet broadcasts skip loopback", "[net][transport]") {
