@@ -336,6 +336,10 @@ XSocket::XSocket(KernelState* kernel_state,
 
 XSocket::~XSocket() {
   // Guest memory may be going away with a socket the title never closed.
+  Abandon();
+}
+
+void XSocket::Abandon() {
   if (overlapped_receives_) {
     overlapped_receives_->Close(false);
   }

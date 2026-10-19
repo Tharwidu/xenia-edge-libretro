@@ -29,6 +29,7 @@
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xobject.h"
+#include "xenia/kernel/xsocket.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/ui/imgui_host_notification.h"
@@ -116,6 +117,12 @@ KernelState::~KernelState() {
     }
   }
   idle_io_events_.clear();
+
+  // A reclaimed fiber or a pending wait can keep a socket past the table reset
+  // so its host socket closes here.
+  for (auto& socket : object_table_.GetObjectsByType<XSocket>()) {
+    socket->Abandon();
+  }
 
   // Delete all objects.
   object_table_.Reset();

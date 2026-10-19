@@ -141,6 +141,9 @@ class XSocket : public XObject {
 
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
+  // Closes without completing pending overlapped receives, whose memory may be
+  // gone.
+  void Abandon();
 
   X_STATUS GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
                      uint32_t* optlen);
