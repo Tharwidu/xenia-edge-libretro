@@ -206,6 +206,12 @@ class SystemLink {
   // No |done| of the lookup runs after this returns.
   void CancelQos(uint32_t tag);
 
+  // Moves cross-platform frames to UDP |port|, 3074 for 0. Other System Links
+  // only remember it.
+  uint32_t SetSystemLinkPort(uint16_t port);
+  uint16_t system_link_port() const;
+  // The port SetSystemLinkPort moves to, none for a reserved one.
+  static std::optional<uint16_t> ResolveSystemLinkPort(uint16_t port);
   bool cross_platform() const;
 
   // Port 0 picks a free one.

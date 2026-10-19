@@ -105,6 +105,17 @@ class TestTransport : public PacketTransport {
     return sent_;
   }
 
+  bool SetPort(uint16_t port) override {
+    std::lock_guard lock(wire_->mutex);
+    ports_.push_back(port);
+    return true;
+  }
+  // Every port SetPort moved to.
+  std::vector<uint16_t> Ports() const {
+    std::lock_guard lock(wire_->mutex);
+    return ports_;
+  }
+
   // Delivers |frame| to this side as if it came over the wire.
   void Inject(std::vector<uint8_t> frame) {
     {
@@ -147,6 +158,7 @@ class TestTransport : public PacketTransport {
   bool woken_ = false;
   bool hold_ = false;
   std::vector<std::vector<uint8_t>> sent_;
+  std::vector<uint16_t> ports_;
 };
 
 struct Pair {
@@ -1635,6 +1647,58 @@ TEST_CASE("Cross-platform System Link keeps to its key type",
   Pair normal;
   id[0] = 0x41;
   CHECK(normal.a->RegisterKey(id, normal.key) == kWsaInvalid);
+}
+
+TEST_CASE("Cross-platform System Link moves to the port the title sets",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  CHECK(pair.a->system_link_port() == kSystemLinkPort);
+  CHECK(pair.a->SetSystemLinkPort(1257) == kWsaAddressInUse);
+  CHECK(pair.a->system_link_port() == kSystemLinkPort);
+  REQUIRE(pair.a->SetSystemLinkPort(14000) == 0);
+  CHECK(pair.a->system_link_port() == 14000);
+
+  auto rx = Bind(*pair.a, 1000, false);
+  REQUIRE(rx);
+  const auto search = Hex(kConsoleSearch);
+  pair.transports[0]->Inject(search);
+  pair.transports[0]->Inject(
+      Readdressed(search, kConsoleAddress, kBroadcastAddress, 14000, 14000));
+  REQUIRE(Ready(*rx));
+  std::array<uint8_t, 64> buffer{};
+  Endpoint source;
+  uint32_t error = 0;
+  CHECK(rx->Receive(buffer, false, source, 0, error) ==
+        static_cast<int>(Hex(kConsoleSearchData).size()));
+  CHECK(rx->Receive(buffer, false, source, 0, error) == -1);
+
+  const std::vector<uint8_t> data{1, 2, 3};
+  REQUIRE(rx->Send({kBroadcastAddress, 1000}, data, error) == 3);
+  REQUIRE(WaitFor([&] { return !pair.transports[0]->Sent().empty(); }));
+  CHECK(AddressesOf(pair.transports[0]->Sent().back()) ==
+        FrameAddresses{kHostAddress, kBroadcastAddress, 14000, 14000});
+  REQUIRE(pair.a->SetSystemLinkPort(0) == 0);
+  CHECK(pair.a->system_link_port() == kSystemLinkPort);
+}
+
+TEST_CASE("System Link only remembers the port for other titles",
+          "[net][system_link][cross_platform]") {
+  Pair pair;
+  REQUIRE(pair.a->SetSystemLinkPort(14000) == 0);
+  CHECK(pair.a->system_link_port() == 14000);
+  CHECK(pair.transports[0]->Ports().empty());
+  auto tx = Bind(*pair.a, 1000, false);
+  auto rx = Bind(*pair.b, 1000, false);
+  REQUIRE(tx);
+  REQUIRE(rx);
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({kBroadcastAddress, 1000}, data, error) == 3);
+  REQUIRE(Ready(*rx));
+  const auto sent = pair.transports[0]->Sent();
+  REQUIRE(!sent.empty());
+  CHECK(AddressesOf(sent.back()) ==
+        FrameAddresses{1, kBroadcastAddress, kSystemLinkPort, kSystemLinkPort});
 }
 
 }  // namespace xe::net::secure::test

@@ -51,6 +51,8 @@ constexpr size_t kInboxLimit = 64, kPortLimit = 128;
 constexpr uint64_t kRepeatWindowMs = 500;
 constexpr size_t kRepeatLimit = 512;
 constexpr uint16_t kFirstDynamicPort = 49152;
+// Ports up to this one are reserved.
+constexpr uint16_t kLastReservedPort = 1257;
 constexpr uint32_t kBroadcast = 0xFFFFFFFF;
 // What this console's own XNADDR maps to.
 constexpr uint32_t kLoopback = 0x7F000001;
@@ -296,6 +298,7 @@ struct SystemLink::State {
   // Guards everything below.
   std::mutex mutex;
   std::optional<secure::CrossPlatform> cross_platform;
+  uint16_t system_link_port = secure::kSystemLinkPort;
   std::map<KeyId, Key> keys;
   std::map<uint32_t, Peer> peers;
   uint32_t next_address = 1;
@@ -1706,6 +1709,40 @@ void SystemLink::QosLookup(
   lookup.done = std::move(done);
   state_->qos_lookups[tag] = std::move(lookup);
   state_->transport->Wake();
+}
+
+uint32_t SystemLink::SetSystemLinkPort(uint16_t port) {
+  const auto resolved = ResolveSystemLinkPort(port);
+  if (!resolved) {
+    return kWsaAddressInUse;
+  }
+  std::lock_guard lock(state_->mutex);
+  if (auto& cross_platform = state_->cross_platform) {
+    if (*resolved != cross_platform->port) {
+      if (!state_->transport->SetPort(*resolved)) {
+        return kWsaAddressInUse;
+      }
+      XELOGI("System Link: moved to UDP port {}", *resolved);
+    }
+    cross_platform->port = *resolved;
+  }
+  state_->system_link_port = *resolved;
+  return 0;
+}
+
+uint16_t SystemLink::system_link_port() const {
+  std::lock_guard lock(state_->mutex);
+  return state_->system_link_port;
+}
+
+std::optional<uint16_t> SystemLink::ResolveSystemLinkPort(uint16_t port) {
+  if (!port) {
+    return secure::kSystemLinkPort;
+  }
+  if (port <= kLastReservedPort) {
+    return std::nullopt;
+  }
+  return port;
 }
 
 bool SystemLink::cross_platform() const {
