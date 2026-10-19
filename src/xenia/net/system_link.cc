@@ -70,6 +70,19 @@ constexpr unsigned kLoopbackRounds = 64;
 
 uint64_t Now() { return Clock::QueryHostUptimeMillis(); }
 
+// Stands in for the transport once the System Link is gone.
+class ClosedTransport final : public secure::PacketTransport {
+ public:
+  secure::Mac identity() const override { return {}; }
+  uint32_t mtu() const override { return 0; }
+  bool healthy() const override { return false; }
+  int Send(std::span<const uint8_t> frame) override { return -1; }
+  bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) override {
+    return false;
+  }
+  void Wake() override {}
+};
+
 uint32_t Ina(const Address& address) {
   return uint32_t(address[0]) << 24 | uint32_t(address[1]) << 16 |
          uint32_t(address[2]) << 8 | address[3];
@@ -1480,10 +1493,14 @@ SystemLink::~SystemLink() {
   state_->worker.request_stop();
   state_->transport->Wake();
   state_->worker.join();
+  std::shared_ptr<secure::PacketTransport> transport;
   {
     // Lookups end without writing results once the System Link is gone.
     std::lock_guard lock(state_->mutex);
     state_->qos_lookups.clear();
+    // The transport closes even while ports and streams keep the state alive.
+    transport =
+        std::exchange(state_->transport, std::make_shared<ClosedTransport>());
   }
   Reset();
 }

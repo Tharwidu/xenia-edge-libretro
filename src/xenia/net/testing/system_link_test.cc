@@ -390,6 +390,25 @@ TEST_CASE("System Link ports pick a free port and unblock on close",
   CHECK(Bind(*pair.b, 1000, false));
 }
 
+TEST_CASE("System Link releases its transport while ports outlive it",
+          "[net][system_link]") {
+  Pair pair;
+  auto port = Bind(*pair.a, 1000, false);
+  auto listener = Listen(*pair.a, 1003);
+  auto stream = Stream(*pair.a);
+  std::weak_ptr<TestTransport> transport = pair.transports[0];
+  pair.transports[0].reset();
+  pair.a.reset();
+  CHECK(transport.expired());
+  // They fail as if the LAN went away.
+  const uint8_t byte = 0;
+  uint32_t error = 0;
+  CHECK(port->Send({0xFFFFFFFF, 1000}, std::span(&byte, 1), error) == -1);
+  CHECK(error == kWsaNetworkDown);
+  CHECK(stream->Bind(1004) == kWsaNetworkDown);
+  listener->Close(false);
+}
+
 TEST_CASE("System Link delivers a frame that arrives twice once",
           "[net][system_link]") {
   Pair pair;
