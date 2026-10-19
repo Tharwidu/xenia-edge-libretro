@@ -1196,6 +1196,15 @@ TEST_CASE("System Link streams keep data when their ports are taken again",
   REQUIRE(SendAll(*streams.client, data));
   streams.client->Close(false);
   REQUIRE(WaitFor([&] { return streams.accepted->PendingBytes() == 5; }));
+  // TIME_WAIT starts once the client's FIN arrives after its data.
+  std::atomic<bool> finished{false};
+  streams.accepted->SetReadyCallback([&](uint32_t events) {
+    if (events & kStreamClose) {
+      finished = true;
+    }
+  });
+  REQUIRE(WaitFor([&] { return finished.load(); }));
+  streams.accepted->SetReadyCallback(nullptr);
   auto again = Stream(*streams.pair.a);
   REQUIRE(again->Bind(1500) == 0);
   REQUIRE(again->Connect({streams.host, 1003}, kWait) == 0);
