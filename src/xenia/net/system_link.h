@@ -206,6 +206,8 @@ class SystemLink {
   // No |done| of the lookup runs after this returns.
   void CancelQos(uint32_t tag);
 
+  bool cross_platform() const;
+
   // Port 0 picks a free one.
   std::unique_ptr<SystemLinkPort> Bind(uint16_t port, bool vdp,
                                        uint32_t& error);

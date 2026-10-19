@@ -24,12 +24,6 @@ namespace {
 // limit so a window's worth of them leaves room for everything else.
 constexpr size_t kOutboundLimit = 512, kTcpOutboundLimit = 384;
 
-Mac Machine(const Address& address) {
-  Mac mac;
-  std::copy_n(address.begin() + 10, mac.size(), mac.begin());
-  return mac;
-}
-
 bool SameRequest(const Exchange& a, const Exchange& b) {
   return a.id == b.id && a.initiator_spi == b.initiator_spi &&
          a.initiator_challenge == b.initiator_challenge &&
@@ -69,7 +63,7 @@ struct Associations::State {
 
 Associations::Associations(AssociationConfig config)
     : config_(std::move(config)) {
-  local_ = Machine(config_.identity);
+  local_ = MachineOf(config_.identity);
   config_.peer_limit = std::clamp<size_t>(config_.peer_limit, 1, 32);
   config_.retry_ms = std::max<uint64_t>(config_.retry_ms, 100);
   config_.idle_ms = std::max<uint64_t>(config_.idle_ms, 1000);
@@ -78,6 +72,14 @@ Associations::Associations(AssociationConfig config)
 }
 
 Associations::~Associations() = default;
+
+Mac Associations::MachineOf(const Address& address) const {
+  return Machine(address, config_.cross_platform.has_value());
+}
+
+bool Associations::SystemLinkKey(const KeyId& id) const {
+  return SystemLinkKeyId(id, config_.cross_platform.has_value());
+}
 
 uint32_t Associations::NewSpi() {
   for (unsigned attempt = 0; attempt < 32; ++attempt) {
@@ -121,7 +123,7 @@ bool Associations::ExchangePacket(State& state, uint64_t now) {
   Random(state.exchange.address_iv);
   auto payload = EncodeExchange(state.registration, state.exchange);
   if (!payload ||
-      !Emit(Machine(state.key.first), {payload->begin(), payload->end()})) {
+      !Emit(MachineOf(state.key.first), {payload->begin(), payload->end()})) {
     return false;
   }
   state.attempted = now;
@@ -135,9 +137,10 @@ bool Associations::Connect(const Address& peer, const KeyId& id, uint64_t now) {
   if (states_.contains({peer, id})) {
     return true;
   }
-  if (peer == config_.identity || Machine(peer) == local_ || (id[0] & 0xE0) ||
-      states_.size() >= config_.peer_limit || events_.size() >= 96 ||
-      !config_.credential) {
+  if (peer == config_.identity || MachineOf(peer) == local_ ||
+      !SystemLinkKey(id) || states_.size() >= config_.peer_limit ||
+      events_.size() >= 96 || !config_.credential ||
+      (config_.cross_platform && !SubnetPeer(peer, *config_.cross_platform))) {
     return false;
   }
   auto credential = config_.credential(id);
@@ -180,7 +183,7 @@ bool Associations::Protected(State& state, const Packet& packet, uint64_t now) {
   const uint32_t sequence =
       !state.have_sent && config_.sequence_zero ? 0 : state.sequence + 1;
   if (!Encode(state.transmit, state.remote_spi, sequence, packet, payload) ||
-      !Emit(Machine(state.key.first), std::move(payload))) {
+      !Emit(MachineOf(state.key.first), std::move(payload))) {
     return false;
   }
   state.sequence = sequence;
@@ -242,7 +245,7 @@ void Associations::Established(State& state, uint64_t now) {
   events_.push_back({AssociationEvent::Type::Connected,
                      state.key.first,
                      state.key.second,
-                     Machine(state.key.first),
+                     MachineOf(state.key.first),
                      {}});
   Packet keepalive;
   keepalive.kind = Kind::Control;
@@ -267,7 +270,7 @@ void Associations::Retired(PeerKey key) {
          found->second->attempts);
   states_.erase(found);
   // Drop this generation's queued output and events so a rejoin starts clean.
-  auto mac = Machine(key.first);
+  auto mac = MachineOf(key.first);
   std::erase_if(outbound_, [&](const Frame& frame) {
     if (frame.destination != mac || frame.payload.size() < 20) {
       return false;
@@ -313,7 +316,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
     }
     KeyId id;
     std::copy_n(wire.begin() + 12, id.size(), id.begin());
-    if (id[0] & 0xE0) {
+    if (!SystemLinkKey(id)) {
       return;
     }
     auto credential = config_.credential(id);
@@ -337,7 +340,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
       }
       auto& state = *found->second;
       if (!state.initiator || !ResponseMatches(state.request, *exchange) ||
-          frame.source != Machine(key.first) ||
+          frame.source != MachineOf(key.first) ||
           (state.have_freshness &&
            !FreshnessNewer(exchange->freshness, state.remote_freshness,
                            true))) {
@@ -345,7 +348,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
             "XNet exchange rejected: initiator={}, request matches={}, "
             "source matches={}",
             state.initiator, ResponseMatches(state.request, *exchange),
-            frame.source == Machine(key.first));
+            frame.source == MachineOf(key.first));
         return;
       }
       // A retried response may confirm an established association but never
@@ -385,7 +388,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
     }
     if (exchange->responder_address != config_.identity ||
         exchange->initiator_address == config_.identity ||
-        frame.source != Machine(exchange->initiator_address)) {
+        frame.source != MachineOf(exchange->initiator_address)) {
       return;
     }
     PeerKey key{exchange->initiator_address, id};
@@ -403,9 +406,10 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
         ExchangePacket(state, now);
         return;
       }
-      // On a simultaneous connect the smaller MAC stays the initiator.
+      // On a simultaneous connect the smaller XNADDR MAC stays the initiator.
       if (!(state.initiator && state.status == AssociationStatus::Pending &&
-            local_ > frame.source)) {
+            Machine(config_.identity, false) >
+                Machine(exchange->initiator_address, false))) {
         return;
       }
     }
@@ -451,7 +455,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
   auto found =
       std::find_if(states_.begin(), states_.end(), [&](const auto& item) {
         return item.second->local_spi == Spi(wire) &&
-               Machine(item.first.first) == frame.source;
+               MachineOf(item.first.first) == frame.source;
       });
   if (found == states_.end()) {
     XELOGD("XNet protected packet rejected: association unavailable");

@@ -99,10 +99,10 @@ std::string MacText(const secure::Mac& mac) {
                      mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// System Link keys keep the top three bits clear. Online peer keys share the
-// registry but never get an association.
-bool ValidKeyId(const KeyId& id) {
-  return !(id[0] & 0xE0) || (id[0] & 0xF0) == 0x80;
+// System Link keys carry their type in the top three bits. Online peer keys
+// share the registry but never get an association.
+bool ValidKeyId(const KeyId& id, bool cross_platform) {
+  return secure::SystemLinkKeyId(id, cross_platform) || (id[0] & 0xF0) == 0x80;
 }
 
 struct Datagram {
@@ -295,6 +295,7 @@ struct SystemLink::State {
   const Key broadcast_auth;
   // Guards everything below.
   std::mutex mutex;
+  std::optional<secure::CrossPlatform> cross_platform;
   std::map<KeyId, Key> keys;
   std::map<uint32_t, Peer> peers;
   uint32_t next_address = 1;
@@ -322,6 +323,7 @@ struct SystemLink::State {
       : transport(std::move(io)),
         identity(config.identity),
         broadcast_auth(config.broadcast.authentication),
+        cross_platform(config.cross_platform),
         associations(WithCredential(std::move(config), keys)) {
     worker = std::jthread([this](std::stop_token stop) { Run(stop); });
   }
@@ -345,8 +347,10 @@ struct SystemLink::State {
       const bool received =
           transport->Receive(wire, 25) && !Repeat(wire, Now());
       std::vector<secure::Frame> outbound;
+      std::optional<secure::CrossPlatform> addressing;
       {
         std::lock_guard lock(mutex);
+        addressing = cross_platform;
         if (!transport->healthy()) {
           XELOGE("System Link packet transport lost");
           associations.Reset();
@@ -357,7 +361,7 @@ struct SystemLink::State {
           return;
         }
         if (received) {
-          if (auto frame = secure::DecodeFrame(wire)) {
+          if (auto frame = secure::DecodeFrame(wire, addressing)) {
             if (!ReceiveQos(*frame)) {
               associations.Receive(*frame, Now());
             }
@@ -373,7 +377,7 @@ struct SystemLink::State {
         qos_outbound.clear();
       }
       for (const auto& frame : outbound) {
-        if (auto encoded = secure::EncodeFrame(frame)) {
+        if (auto encoded = secure::EncodeFrame(frame, addressing)) {
           if (transport->Send(*encoded) != static_cast<int>(encoded->size())) {
             XELOGE("System Link packet transmission failed");
           }
@@ -406,6 +410,10 @@ struct SystemLink::State {
   }
 
   // The rest expects mutex held.
+
+  secure::Mac Machine(const Address& address) const {
+    return secure::Machine(address, cross_platform.has_value());
+  }
 
   // QoS records travel outside any association.
   bool ReceiveQos(const secure::Frame& frame) {
@@ -491,7 +499,7 @@ struct SystemLink::State {
                const secure::QosReply& reply) {
     if (auto payload = secure::EncodeQosReply(registration, reply)) {
       qos_outbound.push_back(
-          {transport->identity(), destination, false, std::move(*payload)});
+          {Machine(identity), destination, false, std::move(*payload)});
     }
   }
 
@@ -506,8 +514,8 @@ struct SystemLink::State {
                                  [&](const QosProbing& entry) {
                                    return entry.target == header.target;
                                  });
-      // Hosts answer from their own MAC.
-      if (target == probing.end() || Enet(target->address) != frame.source) {
+      // Hosts answer from their own machine.
+      if (target == probing.end() || Machine(target->address) != frame.source) {
         return;
       }
       auto reply = secure::DecodeQosReply(target->keys, frame.payload);
@@ -556,7 +564,7 @@ struct SystemLink::State {
         probe.flags = secure::kQosProbeDataRequest;
         probe.id = target->id;
         probe.address = target->address;
-        qos_outbound.push_back({transport->identity(), Enet(target->address),
+        qos_outbound.push_back({Machine(identity), Machine(target->address),
                                 false,
                                 secure::EncodeQosProbe(target->keys, probe)});
         target->next_ms = now + kQosRetryMs;
@@ -1484,6 +1492,9 @@ SystemLink::SystemLink(uint32_t address,
   // Offline, but SGADDR still names the console platform.
   identity_[kPlatformOffset] = kXbox360Platform;
   association.identity = identity_;
+  if (association.cross_platform) {
+    association.cross_platform->address = address;
+  }
   state_ =
       std::make_shared<State>(std::move(transport), std::move(association));
 }
@@ -1522,7 +1533,7 @@ void SystemLink::CreateKey(KeyId& id, Key& key) {
 
 uint32_t SystemLink::RegisterKey(const KeyId& id, const Key& key) {
   std::lock_guard lock(state_->mutex);
-  if (!ValidKeyId(id)) {
+  if (!ValidKeyId(id, state_->cross_platform.has_value())) {
     return kWsaInvalid;
   }
   if (state_->keys.contains(id)) {
@@ -1676,8 +1687,11 @@ void SystemLink::QosLookup(
     }
     // Only System Link keys cross the LAN.
     // Replies name targets in 16 bits.
-    if ((target.id[0] & 0xE0) || host == secure::Mac{} || i > 0xFFFF ||
-        !state_->transport->healthy()) {
+    const auto& cross_platform = state_->cross_platform;
+    if (!secure::SystemLinkKeyId(target.id, cross_platform.has_value()) ||
+        (cross_platform &&
+         !secure::SubnetPeer(target.address, *cross_platform)) ||
+        host == secure::Mac{} || i > 0xFFFF || !state_->transport->healthy()) {
       done(i, {});
       continue;
     }
@@ -1692,6 +1706,11 @@ void SystemLink::QosLookup(
   lookup.done = std::move(done);
   state_->qos_lookups[tag] = std::move(lookup);
   state_->transport->Wake();
+}
+
+bool SystemLink::cross_platform() const {
+  std::lock_guard lock(state_->mutex);
+  return state_->cross_platform.has_value();
 }
 
 void SystemLink::CancelQos(uint32_t tag) {

@@ -147,8 +147,9 @@ constexpr size_t kQosTagSize = 12;
 constexpr uint8_t kQosRejectedFlags = 0x20;
 
 bool ValidExchange(const Exchange& exchange) {
-  if ((exchange.id[0] & 0xE0) || !ValidSpi(exchange.initiator_spi) ||
-      !(exchange.hops & 0xFF)) {
+  if ((!SystemLinkKeyId(exchange.id, false) &&
+       !SystemLinkKeyId(exchange.id, true)) ||
+      !ValidSpi(exchange.initiator_spi) || !(exchange.hops & 0xFF)) {
     return false;
   }
   return exchange.response ? ValidSpi(exchange.responder_spi)

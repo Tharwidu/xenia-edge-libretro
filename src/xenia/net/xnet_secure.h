@@ -93,14 +93,46 @@ Metadata MakeMetadata(uint32_t executable_id, uint32_t version, uint16_t major,
                       uint16_t minor, uint16_t build, uint8_t revision);
 bool FreshnessNewer(uint64_t incoming, uint64_t previous, bool response);
 
+inline constexpr uint16_t kSystemLinkPort = 3074;
+
+// Titles with cross-platform System Link talk over the real IPs of one subnet
+// on their System Link port. Host byte order.
+struct CrossPlatform {
+  uint32_t address = 0, mask = 0;
+  uint16_t port = kSystemLinkPort;
+};
+
+// System Link key ids carry this type in their top three bits.
+constexpr uint8_t SystemLinkKeyType(bool cross_platform) {
+  return cross_platform ? 0x40 : 0x00;
+}
+constexpr bool SystemLinkKeyId(const KeyId& id, bool cross_platform) {
+  return (id[0] & 0xE0) == SystemLinkKeyType(cross_platform);
+}
+
+// Frames name a machine by its MAC, cross-platform ones by IpMachine() of its
+// IP.
+Mac IpMachine(uint32_t address);
+// The machine an XNADDR names.
+Mac Machine(const Address& address, bool cross_platform);
+// Whether the IP of |address| belongs to a peer of the subnet, which isn't
+// this machine, the subnet's broadcast address or a loopback address.
+bool SubnetPeer(const Address& address, const CrossPlatform& cross_platform);
+
 struct Frame {
   Mac source{}, destination{};
   bool broadcast = false;
   std::vector<uint8_t> payload;
 };
 
-std::optional<std::vector<uint8_t>> EncodeFrame(const Frame& frame);
-std::optional<Frame> DecodeFrame(std::span<const uint8_t> wire);
+std::optional<std::vector<uint8_t>> EncodeFrame(
+    const Frame& frame,
+    const std::optional<CrossPlatform>& cross_platform = std::nullopt);
+// A cross-platform frame must come from another machine of the subnet on the
+// System Link port and go to this machine or 255.255.255.255.
+std::optional<Frame> DecodeFrame(
+    std::span<const uint8_t> wire,
+    const std::optional<CrossPlatform>& cross_platform = std::nullopt);
 
 enum class Kind { Control, Tcp, Udp, Vdp, Discovery };
 

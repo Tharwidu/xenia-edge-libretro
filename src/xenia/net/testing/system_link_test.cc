@@ -18,6 +18,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,7 @@
 #include "xenia/net/xnet_tcp.h"
 
 #include "third_party/catch/include/catch.hpp"
+#include "third_party/mbedtls/include/mbedtls/sha1.h"
 
 namespace xe::net::secure::test {
 namespace {
@@ -91,8 +94,24 @@ class TestTransport : public PacketTransport {
     for (int i = duplicate_ ? 2 : 1; i; --i) {
       wire_->frames[1 - side_].emplace_back(bytes.begin(), bytes.end());
     }
+    sent_.emplace_back(bytes.begin(), bytes.end());
     wire_->changed.notify_all();
     return static_cast<int>(bytes.size());
+  }
+
+  // Every frame this side sent.
+  std::vector<std::vector<uint8_t>> Sent() const {
+    std::lock_guard lock(wire_->mutex);
+    return sent_;
+  }
+
+  // Delivers |frame| to this side as if it came over the wire.
+  void Inject(std::vector<uint8_t> frame) {
+    {
+      std::lock_guard lock(wire_->mutex);
+      wire_->frames[side_].push_back(std::move(frame));
+    }
+    wire_->changed.notify_all();
   }
 
   bool Receive(std::vector<uint8_t>& bytes, uint32_t timeout_ms) override {
@@ -127,6 +146,7 @@ class TestTransport : public PacketTransport {
   // Guarded by the wire's mutex.
   bool woken_ = false;
   bool hold_ = false;
+  std::vector<std::vector<uint8_t>> sent_;
 };
 
 struct Pair {
@@ -242,6 +262,121 @@ std::vector<uint8_t> Pattern(size_t size, uint8_t seed) {
 
 // XNADDR.abEnet.
 constexpr size_t kEnetOffset = 10;
+
+std::vector<uint8_t> Hex(std::string_view text) {
+  std::vector<uint8_t> bytes;
+  for (size_t i = 0; i + 1 < text.size(); i += 2) {
+    bytes.push_back(
+        uint8_t(std::stoi(std::string(text.substr(i, 2)), nullptr, 16)));
+  }
+  return bytes;
+}
+
+constexpr uint32_t kBroadcastAddress = 0xFFFFFFFF;
+constexpr uint32_t kSubnetMask = 0xFFFFFF00;
+// 10.0.1.12, on the console's subnet.
+constexpr uint32_t kHostAddress = 0x0A00010C;
+// 10.0.1.172.
+constexpr uint32_t kConsoleAddress = 0x0A0001AC;
+
+// The console at kConsoleAddress looking for Lost Planet Colonies games, as
+// captured on its LAN with IpMachine() of its address as the source MAC, and
+// the datagram the title broadcast.
+constexpr std::string_view kConsoleSearch =
+    "ffffffffffff02000a0001ac080045000061ee7300004011806d0a0001acffffffff0c02"
+    "0c02004dc580870000007d88ecfd11e853b9b1c5e19d1c64f96311fb2c27af4f0ff946e3"
+    "ca9a79c8e4444ac5f1a2a009c450de074343030000000097442005446853f13e1831f7e2"
+    "132a1d";
+constexpr std::string_view kConsoleSearchData =
+    "000C41FF00000000FFFFFFFF82B600FFFFFFFFFF82AEF8884C60545329C0D9B500000000";
+// Its next search, with a nonce of its own.
+constexpr std::string_view kConsoleSearchAgain =
+    "ffffffffffff02000a0001ac080045000061ee7600004011806a0a0001acffffffff0c02"
+    "0c02004dad278700000086a20c272fc9ac9895d4b1f3611bc3b7c46b22b54dc83384c722"
+    "7c8b3ffed0570eb0164309d42a82de074343030000000097442005693a4c2d2e53416f64"
+    "bc6e61";
+constexpr std::string_view kConsoleSearchAgainData =
+    "000C41FF00000000FFFFFFFF82B600FFFFFFFFFF82AEF888865DBE9F1AE51EA400000000";
+// The title's LAN key encrypted with key 0x43, as the console computed it.
+constexpr Key kColoniesEncryptedLanKey{0xCF, 0x04, 0x4B, 0xED, 0x8C, 0xC1,
+                                       0xFF, 0x2E, 0x00, 0x70, 0x77, 0xA9,
+                                       0xB7, 0x05, 0xDE, 0xD6};
+
+// A frame as another sender would have sent it. The UDP checksum is optional
+// so it is left out.
+std::vector<uint8_t> Readdressed(std::vector<uint8_t> frame, uint32_t source,
+                                 uint32_t destination,
+                                 uint16_t source_port = kSystemLinkPort,
+                                 uint16_t destination_port = kSystemLinkPort) {
+  auto ip = std::span(frame).subspan(14, 20);
+  for (size_t i = 0; i < 4; ++i) {
+    ip[12 + i] = uint8_t(source >> (24 - 8 * i));
+    ip[16 + i] = uint8_t(destination >> (24 - 8 * i));
+  }
+  ip[10] = ip[11] = 0;
+  uint32_t sum = 0;
+  for (size_t i = 0; i < ip.size(); i += 2) {
+    sum += uint32_t(ip[i]) << 8 | ip[i + 1];
+  }
+  while (sum >> 16) {
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  }
+  ip[10] = uint8_t(~sum >> 8);
+  ip[11] = uint8_t(~sum);
+  auto udp = std::span(frame).subspan(34, 8);
+  udp[0] = uint8_t(source_port >> 8);
+  udp[1] = uint8_t(source_port);
+  udp[2] = uint8_t(destination_port >> 8);
+  udp[3] = uint8_t(destination_port);
+  udp[6] = udp[7] = 0;
+  return frame;
+}
+
+struct FrameAddresses {
+  uint32_t source = 0, destination = 0;
+  uint16_t source_port = 0, destination_port = 0;
+  bool operator==(const FrameAddresses&) const = default;
+};
+
+FrameAddresses AddressesOf(std::span<const uint8_t> frame) {
+  auto word = [&](size_t offset) {
+    return uint16_t(frame[offset] << 8 | frame[offset + 1]);
+  };
+  return {uint32_t(word(26)) << 16 | word(28),
+          uint32_t(word(30)) << 16 | word(32), word(34), word(36)};
+}
+
+// System Links of a title with cross-platform System Link on 10.0.1.0/24.
+struct CrossPlatformPair {
+  std::shared_ptr<Wire> wire = std::make_shared<Wire>();
+  KeyId id{0x41, 3, 5, 7, 9, 11, 13, 15};
+  Key key{2, 4, 6, 8, 10, 12, 14, 16};
+  std::shared_ptr<TestTransport> transports[2];
+  std::unique_ptr<SystemLink> a, b;
+
+  CrossPlatformPair() {
+    a = Make(0);
+    b = Make(1);
+    REQUIRE(a->RegisterKey(id, key) == 0);
+    REQUIRE(b->RegisterKey(id, key) == 0);
+  }
+
+  std::unique_ptr<SystemLink> Make(unsigned side) {
+    auto derived =
+        DeriveBroadcast(kColoniesEncryptedLanKey, [](auto input, auto& digest) {
+          return !mbedtls_sha1(input.data(), input.size(), digest.data());
+        });
+    REQUIRE(derived);
+    auto transport = std::make_shared<TestTransport>(wire, side);
+    transports[side] = transport;
+    AssociationConfig association;
+    association.broadcast = *derived;
+    association.mtu = transport->mtu();
+    association.cross_platform = CrossPlatform{0, kSubnetMask};
+    return std::make_unique<SystemLink>(kHostAddress + side, transport,
+                                        std::move(association));
+  }
+};
 
 struct QosResults {
   std::mutex mutex;
@@ -1298,6 +1433,208 @@ TEST_CASE("System Link streams reset data sent to a closed socket",
   REQUIRE(
       WaitFor([&] { return streams.accepted->Send(buffer, 0, error) < 0; }));
   CHECK(error == kWsaConnectionReset);
+}
+
+TEST_CASE("System Link hears a console's cross-platform search",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  auto rx = Bind(*pair.a, 1000, false);
+  REQUIRE(rx);
+  pair.transports[0]->Inject(Hex(kConsoleSearch));
+  REQUIRE(Ready(*rx));
+  const auto expected = Hex(kConsoleSearchData);
+  std::array<uint8_t, 64> buffer{};
+  Endpoint source;
+  uint32_t error = 0;
+  REQUIRE(rx->Receive(buffer, false, source, 0, error) ==
+          static_cast<int>(expected.size()));
+  CHECK(std::equal(expected.begin(), expected.end(), buffer.begin()));
+  // Broadcasts come from 0.0.0.1.
+  CHECK(source == Endpoint{1, 1000});
+}
+
+TEST_CASE("System Link drops cross-platform frames that aren't for it",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  auto rx = Bind(*pair.a, 1000, false);
+  REQUIRE(rx);
+  const auto search = Hex(kConsoleSearch);
+  pair.transports[0]->Inject(search);
+  for (const auto& frame : {
+           // Another subnet.
+           Readdressed(search, 0x0A0002AC, kBroadcastAddress),
+           // The address of titles without cross-platform System Link.
+           Readdressed(search, 1, kBroadcastAddress),
+           // This console's own address.
+           Readdressed(search, kHostAddress, kBroadcastAddress),
+           // The subnet's broadcast address.
+           Readdressed(search, kConsoleAddress, 0x0A0001FF),
+           // Another machine.
+           Readdressed(search, kConsoleAddress, 0x0A000163),
+           // Another port at either end.
+           Readdressed(search, kConsoleAddress, kBroadcastAddress, 3075),
+           Readdressed(search, kConsoleAddress, kBroadcastAddress,
+                       kSystemLinkPort, 3075),
+       }) {
+    pair.transports[0]->Inject(frame);
+  }
+  // Frames arrive in order so the console's next search comes after them all.
+  pair.transports[0]->Inject(Hex(kConsoleSearchAgain));
+  std::array<uint8_t, 64> buffer{};
+  Endpoint source;
+  uint32_t error = 0;
+  for (const auto data : {kConsoleSearchData, kConsoleSearchAgainData}) {
+    REQUIRE(Ready(*rx));
+    const auto expected = Hex(data);
+    REQUIRE(rx->Receive(buffer, false, source, 0, error) ==
+            static_cast<int>(expected.size()));
+    CHECK(std::equal(expected.begin(), expected.end(), buffer.begin()));
+  }
+  CHECK(rx->Receive(buffer, false, source, 0, error) == -1);
+  CHECK(error == kWsaWouldBlock);
+}
+
+TEST_CASE("Cross-platform frames come only from peers of their subnet",
+          "[net][system_link][cross_platform]") {
+  const auto search = Hex(kConsoleSearch);
+  const auto decodes = [&](uint32_t source, uint32_t destination,
+                           uint32_t own = kHostAddress,
+                           uint32_t mask = kSubnetMask) {
+    return DecodeFrame(Readdressed(search, source, destination),
+                       CrossPlatform{own, mask, kSystemLinkPort})
+        .has_value();
+  };
+  CHECK(decodes(kConsoleAddress, kBroadcastAddress));
+  CHECK(decodes(kConsoleAddress, kHostAddress));
+  // This console's own address, the subnet's broadcast address, another
+  // subnet, the address of titles without cross-platform System Link and
+  // loopback.
+  CHECK_FALSE(decodes(kHostAddress, kBroadcastAddress));
+  CHECK_FALSE(decodes(0x0A0001FF, kBroadcastAddress));
+  CHECK_FALSE(decodes(0x0A0002AC, kBroadcastAddress));
+  CHECK_FALSE(decodes(1, kBroadcastAddress));
+  CHECK_FALSE(decodes(0x7F000002, kBroadcastAddress, 0x7F000001, 0xFF000000));
+  // Unicast to another machine or to the subnet's broadcast address.
+  CHECK_FALSE(decodes(kConsoleAddress, 0x0A000163));
+  CHECK_FALSE(decodes(kConsoleAddress, 0x0A0001FF));
+  // Other titles only take frames from 0.0.0.1.
+  CHECK(DecodeFrame(Readdressed(search, 1, kBroadcastAddress)).has_value());
+  CHECK_FALSE(
+      DecodeFrame(Readdressed(search, kConsoleAddress, kBroadcastAddress))
+          .has_value());
+}
+
+TEST_CASE("System Link ignores cross-platform frames otherwise",
+          "[net][system_link][cross_platform]") {
+  Pair pair;
+  auto rx = Bind(*pair.a, 1000, false);
+  auto tx = Bind(*pair.b, 1000, false);
+  REQUIRE(rx);
+  REQUIRE(tx);
+  pair.transports[0]->Inject(Hex(kConsoleSearch));
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({kBroadcastAddress, 1000}, data, error) == 3);
+  REQUIRE(Ready(*rx));
+  std::array<uint8_t, 64> buffer{};
+  Endpoint source;
+  CHECK(rx->Receive(buffer, false, source, 0, error) == 3);
+  CHECK(rx->Receive(buffer, false, source, 0, error) == -1);
+  CHECK(error == kWsaWouldBlock);
+}
+
+TEST_CASE("Cross-platform System Links talk over their subnet's addresses",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  auto tx = Bind(*pair.a, 1001, false);
+  auto rx = Bind(*pair.b, 1001, false);
+  REQUIRE(tx);
+  REQUIRE(rx);
+  const std::vector<uint8_t> data{0, 1, 2, 3, 4, 5, 6};
+  const int data_size = static_cast<int>(data.size());
+  uint32_t error = 0;
+  REQUIRE(tx->Send({kBroadcastAddress, 1001}, data, error) == data_size);
+  REQUIRE(Ready(*rx));
+  std::array<uint8_t, 32> buffer{};
+  Endpoint source;
+  REQUIRE(rx->Receive(buffer, false, source, 0, error) == data_size);
+  CHECK(source == Endpoint{1, 1001});
+
+  uint32_t address;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, address) == 0);
+  REQUIRE(pair.a->Connect(address) == 0);
+  REQUIRE(tx->Send({address, 1001}, data, error) == data_size);
+  REQUIRE(Ready(*rx));
+  REQUIRE(rx->Receive(buffer, false, source, 0, error) == data_size);
+  CHECK(std::equal(data.begin(), data.end(), buffer.begin()));
+  // The title only ever sees secure addresses.
+  CHECK(source.address >> 24 == 0);
+
+  const auto sent = pair.transports[0]->Sent();
+  REQUIRE(sent.size() >= 2);
+  CHECK(AddressesOf(sent.front()) ==
+        FrameAddresses{kHostAddress, kBroadcastAddress, kSystemLinkPort,
+                       kSystemLinkPort});
+  for (size_t i = 1; i < sent.size(); ++i) {
+    CHECK(AddressesOf(sent[i]) == FrameAddresses{kHostAddress, kHostAddress + 1,
+                                                 kSystemLinkPort,
+                                                 kSystemLinkPort});
+  }
+}
+
+TEST_CASE("Cross-platform System Link only reaches peers of its subnet",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  // Another subnet, the subnet's broadcast address and loopback.
+  std::vector<QosTarget> outside;
+  for (uint32_t ina : {0x08080808u, 0x0A0001FFu, 0x7F000001u}) {
+    QosTarget target{pair.b->identity(), pair.id, pair.key};
+    for (size_t i = 0; i < 4; ++i) {
+      target.address[i] = uint8_t(ina >> (24 - 8 * i));
+    }
+    outside.push_back(target);
+  }
+  for (const auto& target : outside) {
+    uint32_t address;
+    REQUIRE(pair.a->Map(target.address, pair.id, address) == 0);
+    CHECK(pair.a->Connect(address) != 0);
+  }
+  QosResults results;
+  pair.a->QosLookup(1, outside, results.Done());
+  // A target that isn't probed is done before the lookup returns.
+  CHECK(results.Count() == outside.size());
+  pair.a->CancelQos(1);
+  CHECK(pair.transports[0]->Sent().empty());
+}
+
+TEST_CASE("Cross-platform System Link QoS lookups reach a host of the subnet",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  const std::vector<uint8_t> data{9, 8, 7, 6};
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenEnable | kQosListenSetData,
+                            data) == 0);
+  QosResults results;
+  pair.b->QosLookup(1, {{pair.a->identity(), pair.id, pair.key}},
+                    results.Done());
+  REQUIRE(WaitFor([&] { return results.Count() == 1; }));
+  CHECK(results.Get(0).contacted);
+  CHECK(results.Get(0).data == data);
+}
+
+TEST_CASE("Cross-platform System Link keeps to its key type",
+          "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  KeyId id = pair.id;
+  id[0] = 0x01;
+  CHECK(pair.a->RegisterKey(id, pair.key) == kWsaInvalid);
+  id[0] = 0x4F;
+  CHECK(pair.a->RegisterKey(id, pair.key) == 0);
+  // Online keys share the registry.
+  id[0] = 0x81;
+  CHECK(pair.a->RegisterKey(id, pair.key) == 0);
+  Pair normal;
+  id[0] = 0x41;
+  CHECK(normal.a->RegisterKey(id, normal.key) == kWsaInvalid);
 }
 
 }  // namespace xe::net::secure::test

@@ -37,6 +37,8 @@ struct AssociationConfig {
   unsigned retries = 5;
   // Starts sequences at zero and accepts zero from peers.
   bool sequence_zero = false;
+  // Set for titles with cross-platform System Link.
+  std::optional<CrossPlatform> cross_platform;
 };
 
 enum class AssociationStatus { Missing, Pending, Established };
@@ -72,6 +74,8 @@ class Associations {
   struct State;
   using PeerKey = std::pair<Address, KeyId>;
 
+  Mac MachineOf(const Address& address) const;
+  bool SystemLinkKey(const KeyId& id) const;
   uint32_t NewSpi();
   uint64_t NewFreshness();
   bool Emit(Mac destination, std::vector<uint8_t> payload,
