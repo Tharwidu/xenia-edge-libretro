@@ -13,7 +13,9 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
-#include "xenia/kernel/kernel_state.cc"
+#include "xenia/emulator.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/ui/windowed_app_wx.h"
 
 #include "version.h"
