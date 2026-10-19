@@ -104,7 +104,18 @@ std::unique_ptr<net::secure::PacketTransport> OpenTransport(
 
 bool SystemLinkEnabled() { return cvars::systemlink_transport != "off"; }
 
-std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state) {
+bool CrossPlatformTitle(KernelState* kernel_state) {
+  auto module = kernel_state->GetExecutableModule();
+  if (!module) {
+    return false;
+  }
+  uint32_t system_flags = 0;
+  module->GetOptHeader<uint32_t>(XEX_HEADER_SYSTEM_FLAGS, &system_flags);
+  return system_flags & XEX_SYSTEM_CROSS_PLATFORM_SYSTEM_LINK;
+}
+
+std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
+                                                  uint16_t port) {
   if (!SystemLinkEnabled()) {
     return nullptr;
   }
@@ -157,8 +168,10 @@ std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state) {
       "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
       cvars::systemlink_transport, mac[0], mac[1], mac[2], mac[3], mac[4],
       mac[5]);
-  return std::make_unique<net::SystemLink>(address, std::move(transport),
-                                           std::move(association));
+  auto link = std::make_unique<net::SystemLink>(address, std::move(transport),
+                                                std::move(association));
+  link->SetSystemLinkPort(port);
+  return link;
 }
 
 std::shared_ptr<net::SystemLink> GetSystemLink(KernelState* kernel_state) {

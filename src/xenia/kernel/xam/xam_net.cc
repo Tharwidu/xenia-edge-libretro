@@ -735,25 +735,44 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetInAddrToXnAddr, kNetworking, kImplemented);
 
+dword_result_t NetDll_XNetGetSystemLinkPort_entry(dword_t caller,
+                                                  lpword_t port) {
+  if (!CrossPlatformTitle(kernel_state())) {
+    return net::kWsaAccessDenied;
+  }
+  if (!SystemLinkEnabled()) {
+    return uint32_t(X_WSAError::X_WSANOTINITIALISED);
+  }
+  if (!port) {
+    return uint32_t(X_WSAError::X_WSAEFAULT);
+  }
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  *port = xam->system_link_port();
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetGetSystemLinkPort, kNetworking, kImplemented);
+
 // https://www.google.com/patents/WO2008112448A1?cl=en
-// Reserves a port for use by system link
-// TODO(has207): cross-platform System Link, for titles with the
-// XEX_SYSTEM_CROSS_PLATFORM_SYSTEM_LINK flag. Aliens: Colonial Marines
-// (5345080C) sets port 14000 here. Only those titles may set it and it then
-// replaces UDP 3074 for their System Link traffic. Their System Link key IDs
-// have type 0x40 and only those are accepted. Frames carry the console's own
-// IP in place of 0.0.0.1, unicast goes to the peer's XNADDR IP and peers must
-// share the subnet. Their broadcast keys are SHA-1 of each key's index byte
-// and the LAN key AES-CBC encrypted with hypervisor key 0x43 and a zero IV, in
-// place of HMAC with key 0x19. That key's value is unknown. Until it is,
-// consoles can't authenticate us. GFWL's xlive.dll always uses this format and
-// seems to take each title's already encrypted LAN key from its config. A host
-// socket on this port with the host's own IP could reach consoles on the LAN
-// without Kai or the tunnel. Over Kai, consoles need an Xbox One MAC and a
-// Kai-assigned IP. Xenia-to-xenia already works over the current traffic.
+// Reserves a port for use by system link. Only titles with cross-platform
+// System Link may, while they have no sockets. Before System Link starts it
+// picks the port System Link starts on. Aliens: Colonial Marines uses 14000.
 dword_result_t NetDll_XNetSetSystemLinkPort_entry(dword_t caller,
                                                   dword_t port) {
-  return GetSystemLink(kernel_state()) ? 0 : 1;
+  if (!CrossPlatformTitle(kernel_state())) {
+    return net::kWsaAccessDenied;
+  }
+  if (!SystemLinkEnabled()) {
+    return uint32_t(X_WSAError::X_WSANOTINITIALISED);
+  }
+  const auto resolved = net::SystemLink::ResolveSystemLinkPort(uint16_t(port));
+  if (!resolved) {
+    return net::kWsaAddressInUse;
+  }
+  if (!kernel_state()->object_table()->GetObjectsByType<XSocket>().empty()) {
+    return uint32_t(X_WSAError::X_WSAENOTEMPTY);
+  }
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  return xam->SetSystemLinkPort(*resolved);
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetSetSystemLinkPort, kNetworking, kImplemented);
 

@@ -25,9 +25,14 @@ namespace xam {
 // link.
 bool SystemLinkEnabled();
 
-// Starts System Link for the running title over the configured transport.
-// Null when it is off or cannot start.
-std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state);
+// Whether the running title has cross-platform System Link.
+bool CrossPlatformTitle(KernelState* kernel_state);
+
+// Starts System Link for the running title over the configured transport, on
+// UDP |port| for cross-platform System Link. Null when it is off or cannot
+// start.
+std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
+                                                  uint16_t port);
 
 // The running title's System Link, started on first use. Null when it is off
 // or could not start, then the title gets no System Link at all.

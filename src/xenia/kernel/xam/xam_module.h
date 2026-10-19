@@ -47,6 +47,10 @@ class XamModule : public KernelModule {
 
   // Started on first use, see GetSystemLink.
   std::shared_ptr<net::SystemLink> system_link();
+  // Moves System Link to the resolved UDP |port|, or picks the port it starts
+  // on when it hasn't started yet.
+  uint32_t SetSystemLinkPort(uint16_t port);
+  uint16_t system_link_port();
 
  private:
   uint32_t callback_ = 0;
@@ -55,6 +59,7 @@ class XamModule : public KernelModule {
   std::mutex system_link_mutex_;
   bool system_link_started_ = false;
   std::shared_ptr<net::SystemLink> system_link_;
+  uint16_t system_link_port_ = net::secure::kSystemLinkPort;
 };
 
 }  // namespace xam

@@ -72,9 +72,23 @@ std::shared_ptr<net::SystemLink> XamModule::system_link() {
   std::lock_guard lock(system_link_mutex_);
   if (!system_link_started_) {
     system_link_started_ = true;
-    system_link_ = CreateSystemLink(kernel_state_);
+    system_link_ = CreateSystemLink(kernel_state_, system_link_port_);
   }
   return system_link_;
+}
+
+uint32_t XamModule::SetSystemLinkPort(uint16_t port) {
+  std::lock_guard lock(system_link_mutex_);
+  if (system_link_) {
+    return system_link_->SetSystemLinkPort(port);
+  }
+  system_link_port_ = port;
+  return 0;
+}
+
+uint16_t XamModule::system_link_port() {
+  std::lock_guard lock(system_link_mutex_);
+  return system_link_ ? system_link_->system_link_port() : system_link_port_;
 }
 
 }  // namespace xam
