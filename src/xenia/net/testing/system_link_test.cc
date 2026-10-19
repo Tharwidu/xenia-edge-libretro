@@ -1647,6 +1647,12 @@ TEST_CASE("Cross-platform System Link keeps to its key type",
   Pair normal;
   id[0] = 0x41;
   CHECK(normal.a->RegisterKey(id, normal.key) == kWsaInvalid);
+
+  Key key;
+  SystemLink::CreateKey(id, key, true);
+  CHECK((id[0] & 0xE0) == 0x40);
+  SystemLink::CreateKey(id, key, false);
+  CHECK((id[0] & 0xE0) == 0);
 }
 
 TEST_CASE("Cross-platform System Link moves to the port the title sets",

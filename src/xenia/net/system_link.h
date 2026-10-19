@@ -179,7 +179,7 @@ class SystemLink {
   const secure::Address& identity() const { return identity_; }
   static uint64_t MachineId(const secure::Address& address);
 
-  static void CreateKey(KeyId& id, Key& key);
+  static void CreateKey(KeyId& id, Key& key, bool cross_platform);
   uint32_t RegisterKey(const KeyId& id, const Key& key);
   uint32_t UnregisterKey(const KeyId& id);
   bool GetKey(const KeyId& id, Key& key) const;

@@ -124,7 +124,10 @@ X_RESULT XSession::Create(uint32_t flags, uint32_t user_index,
   // Only a peer network session needs System Link.
   auto link = peer_network ? xam::GetSystemLink(kernel_state_) : nullptr;
   if (flags & SessionFlags::HOST) {
-    net::SystemLink::CreateKey(info->session_id, info->key_exchange_key);
+    net::SystemLink::CreateKey(
+        info->session_id, info->key_exchange_key,
+        link ? link->cross_platform()
+             : xam::CrossPlatformSystemLink(kernel_state_));
     info->host_address = link ? link->identity() : net::secure::Address{};
   } else if (!peer_network) {
     *info = {};

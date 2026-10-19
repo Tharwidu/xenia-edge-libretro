@@ -1749,7 +1749,8 @@ DECLARE_XAM_EXPORT1(NetDll_getpeername, kNetworking, kImplemented);
 
 dword_result_t NetDll_XNetCreateKey_entry(dword_t caller, lpdword_t key_id,
                                           lpdword_t exchange_key) {
-  if (!GetSystemLink(kernel_state())) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
     kernel_memory()->Fill(key_id.guest_address(), 8, 0xBE);
     kernel_memory()->Fill(exchange_key.guest_address(), 16, 0xBE);
     return 0;
@@ -1759,7 +1760,7 @@ dword_result_t NetDll_XNetCreateKey_entry(dword_t caller, lpdword_t key_id,
   }
   net::KeyId id;
   net::Key key;
-  net::SystemLink::CreateKey(id, key);
+  net::SystemLink::CreateKey(id, key, link->cross_platform());
   std::memcpy(key_id, id.data(), id.size());
   std::memcpy(exchange_key, key.data(), key.size());
   return 0;

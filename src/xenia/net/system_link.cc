@@ -1527,10 +1527,10 @@ uint64_t SystemLink::MachineId(const Address& address) {
   return 0xFA00000000000000ull | id;
 }
 
-void SystemLink::CreateKey(KeyId& id, Key& key) {
+void SystemLink::CreateKey(KeyId& id, Key& key, bool cross_platform) {
   Random(id);
   // XNKID_SYSTEM_LINK.
-  id[0] &= 0x0F;
+  id[0] = (id[0] & 0x0F) | secure::SystemLinkKeyType(cross_platform);
   Random(key);
 }
 

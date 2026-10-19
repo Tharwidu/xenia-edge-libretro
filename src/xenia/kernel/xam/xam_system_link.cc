@@ -13,6 +13,7 @@
 #include "xenia/kernel/xam/xam_system_link.h"
 
 #include <algorithm>
+#include <bit>
 #include <optional>
 #include <span>
 #include <string>
@@ -24,15 +25,31 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
+#include "xenia/kernel/xboxkrnl/xecrypt_sha.h"
+#include "xenia/net/host_interfaces.h"
 #include "xenia/net/packet_transport.h"
 
 DEFINE_string(systemlink_transport, "tunnel",
               "How System Link traffic travels. \"tunnel\" sends it straight "
               "to other Xenia instances on this LAN and is the better choice "
               "for Xenia-to-Xenia play. \"kai\" goes through an XLink Kai "
-              "engine, which is required to play with Xbox 360 consoles and "
-              "also reaches players over the internet. \"off\" turns System "
-              "Link off.",
+              "engine, which reaches Xbox 360 consoles and players over the "
+              "internet. \"off\" turns System Link off for every title. While "
+              "systemlink_cross_platform is on, titles with cross-platform "
+              "System Link use the local network in place of the tunnel or "
+              "Kai.",
+              "Network");
+DEFINE_bool(systemlink_cross_platform, false,
+            "Lets Shadowrun, Lost Planet Colonies, Aliens: Colonial Marines "
+            "and Universe at War: Earth Assault play System Link with Xbox "
+            "360 consoles and Windows PCs on the local network. While it is "
+            "on, these titles only play on the local network, not over XLink "
+            "Kai or the tunnel. Turn it off to play them over Kai or the "
+            "tunnel. Other Xenia instances need the same setting to join.",
+            "Network");
+DEFINE_string(systemlink_cross_platform_interface, "auto",
+              "Network interface that cross-platform System Link uses. "
+              "\"auto\" picks the one with the default route.",
               "Network");
 DEFINE_string(systemlink_kai_engine, "127.0.0.1",
               "IPv4 address of the XLink Kai engine. An engine on another "
@@ -55,6 +72,66 @@ namespace {
 // A Microsoft block from while the 360 was made. XLink Kai only forwards
 // frames from console vendors.
 constexpr uint8_t kMacPrefix[] = {0x00, 0x1D, 0xD8};
+
+// Titles with cross-platform System Link derive their broadcast keys from
+// their LAN key AES-CBC encrypted with key 0x43 and a zero IV, which only a
+// console can compute.
+struct CrossPlatformKey {
+  net::Key lan_key;
+  net::Key encrypted;
+};
+constexpr CrossPlatformKey kCrossPlatformKeys[] = {
+    // Lost Planet Colonies.
+    {{0xBF, 0xB2, 0x96, 0x96, 0x23, 0x9F, 0x88, 0xBF, 0x5F, 0x20, 0x0E, 0x47,
+      0x96, 0x66, 0x47, 0xC6},
+     {0xCF, 0x04, 0x4B, 0xED, 0x8C, 0xC1, 0xFF, 0x2E, 0x00, 0x70, 0x77, 0xA9,
+      0xB7, 0x05, 0xDE, 0xD6}},
+    // Shadowrun and Aliens: Colonial Marines.
+    {{0xFE, 0xEF, 0xF0, 0x0D, 0x01, 0x02, 0x03, 0x04, 0x50, 0x60, 0x71, 0x72,
+      0x8A, 0x8D, 0xA9, 0x9A},
+     {0x85, 0x02, 0x0A, 0x99, 0x03, 0x67, 0x63, 0x69, 0x90, 0x09, 0x14, 0xC8,
+      0xD8, 0x2C, 0x1B, 0x12}},
+};
+
+std::string KeyText(const net::Key& key) {
+  std::string text;
+  for (uint8_t byte : key) {
+    text += fmt::format("{:02X}", byte);
+  }
+  return text;
+}
+
+std::optional<net::secure::ProtectionKeys> DeriveBroadcast(
+    const net::Key& lan_key, bool cross_platform) {
+  if (cross_platform) {
+    const auto known = std::ranges::find(kCrossPlatformKeys, lan_key,
+                                         &CrossPlatformKey::lan_key);
+    if (known != std::end(kCrossPlatformKeys)) {
+      return net::secure::DeriveBroadcast(
+          known->encrypted,
+          [](std::span<const uint8_t> input, net::secure::Sha1Digest& digest) {
+            xboxkrnl::XeCryptSha(input.data(), uint32_t(input.size()), nullptr,
+                                 0, nullptr, 0, digest.data(),
+                                 uint32_t(digest.size()));
+            return true;
+          });
+    }
+    XELOGE(
+        "System Link: LAN key {} has no cross-platform key so consoles won't "
+        "see this title. On a modded console, call XeKeysAesCbc (xboxkrnl "
+        "ordinal 587) with key 0x43, this LAN key as the 16-byte input, an "
+        "output buffer, 16 zero bytes as the IV and 1 to encrypt, then add the "
+        "LAN key and the output to kCrossPlatformKeys.",
+        KeyText(lan_key));
+  }
+  return net::secure::DeriveBroadcast(
+      lan_key,
+      [](std::span<const uint8_t> input, net::secure::Sha1Digest& digest) {
+        return xboxkrnl::XeKeysHmacSha(
+            0x19, input.data(), uint32_t(input.size()), nullptr, 0, nullptr, 0,
+            digest.data(), uint32_t(digest.size()));
+      });
+}
 
 std::optional<uint32_t> ParseAddress(const std::string& text) {
   asio::error_code ec;
@@ -100,6 +177,57 @@ std::unique_ptr<net::secure::PacketTransport> OpenTransport(
   return transport;
 }
 
+// Titles with cross-platform System Link play on the host network as a
+// machine of the interface's subnet.
+std::unique_ptr<net::secure::PacketTransport> OpenCrossPlatformTransport(
+    net::secure::CrossPlatform& cross_platform, uint16_t port) {
+  const std::string& name = cvars::systemlink_cross_platform_interface;
+  const bool automatic = name.empty() || name == "auto";
+  const auto host = net::FindHostInterface(automatic ? "" : name);
+  if (!host) {
+    std::string names;
+    for (const auto& known : net::HostInterfaceNames()) {
+      names += fmt::format("{}\"{}\"", names.empty() ? "" : ", ", known);
+    }
+    if (names.empty()) {
+      XELOGE("System Link: no network interface that can broadcast is up");
+    } else if (automatic) {
+      XELOGE(
+          "System Link: the default route doesn't lead through an interface "
+          "that can broadcast. Set systemlink_cross_platform_interface to one "
+          "of {}.",
+          names);
+    } else {
+      XELOGE(
+          "System Link: no interface named \"{}\" is up. Set "
+          "systemlink_cross_platform_interface to one of {}.",
+          name, names);
+    }
+    return nullptr;
+  }
+  // Peers come from the subnet so a /31, /32 or /0 has none.
+  if (!host->mask || host->mask >= 0xFFFFFFFE) {
+    XELOGE("System Link: interface \"{}\" is a /{} with no room for peers",
+           host->name, std::popcount(host->mask));
+    return nullptr;
+  }
+  std::string error;
+  auto transport = net::secure::OpenHostTransport(*host, port, error);
+  if (!transport) {
+    XELOGE("System Link: {}", error);
+    return nullptr;
+  }
+  const auto& mac = host->mac;
+  XELOGI(
+      "System Link: cross-platform on \"{}\", {}/{}, UDP port {}, MAC "
+      "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+      host->name, asio::ip::address_v4(host->address).to_string(),
+      std::popcount(host->mask), port, mac[0], mac[1], mac[2], mac[3], mac[4],
+      mac[5]);
+  cross_platform = {host->address, host->mask, port};
+  return transport;
+}
+
 }  // namespace
 
 bool SystemLinkEnabled() { return cvars::systemlink_transport != "off"; }
@@ -112,6 +240,10 @@ bool CrossPlatformTitle(KernelState* kernel_state) {
   uint32_t system_flags = 0;
   module->GetOptHeader<uint32_t>(XEX_HEADER_SYSTEM_FLAGS, &system_flags);
   return system_flags & XEX_SYSTEM_CROSS_PLATFORM_SYSTEM_LINK;
+}
+
+bool CrossPlatformSystemLink(KernelState* kernel_state) {
+  return cvars::systemlink_cross_platform && CrossPlatformTitle(kernel_state);
 }
 
 std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
@@ -131,27 +263,35 @@ std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
   }
   net::Key key;
   std::copy_n(lan_key->key, key.size(), key.begin());
-  auto broadcast = net::secure::DeriveBroadcast(
-      key, [](std::span<const uint8_t> input, net::secure::Sha1Digest& digest) {
-        return xboxkrnl::XeKeysHmacSha(
-            0x19, input.data(), uint32_t(input.size()), nullptr, 0, nullptr, 0,
-            digest.data(), uint32_t(digest.size()));
-      });
+  const bool cross_platform = CrossPlatformSystemLink(kernel_state);
+  if (!cross_platform && CrossPlatformTitle(kernel_state)) {
+    XELOGI(
+        "System Link: the title has cross-platform System Link. Turn on "
+        "systemlink_cross_platform to play it with consoles and PCs.");
+  }
+  auto broadcast = DeriveBroadcast(key, cross_platform);
   if (!broadcast) {
     XELOGE("System Link: no platform key to derive the LAN keys");
     return nullptr;
   }
 
-  // New for every title so instances on one machine never share it.
-  net::secure::Mac mac;
-  std::copy(std::begin(kMacPrefix), std::end(kMacPrefix), mac.begin());
-  net::Random(std::span(mac).subspan(std::size(kMacPrefix)));
-  auto transport = OpenTransport(mac);
+  net::secure::AssociationConfig association;
+  std::unique_ptr<net::secure::PacketTransport> transport;
+  if (cross_platform) {
+    association.cross_platform.emplace();
+    transport = OpenCrossPlatformTransport(*association.cross_platform, port);
+  } else {
+    // New for every title so instances on one machine never share it.
+    net::secure::Mac mac;
+    std::copy(std::begin(kMacPrefix), std::end(kMacPrefix), mac.begin());
+    net::Random(std::span(mac).subspan(std::size(kMacPrefix)));
+    transport = OpenTransport(mac);
+  }
   if (!transport) {
     return nullptr;
   }
+  const auto mac = transport->identity();
 
-  net::secure::AssociationConfig association;
   association.broadcast = *broadcast;
   association.freshness_time = [] { return Clock::QueryGuestSystemTime(); };
   const auto* version = kernel_state->GetKernelVersion();
@@ -159,15 +299,19 @@ std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state,
       execution->title_id, execution->version_value, version->major,
       version->minor, version->build, uint8_t(version->qfe));
   association.mtu = transport->mtu();
-  // A console without DHCP picks an RFC 3927 address. Peers only display it
-  // since frames go by MAC.
-  const uint32_t address =
-      0xA9FE0000 | (uint32_t(1 + mac[4] % 254) << 8) | mac[5];
-  XELOGI(
-      "System Link: {} transport, MAC "
-      "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-      cvars::systemlink_transport, mac[0], mac[1], mac[2], mac[3], mac[4],
-      mac[5]);
+  uint32_t address;
+  if (association.cross_platform) {
+    address = association.cross_platform->address;
+  } else {
+    // A console without DHCP picks an RFC 3927 address. Peers only display
+    // it since frames go by MAC.
+    address = 0xA9FE0000 | (uint32_t(1 + mac[4] % 254) << 8) | mac[5];
+    XELOGI(
+        "System Link: {} transport, MAC "
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        cvars::systemlink_transport, mac[0], mac[1], mac[2], mac[3], mac[4],
+        mac[5]);
+  }
   auto link = std::make_unique<net::SystemLink>(address, std::move(transport),
                                                 std::move(association));
   link->SetSystemLinkPort(port);

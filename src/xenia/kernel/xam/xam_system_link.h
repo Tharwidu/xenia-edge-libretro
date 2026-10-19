@@ -27,6 +27,8 @@ bool SystemLinkEnabled();
 
 // Whether the running title has cross-platform System Link.
 bool CrossPlatformTitle(KernelState* kernel_state);
+// Whether the running title uses cross-platform System Link.
+bool CrossPlatformSystemLink(KernelState* kernel_state);
 
 // Starts System Link for the running title over the configured transport, on
 // UDP |port| for cross-platform System Link. Null when it is off or cannot
