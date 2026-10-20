@@ -1175,6 +1175,10 @@ dword_result_t NetDll_setsockopt_entry(dword_t caller, dword_t socket_handle,
     return -1;
   }
 
+  if (!optval_ptr) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEFAULT));
+    return -1;
+  }
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
   if (XFAILED(status)) {
     XThread::SetLastError(socket->GetLastWSAError());

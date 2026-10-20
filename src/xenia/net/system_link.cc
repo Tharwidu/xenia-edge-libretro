@@ -270,6 +270,28 @@ uint32_t DatagramDestinationError(Endpoint destination, bool broadcast) {
   return 0;
 }
 
+uint32_t SocketOptionValue(const void* optval, uint32_t optlen) {
+  const auto* bytes = static_cast<const uint8_t*>(optval);
+  if (optlen < 4) {
+    return bytes[0];
+  }
+  return uint32_t(bytes[0]) << 24 | uint32_t(bytes[1]) << 16 |
+         uint32_t(bytes[2]) << 8 | bytes[3];
+}
+
+void StoreSocketOptionValue(void* optval, uint32_t& optlen, uint32_t value) {
+  auto* bytes = static_cast<uint8_t*>(optval);
+  if (optlen < 4) {
+    bytes[0] = uint8_t(value);
+    optlen = 1;
+    return;
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    bytes[i] = uint8_t(value >> (24 - 8 * i));
+  }
+  optlen = 4;
+}
+
 struct SystemLink::State {
   struct QosListen {
     bool enabled = false;

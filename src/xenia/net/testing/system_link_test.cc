@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -930,6 +931,37 @@ TEST_CASE("System Link datagrams refuse destinations sendto rejects",
   // Secure addresses and unmapped ones fail later if at all.
   CHECK(DatagramDestinationError({1, 1000}, false) == 0);
   CHECK(DatagramDestinationError({0xA9FE0488, 1000}, false) == 0);
+}
+
+TEST_CASE("System Link socket options read a short value as one byte",
+          "[net][system_link]") {
+  const uint8_t dword[] = {0x00, 0x00, 0x03, 0xE8};
+  CHECK(SocketOptionValue(dword, 4) == 1000);
+  // A one-byte BOOL and the stack bytes after it.
+  const uint8_t bool_byte[] = {0x01, 0xCD, 0xCD, 0xCD};
+  CHECK(SocketOptionValue(bool_byte, 1) == 1);
+  CHECK(SocketOptionValue(bool_byte, 3) == 1);
+  const uint8_t false_byte[] = {0x00, 0xCD, 0xCD, 0xCD};
+  CHECK(SocketOptionValue(false_byte, 1) == 0);
+  // Virtual-On Force sets SO_BROADCAST that way before it broadcasts.
+  CHECK(DatagramDestinationError({0xFFFFFFFF, 1002},
+                                 SocketOptionValue(bool_byte, 1) != 0) == 0);
+}
+
+TEST_CASE("System Link socket options store a short value as one byte",
+          "[net][system_link]") {
+  std::array<uint8_t, 4> dword;
+  dword.fill(0xCD);
+  uint32_t optlen = 4;
+  StoreSocketOptionValue(dword.data(), optlen, 1000);
+  CHECK(optlen == 4);
+  CHECK(dword == std::array<uint8_t, 4>{0x00, 0x00, 0x03, 0xE8});
+  std::array<uint8_t, 4> bool_byte;
+  bool_byte.fill(0xCD);
+  optlen = 1;
+  StoreSocketOptionValue(bool_byte.data(), optlen, 1);
+  CHECK(optlen == 1);
+  CHECK(bool_byte == std::array<uint8_t, 4>{0x01, 0xCD, 0xCD, 0xCD});
 }
 
 TEST_CASE("System Link unregistering a key retires its peers",

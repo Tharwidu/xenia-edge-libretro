@@ -63,6 +63,13 @@ struct Endpoint {
 // sends anything, 0 if the send goes on. |broadcast| is SO_BROADCAST.
 uint32_t DatagramDestinationError(Endpoint destination, bool broadcast);
 
+// The value of a BOOL or DWORD socket option: its first byte when |optlen| is
+// under four, otherwise a big-endian DWORD.
+uint32_t SocketOptionValue(const void* optval, uint32_t optlen);
+// Stores a BOOL or DWORD socket option value the same way and sets |optlen| to
+// the bytes written.
+void StoreSocketOptionValue(void* optval, uint32_t& optlen, uint32_t value);
+
 // XNetQosListen flags.
 inline constexpr uint32_t kQosListenEnable = 0x01;
 inline constexpr uint32_t kQosListenDisable = 0x02;

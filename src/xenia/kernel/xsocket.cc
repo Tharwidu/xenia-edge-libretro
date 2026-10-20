@@ -462,6 +462,11 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
   }
+  // SetOption keeps SO_BROADCAST of a System Link socket off its host socket.
+  if (UsesSystemLink() && level == 0xFFFF && optname == 0x0020) {
+    net::StoreSocketOptionValue(optval_ptr, *optlen, broadcast_socket_);
+    return X_STATUS_SUCCESS;
+  }
 
   // Map Xbox socket levels to native
   int native_level = level;
@@ -530,6 +535,13 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_SUCCESS;
   }
 
+  // SO_BROADCAST of a System Link socket, which never sends from its host
+  // socket. Hosts other than Windows refuse a one-byte BOOL.
+  if (UsesSystemLink() && level == 0xFFFF && optname == 0x0020) {
+    broadcast_socket_ = net::SocketOptionValue(optval_ptr, optlen) != 0;
+    return X_STATUS_SUCCESS;
+  }
+
   // Map Xbox socket levels to native
   int native_level = level;
   if (supported_levels.contains(level)) {
@@ -558,22 +570,16 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // SO_BROADCAST, a big-endian BOOL.
-  if (level == 0xFFFF && optname == 0x0020 && optlen >= sizeof(uint32_t)) {
-    broadcast_socket_ = xe::load_and_swap<uint32_t>(optval_ptr) != 0;
-  }
-
   KeepTimeout(level, optname, optval_ptr, optlen);
   return X_STATUS_SUCCESS;
 }
 
 void XSocket::KeepTimeout(uint32_t level, uint32_t optname,
                           const void* optval_ptr, uint32_t optlen) {
-  // SO_SNDTIMEO / SO_RCVTIMEO, a big-endian DWORD of milliseconds. Kept for
-  // the cooperative retry loop, which never sees the host option take effect.
-  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006) &&
-      optlen >= sizeof(uint32_t)) {
-    uint32_t timeout_ms = xe::load_and_swap<uint32_t>(optval_ptr);
+  // SO_SNDTIMEO / SO_RCVTIMEO in milliseconds. Kept for the cooperative retry
+  // loop, which never sees the host option take effect.
+  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
+    uint32_t timeout_ms = net::SocketOptionValue(optval_ptr, optlen);
     if (optname == 0x1006) {
       recv_timeout_ms_ = timeout_ms;
     } else {
