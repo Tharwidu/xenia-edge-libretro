@@ -229,6 +229,10 @@ class SystemLink {
   static std::optional<uint16_t> ResolveSystemLinkPort(uint16_t port);
   bool cross_platform() const;
 
+  // Whether broadcasts came from older or newer builds of this title, as
+  // secure::kBroadcastVersion* bits, cleared by |reset|.
+  uint32_t BroadcastVersionStatus(bool reset);
+
   // Port 0 picks a free one.
   std::unique_ptr<SystemLinkPort> Bind(uint16_t port, bool vdp,
                                        uint32_t& error);

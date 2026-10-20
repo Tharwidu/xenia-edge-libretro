@@ -255,6 +255,49 @@ Metadata MakeMetadata(uint32_t executable_id, uint32_t version, uint16_t major,
   return result;
 }
 
+std::optional<Metadata> PeekMetadata(std::span<const uint8_t> wire) {
+  // The metadata, the block count, the sequence and the tag end the packet.
+  constexpr size_t kTrailer = 12 + 1 + 2 + 10;
+  if (wire.size() < 4 + kTrailer || Read(wire.subspan(1, 3))) {
+    return std::nullopt;
+  }
+  const uint8_t kind = wire[0] & 15;
+  const size_t reserved = (wire[0] >> 5) | ((wire[0] & 0x10) >> 1);
+  if (kind < 7 || kind > 9 || reserved > 7) {
+    return std::nullopt;
+  }
+  // Ports that don't fit in the padding come before the metadata.
+  const size_t ports = 2 * ((kind - 1) % 3);
+  const size_t clear_ports = ports - std::min(reserved, ports);
+  const size_t blocks = wire[wire.size() - 13];
+  if (wire.size() != 4 + blocks * 8 + clear_ports + kTrailer) {
+    return std::nullopt;
+  }
+  Metadata metadata;
+  std::copy_n(wire.end() - kTrailer, metadata.size(), metadata.begin());
+  return metadata;
+}
+
+uint32_t BroadcastVersionDifference(const Metadata& own,
+                                    const Metadata& theirs) {
+  auto field = [](const Metadata& metadata, size_t index) {
+    return Read(std::span(metadata).subspan(4 * index, 4), true);
+  };
+  if (field(theirs, 0) != field(own, 0)) {
+    return 0;
+  }
+  uint32_t difference = 0;
+  // The version, then the kernel.
+  for (size_t index : {1, 2}) {
+    if (field(theirs, index) < field(own, index)) {
+      difference |= kBroadcastVersionOlder;
+    } else if (field(theirs, index) > field(own, index)) {
+      difference |= kBroadcastVersionNewer;
+    }
+  }
+  return difference;
+}
+
 bool FreshnessNewer(uint64_t incoming, uint64_t previous, bool response) {
   return response ? std::bit_cast<int64_t>(incoming - previous) > 0
                   : std::bit_cast<int64_t>(incoming) >

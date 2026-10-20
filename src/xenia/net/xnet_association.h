@@ -69,6 +69,9 @@ class Associations {
   AssociationStatus Status(const Address& peer, const KeyId& id) const;
   std::vector<Frame> TakeOutbound();
   std::vector<AssociationEvent> TakeEvents();
+  // The kBroadcastVersion* bits of broadcasts that didn't authenticate since
+  // the last |reset|.
+  uint32_t BroadcastVersionStatus(bool reset);
 
  private:
   struct State;
@@ -92,6 +95,7 @@ class Associations {
   std::vector<AssociationEvent> events_;
   uint16_t discovery_sequence_ = 0;
   uint64_t freshness_ = 0;
+  uint32_t broadcast_version_status_ = 0;
 };
 
 }  // namespace xe::net::secure

@@ -306,6 +306,9 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
                            frame.source,
                            std::move(*packet)});
       }
+    } else if (auto metadata = PeekMetadata(wire)) {
+      broadcast_version_status_ |=
+          BroadcastVersionDifference(config_.metadata, *metadata);
     }
     return;
   }
@@ -565,6 +568,15 @@ void Associations::Reset() {
   states_.clear();
   outbound_.clear();
   events_.clear();
+  broadcast_version_status_ = 0;
+}
+
+uint32_t Associations::BroadcastVersionStatus(bool reset) {
+  const uint32_t status = broadcast_version_status_;
+  if (reset) {
+    broadcast_version_status_ = 0;
+  }
+  return status;
 }
 
 AssociationStatus Associations::Status(const Address& peer,

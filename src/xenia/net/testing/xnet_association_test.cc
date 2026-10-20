@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -292,6 +293,102 @@ TEST_CASE(
   pair.Transfer(*pair.left, *pair.right, 105);
   CHECK_FALSE(pair.left->Connect(pair.ba, pair.id, 106));
   CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Missing);
+}
+
+TEST_CASE(
+    "Secure association notes broadcasts of other builds that fail to "
+    "authenticate",
+    "[net][secure][association]") {
+  Pair pair;
+  // The receiver runs version 0x01020304 of title 0x10203040 on kernel 1234.
+  const uint32_t title = 0x10203040, version = 0x01020304;
+  auto broadcast = [&](const Metadata& metadata, bool same_keys,
+                       const Packet& packet = Data()) {
+    AssociationConfig config;
+    config.identity = Identity(3);
+    config.broadcast = pair.broadcast;
+    if (!same_keys) {
+      config.broadcast.authentication[0] ^= 1;
+    }
+    config.metadata = metadata;
+    Associations sender(std::move(config));
+    REQUIRE(sender.Discover(packet));
+    pair.Transfer(sender, *pair.right);
+  };
+  auto heard = [&](const Metadata& metadata, bool same_keys,
+                   const Packet& packet = Data()) {
+    broadcast(metadata, same_keys, packet);
+    return pair.right->BroadcastVersionStatus(true);
+  };
+  const auto older = MakeMetadata(title, version - 1, 2, 0, 1234, 1);
+  const auto newer_kernel = MakeMetadata(title, version, 2, 0, 1235, 1);
+  CHECK(heard(older, false) == kBroadcastVersionOlder);
+  CHECK(heard(newer_kernel, false) == kBroadcastVersionNewer);
+  CHECK(heard(MakeMetadata(title, version + 1, 2, 0, 1233, 1), false) ==
+        (kBroadcastVersionOlder | kBroadcastVersionNewer));
+  CHECK(heard(MakeMetadata(title, version, 2, 0, 1234, 1), false) == 0);
+  CHECK(heard(MakeMetadata(0x50607080, version - 1, 2, 0, 1234, 1), false) ==
+        0);
+  // A broadcast that authenticates is delivered whatever its version.
+  CHECK(heard(older, true) == 0);
+  CHECK(pair.right->TakeEvents().size() == 1);
+  // Ports that don't fit in the padding go in the clear before the metadata.
+  auto unpadded = Data();
+  unpadded.encrypted.resize(8);
+  CHECK(heard(older, false, unpadded) == kBroadcastVersionOlder);
+  auto short_ports = Data();
+  short_ports.source_port = short_ports.destination_port = 1001;
+  short_ports.encrypted.resize(7);
+  CHECK(heard(older, false, short_ports) == kBroadcastVersionOlder);
+
+  // The bits add up until a reset.
+  broadcast(older, false);
+  broadcast(newer_kernel, false);
+  const uint32_t both = kBroadcastVersionOlder | kBroadcastVersionNewer;
+  CHECK(pair.right->BroadcastVersionStatus(false) == both);
+  CHECK(pair.right->BroadcastVersionStatus(true) == both);
+  CHECK(pair.right->BroadcastVersionStatus(false) == 0);
+  broadcast(older, false);
+  pair.right->Reset();
+  CHECK(pair.right->BroadcastVersionStatus(false) == 0);
+}
+
+TEST_CASE(
+    "Secure association ignores the version of malformed or unicast discovery "
+    "packets",
+    "[net][secure][association]") {
+  Pair pair;
+  AssociationConfig config;
+  config.identity = Identity(3);
+  config.broadcast = pair.broadcast;
+  config.broadcast.authentication[0] ^= 1;
+  config.metadata = MakeMetadata(0x10203040, 0x01020303, 2, 0, 1234, 1);
+  Associations older(std::move(config));
+  REQUIRE(older.Discover(Data()));
+  auto frames = older.TakeOutbound();
+  REQUIRE(frames.size() == 1);
+  const Frame search = frames[0];
+  auto heard = [&](const Frame& frame) {
+    pair.right->Receive(frame, 100);
+    return pair.right->BroadcastVersionStatus(true);
+  };
+  REQUIRE(heard(search) == kBroadcastVersionOlder);
+  auto unicast = search;
+  unicast.broadcast = false;
+  unicast.destination = {0x02, 0x58, 0x00, 0x00, 0x00, 0x02};
+  CHECK(heard(unicast) == 0);
+  auto altered = [&](const std::function<void(std::vector<uint8_t>&)>& change) {
+    auto frame = search;
+    change(frame.payload);
+    return heard(frame);
+  };
+  // A nonzero SPI, another kind, block counts and sizes that disagree.
+  CHECK(altered([](auto& wire) { wire[3] = 1; }) == 0);
+  CHECK(altered([](auto& wire) { wire[0] = (wire[0] & 0xF0) | 4; }) == 0);
+  CHECK(altered([](auto& wire) { ++wire[wire.size() - 13]; }) == 0);
+  CHECK(altered([](auto& wire) { wire.insert(wire.end() - 25, 0); }) == 0);
+  CHECK(altered([](auto& wire) { wire.erase(wire.begin() + 4); }) == 0);
+  CHECK(altered([](auto& wire) { wire.resize(28); }) == 0);
 }
 
 TEST_CASE(

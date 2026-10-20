@@ -799,6 +799,14 @@ dword_result_t NetDll_XNetGetEthernetLinkStatus_entry(dword_t caller) {
 DECLARE_XAM_EXPORT1(NetDll_XNetGetEthernetLinkStatus, kNetworking,
                     kImplemented);
 
+dword_result_t NetDll_XNetGetBroadcastVersionStatus_entry(dword_t caller,
+                                                          dword_t reset) {
+  auto link = GetSystemLink(kernel_state());
+  return link ? link->BroadcastVersionStatus(reset != 0) : 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetGetBroadcastVersionStatus, kNetworking,
+                    kImplemented);
+
 // Fills |dns| with the IPv4 addresses |host| resolves to.
 static void ResolveDnsHost(const std::string& host, XNDNS* dns) {
   asio::error_code ec;

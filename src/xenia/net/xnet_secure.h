@@ -91,6 +91,16 @@ TrafficKeys DeriveTraffic(const Key& registration_auth, const DhValue& shared,
 Block PacketIv(const Block& seed, uint32_t sequence);
 Metadata MakeMetadata(uint32_t executable_id, uint32_t version, uint16_t major,
                       uint16_t minor, uint16_t build, uint8_t revision);
+// The metadata a discovery packet sends in the clear, none for a packet that
+// isn't laid out as one.
+std::optional<Metadata> PeekMetadata(std::span<const uint8_t> wire);
+// XNetGetBroadcastVersionStatus bits.
+inline constexpr uint32_t kBroadcastVersionOlder = 0x01;
+inline constexpr uint32_t kBroadcastVersionNewer = 0x02;
+// Whether a broadcast from |theirs| came from an older or newer version or
+// kernel than |own|, 0 for another title.
+uint32_t BroadcastVersionDifference(const Metadata& own,
+                                    const Metadata& theirs);
 bool FreshnessNewer(uint64_t incoming, uint64_t previous, bool response);
 
 inline constexpr uint16_t kSystemLinkPort = 3074;

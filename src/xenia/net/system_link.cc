@@ -1794,6 +1794,11 @@ bool SystemLink::cross_platform() const {
   return state_->cross_platform.has_value();
 }
 
+uint32_t SystemLink::BroadcastVersionStatus(bool reset) {
+  std::lock_guard lock(state_->mutex);
+  return state_->associations.BroadcastVersionStatus(reset);
+}
+
 void SystemLink::CancelQos(uint32_t tag) {
   std::lock_guard lock(state_->mutex);
   state_->qos_lookups.erase(tag);

@@ -184,11 +184,13 @@ struct Pair {
   }
 
   std::unique_ptr<SystemLink> Make(unsigned side,
-                                   const ProtectionKeys& broadcast) {
+                                   const ProtectionKeys& broadcast,
+                                   const Metadata& metadata = {}) {
     auto transport = std::make_shared<TestTransport>(wire, side);
     transports[side] = transport;
     AssociationConfig association;
     association.broadcast = broadcast;
+    association.metadata = metadata;
     association.mtu = transport->mtu();
     // Documentation range addresses.
     return std::make_unique<SystemLink>(0xC0000201 + side, transport,
@@ -965,6 +967,32 @@ TEST_CASE("XNet startup parameters take xam's defaults and limits",
   auto from_extended = defaults;
   from_extended[8] = 16;
   CHECK(NormalizeStartupParams(extended) == from_extended);
+}
+
+TEST_CASE("System Link reports broadcasts of other builds of the title",
+          "[net][system_link]") {
+  Pair pair;
+  pair.a.reset();
+  pair.b.reset();
+  // An older build that also broadcasts with another LAN key.
+  auto older_keys = pair.broadcast;
+  older_keys.authentication[0] ^= 1;
+  pair.a =
+      pair.Make(0, older_keys, MakeMetadata(0x434307ED, 3, 2, 0, 17559, 0));
+  pair.b = pair.Make(1, pair.broadcast,
+                     MakeMetadata(0x434307ED, 0x103, 2, 0, 17559, 0));
+  auto tx = Bind(*pair.a, 1001, false);
+  auto rx = Bind(*pair.b, 1001, false);
+  REQUIRE(tx);
+  REQUIRE(rx);
+  CHECK(pair.b->BroadcastVersionStatus(false) == 0);
+  const std::vector<uint8_t> data{0, 1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({0xFFFFFFFF, 1001}, data, error) == int(data.size()));
+  REQUIRE(WaitFor([&] { return pair.b->BroadcastVersionStatus(false) != 0; }));
+  CHECK(pair.b->BroadcastVersionStatus(true) == kBroadcastVersionOlder);
+  CHECK(pair.b->BroadcastVersionStatus(false) == 0);
+  CHECK_FALSE(rx->Readable());
 }
 
 TEST_CASE("System Link socket options store a short value as one byte",
