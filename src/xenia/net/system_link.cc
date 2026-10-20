@@ -292,6 +292,28 @@ void StoreSocketOptionValue(void* optval, uint32_t& optlen, uint32_t value) {
   optlen = 4;
 }
 
+StartupParams NormalizeStartupParams(std::span<const uint8_t> params) {
+  constexpr StartupParams kDefaults{0, 0, 8, 32, 16, 16, 8, 32, 64, 2, 3, 8, 2};
+  constexpr StartupParams kMinimums{0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+  constexpr StartupParams kMaximums{0,   255, 232, 232, 63,  63, 255,
+                                    255, 255, 255, 255, 255, 255};
+  StartupParams result = kDefaults;
+  // The extended struct starts with the same fields, any other size is
+  // ignored.
+  if (params.size() >= kStartupParamsSize &&
+      (params[0] == kStartupParamsSize || params[0] == 0x4C)) {
+    for (size_t i = 1; i < kStartupParamsSize; ++i) {
+      if (params[i]) {
+        result[i] = std::clamp(params[i], kMinimums[i], kMaximums[i]);
+      }
+    }
+  }
+  // Retail xam clears the flags that turn security off.
+  result[1] &= 0xF6;
+  result[0] = kStartupParamsSize;
+  return result;
+}
+
 struct SystemLink::State {
   struct QosListen {
     bool enabled = false;

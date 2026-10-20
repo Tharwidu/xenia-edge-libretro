@@ -91,6 +91,27 @@ uint16_t XamModule::system_link_port() {
   return system_link_ ? system_link_->system_link_port() : system_link_port_;
 }
 
+void XamModule::StartXNet(bool wsa, std::span<const uint8_t> params) {
+  std::lock_guard lock(xnet_mutex_);
+  if (!xnet_starts_ && !wsa_starts_) {
+    xnet_startup_params_ = net::NormalizeStartupParams(params);
+  }
+  ++(wsa ? wsa_starts_ : xnet_starts_);
+}
+
+void XamModule::CleanupXNet(bool wsa) {
+  std::lock_guard lock(xnet_mutex_);
+  auto& starts = wsa ? wsa_starts_ : xnet_starts_;
+  if (starts) {
+    --starts;
+  }
+}
+
+net::StartupParams XamModule::xnet_startup_params() {
+  std::lock_guard lock(xnet_mutex_);
+  return xnet_startup_params_;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe

@@ -10,6 +10,7 @@
 #ifndef XENIA_NET_SYSTEM_LINK_H_
 #define XENIA_NET_SYSTEM_LINK_H_
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -69,6 +70,13 @@ uint32_t SocketOptionValue(const void* optval, uint32_t optlen);
 // Stores a BOOL or DWORD socket option value the same way and sets |optlen| to
 // the bytes written.
 void StoreSocketOptionValue(void* optval, uint32_t& optlen, uint32_t value);
+
+// XNetStartupParams as the guest lays them out.
+inline constexpr size_t kStartupParamsSize = 13;
+using StartupParams = std::array<uint8_t, kStartupParamsSize>;
+// What XNet runs with for the parameters a title passed, none when empty. Zero
+// fields take xam's defaults and the others are clamped to its limits.
+StartupParams NormalizeStartupParams(std::span<const uint8_t> params);
 
 // XNetQosListen flags.
 inline constexpr uint32_t kQosListenEnable = 0x01;

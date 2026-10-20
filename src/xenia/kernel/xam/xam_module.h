@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 
 #include "xenia/cpu/export_resolver.h"
@@ -52,6 +53,13 @@ class XamModule : public KernelModule {
   uint32_t SetSystemLinkPort(uint16_t port);
   uint16_t system_link_port();
 
+  // XNetStartup, or WSAStartup with |wsa| and no |params|. Only the first
+  // start since everything was cleaned up takes its parameters.
+  void StartXNet(bool wsa, std::span<const uint8_t> params);
+  // XNetCleanup, or WSACleanup with |wsa|.
+  void CleanupXNet(bool wsa);
+  net::StartupParams xnet_startup_params();
+
  private:
   uint32_t callback_ = 0;
   LoaderData loader_data_;
@@ -60,6 +68,10 @@ class XamModule : public KernelModule {
   bool system_link_started_ = false;
   std::shared_ptr<net::SystemLink> system_link_;
   uint16_t system_link_port_ = net::secure::kSystemLinkPort;
+
+  std::mutex xnet_mutex_;
+  uint32_t xnet_starts_ = 0, wsa_starts_ = 0;
+  net::StartupParams xnet_startup_params_ = net::NormalizeStartupParams({});
 };
 
 }  // namespace xam

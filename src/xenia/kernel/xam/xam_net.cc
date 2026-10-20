@@ -207,24 +207,23 @@ struct XNetStartupParams {
   uint8_t cfgQosSrvMaxSimultaneousResponses;
   uint8_t cfgQosPairWaitTimeInSeconds;
 };
-static_assert_size(XNetStartupParams, 0xD);
-
-XNetStartupParams xnet_startup_params = {0};
+static_assert_size(XNetStartupParams, net::kStartupParamsSize);
 
 dword_result_t NetDll_XNetStartup_entry(dword_t caller,
                                         pointer_t<XNetStartupParams> params) {
   XELOGI("NetDll_XNetStartup: caller={}, params={:08X}", caller.value(),
          params.guest_address());
 
-  if (params) {
-    assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
-    std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
-  }
-
   // Gives the transport time to come up before the title looks for peers.
   GetSystemLink(kernel_state());
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  std::span<const uint8_t> given;
+  if (params) {
+    given = {reinterpret_cast<const uint8_t*>(params.host_address()),
+             sizeof(XNetStartupParams)};
+  }
+  xam->StartXNet(false, given);
 
   /*
   if (!xam->xnet()) {
@@ -256,6 +255,7 @@ dword_result_t NetDll_XNetCleanup_entry(dword_t caller, lpvoid_t params) {
   }
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->CleanupXNet(false);
   // auto xnet = xam->xnet();
   // xam->set_xnet(nullptr);
 
@@ -278,13 +278,18 @@ dword_result_t NetDll_XNetGetOpt_entry(dword_t one, dword_t option_id,
                                        lpdword_t buffer_size) {
   assert_true(one == 1);
   switch (option_id) {
-    case 1:
+    case 1: {
       if (*buffer_size < sizeof(XNetStartupParams)) {
         *buffer_size = sizeof(XNetStartupParams);
         return uint32_t(X_WSAError::X_WSAEMSGSIZE);
       }
-      std::memcpy(buffer_ptr, &xnet_startup_params, sizeof(XNetStartupParams));
+      const auto params = kernel_state()
+                              ->GetKernelModule<XamModule>("xam.xex")
+                              ->xnet_startup_params();
+      std::memcpy(buffer_ptr, params.data(), params.size());
+      *buffer_size = sizeof(XNetStartupParams);
       return 0;
+    }
     default:
       XELOGE("NetDll_XNetGetOpt: option {} unimplemented",
              static_cast<uint32_t>(option_id));
@@ -318,6 +323,8 @@ dword_result_t NetDll_WSAStartup_entry(dword_t caller, word_t version,
   // TODO(benvanik): abstraction layer needed.
   XELOGI("NetDll_WSAStartup: version={:04X}, data_ptr={:08X}", version.value(),
          data_ptr.guest_address());
+
+  kernel_state()->GetKernelModule<XamModule>("xam.xex")->StartXNet(true, {});
 
   int ret = 0;
 
@@ -368,7 +375,8 @@ dword_result_t NetDll_WSAStartupEx_entry(dword_t caller, word_t version,
 DECLARE_XAM_EXPORT1(NetDll_WSAStartupEx, kNetworking, kImplemented);
 
 dword_result_t NetDll_WSACleanup_entry(dword_t caller) {
-  // This does nothing. Xenia needs WSA running.
+  // Host WSA keeps running, Xenia needs it.
+  kernel_state()->GetKernelModule<XamModule>("xam.xex")->CleanupXNet(true);
   return 0;
 }
 DECLARE_XAM_EXPORT1(NetDll_WSACleanup, kNetworking, kImplemented);

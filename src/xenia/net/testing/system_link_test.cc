@@ -948,6 +948,25 @@ TEST_CASE("System Link socket options read a short value as one byte",
                                  SocketOptionValue(bool_byte, 1) != 0) == 0);
 }
 
+TEST_CASE("XNet startup parameters take xam's defaults and limits",
+          "[net][system_link]") {
+  const StartupParams defaults{13, 0, 8, 32, 16, 16, 8, 32, 64, 2, 3, 8, 2};
+  // Lost Planet 2 sets the size and leaves the rest to XNet.
+  const uint8_t unset[13] = {13};
+  CHECK(NormalizeStartupParams(unset) == defaults);
+  CHECK(NormalizeStartupParams({}) == defaults);
+  const uint8_t unknown_size[13] = {12, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4};
+  CHECK(NormalizeStartupParams(unknown_size) == defaults);
+  const uint8_t given[13] = {13, 0x0F, 255, 1, 100, 63, 255, 1, 16, 9, 9, 9, 9};
+  CHECK(NormalizeStartupParams(given) ==
+        StartupParams{13, 0x06, 232, 1, 63, 63, 255, 1, 16, 9, 9, 9, 9});
+  std::array<uint8_t, 0x4C> extended{0x4C};
+  extended[8] = 16;
+  auto from_extended = defaults;
+  from_extended[8] = 16;
+  CHECK(NormalizeStartupParams(extended) == from_extended);
+}
+
 TEST_CASE("System Link socket options store a short value as one byte",
           "[net][system_link]") {
   std::array<uint8_t, 4> dword;
