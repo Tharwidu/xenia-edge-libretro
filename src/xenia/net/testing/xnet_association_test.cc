@@ -353,21 +353,43 @@ TEST_CASE(
   auto right_request = pair.right->TakeOutbound().at(0);
   auto registration =
       DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
-  auto exchange = DecodeExchange(registration, pair.id, left_request.payload);
+  auto exchange = DecodeExchange(registration, pair.id, right_request.payload);
   REQUIRE(exchange);
   exchange->public_value.fill(0);
   auto encoded = EncodeExchange(registration, *exchange);
   REQUIRE(encoded);
-  auto bad = left_request;
+  auto bad = right_request;
   bad.payload.assign(encoded->begin(), encoded->end());
-  pair.right->Receive(bad, 101);
-  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Pending);
-  CHECK(pair.right->TakeEvents().empty());
-  CHECK(pair.right->TakeOutbound().empty());
-  pair.right->Receive(left_request, 101);
+  pair.left->Receive(bad, 101);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
+  CHECK(pair.left->TakeEvents().empty());
+  CHECK(pair.left->TakeOutbound().empty());
   pair.left->Receive(right_request, 101);
+  pair.right->Receive(left_request, 101);
   pair.Pump(101);
   CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Established);
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+}
+
+TEST_CASE("Simultaneous secure connect keeps the larger MAC as the initiator",
+          "[net][secure][association]") {
+  Pair pair;
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 100));
+  REQUIRE(pair.right->Connect(pair.aa, pair.id, 100));
+  auto left_request = pair.left->TakeOutbound().at(0);
+  auto right_request = pair.right->TakeOutbound().at(0);
+  // Only the smaller MAC answers a crossed request.
+  pair.right->Receive(left_request, 101);
+  CHECK(pair.right->TakeOutbound().empty());
+  pair.left->Receive(right_request, 101);
+  auto answer = pair.left->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  auto exchange = DecodeExchange(registration, pair.id, answer[0].payload);
+  REQUIRE(exchange);
+  CHECK(exchange->response);
+  pair.right->Receive(answer[0], 101);
   CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
 }
 

@@ -406,9 +406,9 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
         ExchangePacket(state, now);
         return;
       }
-      // On a simultaneous connect the smaller XNADDR MAC stays the initiator.
+      // On a simultaneous connect the larger XNADDR MAC stays the initiator.
       if (!(state.initiator && state.status == AssociationStatus::Pending &&
-            Machine(config_.identity, false) >
+            Machine(config_.identity, false) <
                 Machine(exchange->initiator_address, false))) {
         return;
       }
