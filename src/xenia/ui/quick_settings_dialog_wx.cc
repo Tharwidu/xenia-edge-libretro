@@ -432,7 +432,7 @@ void QuickSettingsDialog::LoadValuesFromCvars() {
       continue;
     }
     // Integer cvars shown as string dropdowns display their option name.
-    std::string v = ui::IntCvarValueToDisplayName(name, ReadCvarString(name));
+    std::string v = ui::CvarValueToDisplayName(name, ReadCvarString(name));
     opt.current_value = v;
     opt.pending_value = v;
     if (auto* combo = dynamic_cast<wxChoice*>(opt.editor)) {
@@ -590,9 +590,8 @@ void QuickSettingsDialog::Save() {
     } else if (ui::FindIntCvarEnumOptions(name)) {
       // Dropdown int cvar: convert the selected option name to its id.
       try {
-        apply(var,
-              toml::value(static_cast<int64_t>(std::stoll(
-                  ui::DisplayNameToIntCvarValue(name, opt.pending_value)))));
+        apply(var, toml::value(static_cast<int64_t>(std::stoll(
+                       ui::DisplayNameToCvarValue(name, opt.pending_value)))));
       } catch (...) {
       }
     } else {
