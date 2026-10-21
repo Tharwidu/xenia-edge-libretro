@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <regex>
 
 #include "xenia/kernel/xam/profile_manager.h"

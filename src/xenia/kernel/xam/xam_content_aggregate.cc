@@ -8,6 +8,8 @@
  */
 
 #include "xenia/base/logging.h"
+
+#include <algorithm>
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
 #include "xenia/kernel/kernel_state.h"

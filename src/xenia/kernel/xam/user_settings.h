@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_XAM_USER_SETTINGS_H_
 #define XENIA_KERNEL_XAM_USER_SETTINGS_H_
 
+#include <algorithm>
 #include <array>
 #include <set>
 #include <variant>

@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 #include "xenia/patcher/plugin_loader.h"
+
+#include <algorithm>
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
 #include "xenia/kernel/user_module.h"

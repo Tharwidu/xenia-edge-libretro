@@ -8,6 +8,8 @@
  */
 
 #include "xenia/kernel/xam/xdbf/gpd_info.h"
+
+#include <algorithm>
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/user_settings.h"
 

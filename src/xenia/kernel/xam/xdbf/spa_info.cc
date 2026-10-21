@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 
+#include <algorithm>
 #include <tuple>
 
 namespace xe {

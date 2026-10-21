@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xam/content_manager.h"
 
+#include <algorithm>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"

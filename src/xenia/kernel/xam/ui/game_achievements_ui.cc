@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xam/ui/game_achievements_ui.h"
 
+#include <algorithm>
+
 #include "xenia/hid/input.h"
 #include "xenia/hid/input_system.h"
 

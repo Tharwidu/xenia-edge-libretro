@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <ranges>
 
 #include "xenia/base/logging.h"

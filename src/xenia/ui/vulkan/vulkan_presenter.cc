@@ -9,6 +9,7 @@
 
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
+#include <algorithm>
 #include <cstdint>
 
 #include "xenia/base/assert.h"

@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/spirv_shader_translator.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>

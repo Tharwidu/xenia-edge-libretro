@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/export_resolver.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string.h"

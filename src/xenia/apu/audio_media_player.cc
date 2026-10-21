@@ -8,6 +8,8 @@
  */
 
 #include "xenia/apu/audio_media_player.h"
+
+#include <algorithm>
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/apu/xma_context.h"

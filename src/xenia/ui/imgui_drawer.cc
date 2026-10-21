@@ -9,6 +9,7 @@
 
 #include "xenia/ui/imgui_drawer.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <ranges>
