@@ -269,6 +269,36 @@ static inline void emit_dupe_frame(void) {
     core_state.video_cb(nullptr, last_frame_w, last_frame_h,
                         static_cast<size_t>(last_frame_w) * 4);
 }
+
+// Test hook, inert unless XENIA_LIBRETRO_SNAP_DIR is set: while
+// <dir>/request exists, the next software frame is written to <dir>/frame.ppm
+// and the request removed. RetroArch 1.7.5 cannot screenshot this core, and
+// unattended test runs need to see the screen.
+static void maybe_dump_frame(const void* xrgb, uint32_t w, uint32_t h) {
+    static const char* dir = std::getenv("XENIA_LIBRETRO_SNAP_DIR");
+    static uint32_t frames = 0;
+    if (!dir || ++frames % 15 != 0) return;
+    const std::filesystem::path base = xe::to_path(dir);
+    std::error_code ec;
+    if (!std::filesystem::exists(base / "request", ec)) return;
+    FILE* out = xe::filesystem::OpenFile(base / "frame.ppm.tmp", "wb");
+    if (!out) return;
+    fprintf(out, "P6\n%u %u\n255\n", w, h);
+    std::vector<uint8_t> row(size_t(w) * 3);
+    const uint8_t* src = static_cast<const uint8_t*>(xrgb);
+    for (uint32_t y = 0; y < h; ++y, src += size_t(w) * 4) {
+        // XRGB8888 is B,G,R,X in memory.
+        for (uint32_t x = 0; x < w; ++x) {
+            row[x * 3 + 0] = src[x * 4 + 2];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 0];
+        }
+        fwrite(row.data(), 1, row.size(), out);
+    }
+    fclose(out);
+    std::filesystem::rename(base / "frame.ppm.tmp", base / "frame.ppm", ec);
+    std::filesystem::remove(base / "request", ec);
+}
 static uint32_t last_geometry_aspect_x = 0, last_geometry_aspect_y = 0;
 
 // Software frame capture buffer (fallback path)
@@ -1679,6 +1709,7 @@ static void update_video(void) {
             // formats anyway and could simply convert to the right one.
             last_frame_w = w;
             last_frame_h = h;
+            maybe_dump_frame(blit_data, w, h);
             core_state.video_cb(blit_data, w, h, w * 4);
             return;
         }
@@ -1702,6 +1733,7 @@ static void update_video(void) {
                                            h, size_t(w) * 4, true);
         last_frame_w = w;
         last_frame_h = h;
+        maybe_dump_frame(dst, w, h);
         core_state.video_cb(dst, w, h, w * 4);
         return;
     }

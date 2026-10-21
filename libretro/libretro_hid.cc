@@ -7,11 +7,14 @@
 #include "libretro_hid.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/ui/virtual_key.h"
 
 namespace xe {
@@ -301,11 +304,47 @@ X_RESULT LibretroInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
   return X_ERROR_EMPTY;
 }
 
+namespace {
+
+// Test hook, inert unless XENIA_LIBRETRO_SNAP_DIR is set: <dir>/pad holds
+// "<RetroPad id bitmask> <lx> <ly> <rx> <ry>" and is merged into port 0, so
+// unattended test runs can drive menus. RetroArch 1.7.5's network gamepad
+// never reaches the bitmask query this driver makes.
+struct InjectedPad {
+  uint16_t buttons = 0;
+  int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+};
+
+InjectedPad ReadInjectedPad() {
+  static const char* dir = std::getenv("XENIA_LIBRETRO_SNAP_DIR");
+  static InjectedPad pad;
+  static uint32_t polls = 0;
+  if (!dir) return pad;
+  if (++polls % 2 == 0) return pad;
+  pad = {};
+  FILE* f = xe::filesystem::OpenFile(xe::to_path(dir) / "pad", "rb");
+  if (!f) return pad;
+  unsigned buttons = 0;
+  int lx = 0, ly = 0, rx = 0, ry = 0;
+  if (fscanf(f, "%u %d %d %d %d", &buttons, &lx, &ly, &rx, &ry) >= 1) {
+    pad.buttons = uint16_t(buttons);
+    pad.lx = int16_t(lx);
+    pad.ly = int16_t(ly);
+    pad.rx = int16_t(rx);
+    pad.ry = int16_t(ry);
+  }
+  fclose(f);
+  return pad;
+}
+
+}  // namespace
+
 void LibretroInputDriver::UpdateFromLibretro(
     retro_input_state_t input_state_cb, bool use_bitmasks) {
   if (!input_state_cb) return;
 
   std::lock_guard<std::mutex> lock(state_mutex_);
+  const InjectedPad injected = ReadInjectedPad();
 
   for (size_t port = 0; port < kMaxPorts; ++port) {
     auto& s = states_[port];
@@ -328,6 +367,12 @@ void LibretroInputDriver::UpdateFromLibretro(
         if (s.buttons[id]) any_input = true;
       }
     }
+    if (port == 0 && injected.buttons) {
+      for (int id = 0; id < 16; ++id) {
+        if (injected.buttons & (1 << id)) s.buttons[id] = 1;
+      }
+      any_input = true;
+    }
 
     // Read analog sticks
     s.left_stick_x = input_state_cb(
@@ -342,6 +387,12 @@ void LibretroInputDriver::UpdateFromLibretro(
     s.right_stick_y = input_state_cb(
         static_cast<unsigned>(port), RETRO_DEVICE_ANALOG,
         RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+    if (port == 0 && (injected.lx || injected.ly || injected.rx || injected.ry)) {
+      s.left_stick_x = injected.lx;
+      s.left_stick_y = injected.ly;
+      s.right_stick_x = injected.rx;
+      s.right_stick_y = injected.ry;
+    }
 
     if (s.left_stick_x || s.left_stick_y ||
         s.right_stick_x || s.right_stick_y)
