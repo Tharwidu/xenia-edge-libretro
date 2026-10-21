@@ -81,6 +81,14 @@ bool Associations::SystemLinkKey(const KeyId& id) const {
   return SystemLinkKeyId(id, config_.cross_platform.has_value());
 }
 
+bool Associations::Ours(const Address& address) const {
+  // xam ignores the other fields, which titles may garble.
+  return Machine(address, false) == Machine(config_.identity, false) &&
+         (!config_.cross_platform ||
+          std::equal(address.begin(), address.begin() + 4,
+                     config_.identity.begin()));
+}
+
 uint32_t Associations::NewSpi() {
   for (unsigned attempt = 0; attempt < 32; ++attempt) {
     std::array<uint8_t, 3> random;
@@ -389,7 +397,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
       }
       return;
     }
-    if (exchange->responder_address != config_.identity ||
+    if (!Ours(exchange->responder_address) ||
         exchange->initiator_address == config_.identity ||
         frame.source != MachineOf(exchange->initiator_address)) {
       return;

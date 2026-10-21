@@ -50,14 +50,16 @@ struct Pair {
     right = Make(b, ba);
   }
 
-  std::unique_ptr<Associations> Make(KeyStore& keys, Address address,
-                                     std::array<uint8_t, 4> reason = {},
-                                     bool sequence_zero = false) {
+  std::unique_ptr<Associations> Make(
+      KeyStore& keys, Address address, std::array<uint8_t, 4> reason = {},
+      bool sequence_zero = false,
+      std::optional<CrossPlatform> cross_platform = std::nullopt) {
     AssociationConfig config;
     config.identity = address;
     config.broadcast = broadcast;
     config.teardown_reason = reason;
     config.sequence_zero = sequence_zero;
+    config.cross_platform = cross_platform;
     config.freshness_time = [] { return uint64_t(100); };
     config.metadata = MakeMetadata(0x10203040, 0x01020304, 2, 0, 1234, 1);
     config.credential = [&keys](const KeyId& id) -> std::optional<Key> {
@@ -488,6 +490,86 @@ TEST_CASE("Simultaneous secure connect keeps the larger MAC as the initiator",
   CHECK(exchange->response);
   pair.right->Receive(answer[0], 101);
   CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+}
+
+TEST_CASE(
+    "A secure request is answered when the MAC of the XNADDR it targets is "
+    "this console's",
+    "[net][secure][association]") {
+  Pair other;
+  REQUIRE(other.left->Connect(Identity(3), other.id, 100));
+  auto request = other.left->TakeOutbound().at(0);
+  std::copy_n(other.ba.begin() + 10, 6, request.destination.begin());
+  other.right->Receive(request, 100);
+  CHECK(other.right->TakeOutbound().empty());
+
+  Pair pair;
+  // Splinter Cell: Conviction hosts put the first four characters of their
+  // dotted IPs in place of the IPs.
+  auto target = pair.ba;
+  std::copy_n("127.0.0.", 8, target.begin());
+  REQUIRE(pair.left->Connect(target, pair.id, 100));
+  pair.Pump();
+  CHECK(pair.left->Status(target, pair.id) == AssociationStatus::Established);
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+  REQUIRE(pair.left->Send(target, pair.id, Data(), 101));
+  pair.right->TakeEvents();
+  pair.Transfer(*pair.left, *pair.right, 101);
+  auto events = pair.right->TakeEvents();
+  REQUIRE(events.size() == 1);
+  CHECK(events[0].peer == pair.aa);
+  REQUIRE(pair.right->Send(pair.aa, pair.id, Data(), 102));
+  pair.left->TakeEvents();
+  pair.Transfer(*pair.right, *pair.left, 102);
+  events = pair.left->TakeEvents();
+  REQUIRE(events.size() == 1);
+  CHECK(events[0].peer == target);
+}
+
+TEST_CASE(
+    "A cross-platform secure request is answered when the IP and MAC of the "
+    "XNADDR it targets are this console's",
+    "[net][secure][association]") {
+  Pair pair;
+  auto id = pair.id;
+  id[0] |= SystemLinkKeyType(true);
+  pair.a[id] = pair.key;
+  pair.b[id] = pair.key;
+  constexpr uint32_t kLeftIp = 0xC0A8010A, kRightIp = 0xC0A80114,
+                     kMask = 0xFFFFFF00;
+  auto at = [](Address address, uint32_t ip) {
+    for (size_t i = 0; i < 4; ++i) {
+      address[i] = uint8_t(ip >> (24 - 8 * i));
+    }
+    return address;
+  };
+  auto aa = at(pair.aa, kLeftIp), ba = at(pair.ba, kRightIp);
+  auto left = pair.Make(pair.a, aa, {}, false, CrossPlatform{kLeftIp, kMask});
+  auto right = pair.Make(pair.b, ba, {}, false, CrossPlatform{kRightIp, kMask});
+  REQUIRE(left->Connect(ba, id, 100));
+  auto request = left->TakeOutbound().at(0);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, id, pair.key);
+  auto exchange = DecodeExchange(registration, id, request.payload);
+  REQUIRE(exchange);
+  auto deliver = [&](const Address& target) {
+    exchange->responder_address = target;
+    auto payload = EncodeExchange(registration, *exchange);
+    REQUIRE(payload);
+    auto frame = request;
+    frame.payload.assign(payload->begin(), payload->end());
+    right->Receive(frame, 100);
+    return right->TakeOutbound().size();
+  };
+  auto target = ba;
+  target[3] = 30;
+  CHECK(deliver(target) == 0);
+  target = ba;
+  target[10] ^= 1;
+  CHECK(deliver(target) == 0);
+  target = ba;
+  target[4] = 1;
+  CHECK(deliver(target) == 1);
 }
 
 TEST_CASE(

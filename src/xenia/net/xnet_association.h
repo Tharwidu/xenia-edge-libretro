@@ -79,6 +79,9 @@ class Associations {
 
   Mac MachineOf(const Address& address) const;
   bool SystemLinkKey(const KeyId& id) const;
+  // Whether |address| names this console by its MAC and for cross-platform
+  // System Link also by its IP.
+  bool Ours(const Address& address) const;
   uint32_t NewSpi();
   uint64_t NewFreshness();
   bool Emit(Mac destination, std::vector<uint8_t> payload,
