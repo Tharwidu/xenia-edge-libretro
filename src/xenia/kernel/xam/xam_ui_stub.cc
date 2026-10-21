@@ -533,20 +533,6 @@ dword_result_t XamShowCommunitySessionsUI_entry(unknown_t r3, unknown_t r4) {
 }
 DECLARE_XAM_EXPORT1(XamShowCommunitySessionsUI, kNone, kStub);
 
-dword_result_t XamSetDashContext_entry(dword_t value,
-                                       const ppc_context_t& ctx) {
-  ctx->kernel_state->dash_context_ = value;
-  kernel_state()->BroadcastNotification(kXNotificationSystemDashContextChanged,
-                                        0);
-  return 0;
-}
-DECLARE_XAM_EXPORT1(XamSetDashContext, kNone, kImplemented);
-
-dword_result_t XamGetDashContext_entry(const ppc_context_t& ctx) {
-  return ctx->kernel_state->dash_context_;
-}
-DECLARE_XAM_EXPORT1(XamGetDashContext, kNone, kImplemented);
-
 dword_result_t XamShowMarketplaceUIEx_entry(dword_t user_index, dword_t ui_type,
                                             qword_t offer_id,
                                             dword_t offer_type,
@@ -664,6 +650,42 @@ void RegisterUIExports(xe::cpu::ExportResolver* export_resolver,
                        xe::kernel::KernelState* kernel_state) {
   // Individual exports self-register via the DECLARE_XAM_EXPORT macros above.
 }
+
+// Upstream moved these into xam_ui.cc after the September merge. No dialog
+// can be shown headless, so each returns what upstream does with none.
+void XamShowNuiDirtyDiscErrorUI_entry(dword_t tracking_id) {}
+DECLARE_XAM_EXPORT1(XamShowNuiDirtyDiscErrorUI, kUI, kStub);
+
+dword_result_t XamShowGoldUpgradeUI_entry(dword_t user_index, dword_t unk,
+                                          dword_t title_id) {
+  return X_ERROR_FUNCTION_FAILED;
+}
+DECLARE_XAM_EXPORT1(XamShowGoldUpgradeUI, kUI, kStub);
+
+dword_result_t XamShowMultiplayerUpgradeUI_entry(dword_t user_index) {
+  return XamShowGoldUpgradeUI_entry(user_index, 6, kernel_state()->title_id());
+}
+DECLARE_XAM_EXPORT1(XamShowMultiplayerUpgradeUI, kUI, kImplemented);
+
+dword_result_t XamShowNuiTroubleshooterUI_entry(dword_t user_index,
+                                                dword_t tracking_id,
+                                                dword_t flags) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiTroubleshooterUI, kNone, kStub);
+
+dword_result_t XamShowNuiHardwareRequiredUI_entry(unknown_t unk1) {
+  if (unk1 != 0) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return XamShowNuiTroubleshooterUI_entry(0xff, 0, 0x400000);
+}
+DECLARE_XAM_EXPORT1(XamShowNuiHardwareRequiredUI, kNone, kImplemented);
+
+dword_result_t XamShowNuiGuideUI_entry(unknown_t tracking_id, unknown_t unk2) {
+  return X_ERROR_ACCESS_DENIED;
+}
+DECLARE_XAM_EXPORT1(XamShowNuiGuideUI, kNone, kStub);
 
 }  // namespace xam
 }  // namespace kernel

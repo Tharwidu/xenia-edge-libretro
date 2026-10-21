@@ -45,7 +45,6 @@ target_link_libraries(xenia-libretro PRIVATE
   xenia-ui
   xenia-ui-vulkan
   xenia-vfs
-  aes_128
   capstone
   fmt
   dxbc
