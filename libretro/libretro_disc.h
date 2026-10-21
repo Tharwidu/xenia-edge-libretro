@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include "libretro.h"
 
@@ -54,6 +55,11 @@ void SetAutomatic(bool enabled);
 // retry is set when the disc returned last time was rejected.
 std::filesystem::path Resolve(uint32_t disc_number, bool retry,
                               uint32_t title_id);
+
+// While a request is parked on the frontend, a line for the on-screen
+// message every ten seconds, empty otherwise - without it the title just sits
+// on its loading screen. Call from the frontend thread.
+std::string TakeNotice();
 
 // Wakes a request parked on the frontend so the emulator can tear down, and
 // makes later requests return nothing. Call before shutting the emulator

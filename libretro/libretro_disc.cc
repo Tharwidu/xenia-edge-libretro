@@ -5,6 +5,8 @@
 
 #include "libretro_disc.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +42,8 @@ bool automatic = true;
 bool ejected = false;
 // A request is parked waiting for the frontend to close the tray.
 uint32_t pending_disc = 0;
+// When TakeNotice last reported the parked request.
+std::chrono::steady_clock::time_point notice_shown;
 bool delivered = false;
 // The frontend swapped discs while no request was pending.
 bool inserted_unconsumed = false;
@@ -186,16 +190,72 @@ const std::regex& DiscPattern() {
   return pattern;
 }
 
-// Candidates for disc N next to `base`: swap the number in the nearest
-// "(Disc k)" path component, then either take that file or, when the match
-// was a folder above base, list the folder standing where base's own folder
-// does (GOD packages name their header by hash, which differs per disc).
+// The number in a "(Disc N)" match; 0 when it is not a plausible one.
+uint32_t DiscNumberOf(const std::smatch& m) {
+  const std::string digits = m[1].str();
+  return digits.size() <= 2 ? uint32_t(std::stoul(digits)) : 0;
+}
+
+// The title a disc name gives before its "(Disc N)": bracketed tags dropped,
+// case and spacing folded, so "Game (World) (En,Fr) " and "Game " agree.
+std::string TitleKey(const std::string& prefix) {
+  std::string key;
+  int depth = 0;
+  bool space = false;
+  for (char c : prefix) {
+    if (c == '(' || c == '[') {
+      ++depth;
+    } else if ((c == ')' || c == ']') && depth) {
+      --depth;
+    } else if (!depth) {
+      if (std::isspace(static_cast<unsigned char>(c))) {
+        space = !key.empty();
+      } else {
+        if (space) key += ' ';
+        space = false;
+        key += char(std::tolower(static_cast<unsigned char>(c)));
+      }
+    }
+  }
+  return key;
+}
+
+// Candidates for disc N next to `base`, closest first; every one is still
+// judged by its probe. The nearest "(Disc k)" path component names the set.
+// Its siblings are, in order: the same name with the number swapped; entries
+// beside it with the same text before "(Disc" and disc N, whatever follows -
+// Redump names one title's discs differently ("(Disc 1) (Install)",
+// "(Disc 2) (Play)"); then entries whose title agrees once region and
+// language tags are dropped. A sibling file is taken as is, so formats may
+// mix: an install disc has no executable and cannot be made into GOD, so a
+// GOD play disc commonly sits beside an ISO install disc. A sibling folder is
+// listed where base's own folder stands (GOD packages name their header by
+// hash, which differs per disc) and at its top level. Last come the other
+// headers in a GOD header's own folder: packages copied the console's way
+// share one <title id>/00007000 folder and have no disc number in any name.
 std::vector<std::filesystem::path> SiblingCandidates(
     const std::filesystem::path& base, uint32_t disc) {
   std::vector<std::filesystem::path> out;
+  std::error_code ec;
+  auto add = [&out](const std::filesystem::path& candidate) {
+    if (std::find(out.begin(), out.end(), candidate) == out.end()) {
+      out.push_back(candidate);
+    }
+  };
+  auto add_files_in = [&](const std::filesystem::path& dir,
+                          const std::filesystem::path& skip) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (entry.is_regular_file(ec) && entry.path() != skip) {
+        files.push_back(entry.path());
+      }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& file : files) add(file);
+  };
+
   std::filesystem::path p = base;
   std::filesystem::path rel;
-  std::error_code ec;
   for (int depth = 0; depth < 6 && p.has_parent_path() &&
                       p != p.parent_path();
        ++depth) {
@@ -210,26 +270,50 @@ std::vector<std::filesystem::path> SiblingCandidates(
                                         m.position(0) + m.length(0) -
                                             m.position(1) - m.length(1)) +
                             m.suffix().str();
-      std::filesystem::path sibling = p.parent_path() / xe::to_path(swapped);
-      if (rel.empty()) {
-        if (std::filesystem::is_regular_file(sibling, ec)) {
-          out.push_back(sibling);
+      std::vector<std::filesystem::path> siblings = {
+          p.parent_path() / xe::to_path(swapped)};
+      std::vector<std::filesystem::path> same_prefix, same_title;
+      const std::string title = TitleKey(m.prefix().str());
+      for (const auto& entry :
+           std::filesystem::directory_iterator(p.parent_path(), ec)) {
+        const std::string other = utf8(entry.path().filename());
+        std::smatch o;
+        if (entry.path() == p || entry.path() == siblings[0] ||
+            !std::regex_search(other, o, DiscPattern()) ||
+            DiscNumberOf(o) != disc) {
+          continue;
         }
-      } else {
-        std::filesystem::path exact = sibling / rel;
-        if (std::filesystem::is_regular_file(exact, ec)) out.push_back(exact);
-        std::filesystem::path dir = sibling / rel.parent_path();
-        for (const auto& entry :
-             std::filesystem::directory_iterator(dir, ec)) {
-          if (entry.is_regular_file(ec) && entry.path() != exact) {
-            out.push_back(entry.path());
+        if (o.prefix().str() == m.prefix().str()) {
+          same_prefix.push_back(entry.path());
+        } else if (!title.empty() && TitleKey(o.prefix().str()) == title) {
+          same_title.push_back(entry.path());
+        }
+      }
+      std::sort(same_prefix.begin(), same_prefix.end());
+      std::sort(same_title.begin(), same_title.end());
+      siblings.insert(siblings.end(), same_prefix.begin(), same_prefix.end());
+      siblings.insert(siblings.end(), same_title.begin(), same_title.end());
+      for (const auto& sibling : siblings) {
+        if (std::filesystem::is_regular_file(sibling, ec)) {
+          add(sibling);
+        } else if (std::filesystem::is_directory(sibling, ec)) {
+          if (!rel.empty()) {
+            const std::filesystem::path exact = sibling / rel;
+            if (std::filesystem::is_regular_file(exact, ec)) add(exact);
+            add_files_in(sibling / rel.parent_path(), exact);
           }
+          add_files_in(sibling, {});
         }
       }
       break;
     }
     rel = rel.empty() ? p.filename() : p.filename() / rel;
     p = p.parent_path();
+  }
+
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(base);
+  if (header && header->content_header.is_magic_valid()) {
+    add_files_in(base.parent_path(), base);
   }
   return out;
 }
@@ -542,11 +626,14 @@ std::filesystem::path Resolve(uint32_t disc_number, bool retry,
   }
 
   DISC_LOG(retry ? RETRO_LOG_WARN : RETRO_LOG_INFO,
-           "Disc %u requested%s: insert it with the frontend's disc control "
-           "(eject, choose the disc, close the tray)\n",
-           disc_number, retry ? " and the last disc was rejected" : "");
+           "Disc %u requested%s, none found beside %s: insert it with the "
+           "frontend's disc control (eject, choose the disc, close the "
+           "tray)\n",
+           disc_number, retry ? " and the last disc was rejected" : "",
+           images.empty() ? "the content" : LabelFor(images[0]).c_str());
   pending_disc = disc_number;
   delivered = false;
+  notice_shown = {};
   while (true) {
     lock.unlock();
     kernel::GuestScheduler::WaitOnFence(fence);
@@ -561,6 +648,19 @@ std::filesystem::path Resolve(uint32_t disc_number, bool retry,
       return images[current_index];
     }
   }
+}
+
+std::string TakeNotice() {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!pending_disc) return {};
+  const auto now = std::chrono::steady_clock::now();
+  if (notice_shown != std::chrono::steady_clock::time_point{} &&
+      now - notice_shown < std::chrono::seconds(10)) {
+    return {};
+  }
+  notice_shown = now;
+  return "Game asks for Disc " + std::to_string(pending_disc) +
+         " - place it beside this disc or use Disc Control";
 }
 
 void Shutdown() {

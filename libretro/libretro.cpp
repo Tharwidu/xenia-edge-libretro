@@ -3037,6 +3037,12 @@ RETRO_API void retro_run(void) {
             pace_software_frame();
             update_video();
         }
+
+        const std::string disc_notice = xe::libretro_disc::TakeNotice();
+        if (!disc_notice.empty()) {
+            retro_message msg = {disc_notice.c_str(), 600};
+            core_state.environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+        }
     }
 
     // React to option changes
