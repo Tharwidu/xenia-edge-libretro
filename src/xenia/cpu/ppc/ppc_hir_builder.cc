@@ -89,6 +89,9 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   SCOPE_profile_cpu_f("cpu");
 
   Module* module = function->module();
+  if (frontend_->processor()->KeepsContextStores(module)) {
+    set_attributes(attributes() | FUNCTION_ATTRIB_KEEP_CONTEXT_STORES);
+  }
 
   function_ = function;
   start_address_ = function_->address();
@@ -124,7 +127,6 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   uint32_t end_address = function_->end_address();
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
-    trace_info_.dest_count = 0;
     uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
     auto opcode = LookupOpcode(code);
     auto& opcode_info = GetOpcodeInfo(opcode);
@@ -342,10 +344,6 @@ Value* PPCHIRBuilder::LoadLR() {
 void PPCHIRBuilder::StoreLR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, lr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 64;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCTR() {
@@ -355,10 +353,6 @@ Value* PPCHIRBuilder::LoadCTR() {
 void PPCHIRBuilder::StoreCTR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, ctr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 65;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCR() {
@@ -449,8 +443,9 @@ void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, Value* rhs,
   Value* eq = CompareEQ(lhs, rhs);
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 2, eq);
 
-  // Value* so = AllocValue(UINT8_TYPE);
-  // StoreContext(offsetof(PPCContext, cr) + (4 * n) + 3, so);
+  // A snapshot of XER[SO], so it cannot be resolved lazily at mfcr time.
+  StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
+               LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE));
 
   // TOOD(benvanik): trace CR.
 }
@@ -479,10 +474,6 @@ Value* PPCHIRBuilder::LoadFPSCR() {
 void PPCHIRBuilder::StoreFPSCR(Value* value) {
   assert_true(value->type == INT32_TYPE);
   StoreContext(offsetof(PPCContext, fpscr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 67;
-  trace_reg.value = value;
 }
 
 // Writes FX, FEX, VX and OX, the four bits CR1 mirrors. FEX needs the exception
@@ -549,8 +540,7 @@ static Value* FpIsSignalingNan(PPCHIRBuilder& f, Value* value) {
 }
 
 // VXSNAN is unconditional on PPC, and the host cannot be relied on for it: the
-// a64 sequences branch around the arithmetic when an operand is a NaN, so a
-// signalling operand may never reach an instruction that would signal.
+// a64 NaN walks quiet a signalling operand without a host exception.
 Value* PPCHIRBuilder::FpInvalidFromOperands(
     std::initializer_list<Value*> operands) {
   Value* any_snan = nullptr;
@@ -582,21 +572,16 @@ void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
 // operand finite and at least one of them denormal.
 Value* PPCHIRBuilder::SingleDenormalOperand(
     std::initializer_list<Value*> operands) {
-  Value* any_denormal = nullptr;
-  Value* any_nonfinite = nullptr;
+  Value* ops[3] = {nullptr, nullptr, nullptr};
+  int count = 0;
   for (Value* operand : operands) {
-    Value* magnitude = FpMagnitude(*this, operand);
-    // Subtracting one wraps a zero operand up to the top, which is what keeps
-    // zero from reading as denormal.
-    Value* is_denormal = CompareULT(Sub(magnitude, LoadConstantUint64(1)),
-                                    LoadConstantUint64(0x000FFFFFFFFFFFFFull));
-    Value* is_nonfinite =
-        CompareUGE(magnitude, LoadConstantUint64(0x7FF0000000000000ull));
-    any_denormal = any_denormal ? Or(any_denormal, is_denormal) : is_denormal;
-    any_nonfinite =
-        any_nonfinite ? Or(any_nonfinite, is_nonfinite) : is_nonfinite;
+    ops[count++] = operand;
   }
-  return And(any_denormal, IsFalse(any_nonfinite));
+  assert_true(count >= 1 && count <= 3);
+  for (; count < 3; ++count) {
+    ops[count] = ops[count - 1];
+  }
+  return DenormalQuirk(ops[0], ops[1], ops[2]);
 }
 
 Value* PPCHIRBuilder::ApplySingleDenormalOperand(Value* quirk, Value* result) {
@@ -728,15 +713,32 @@ void PPCHIRBuilder::CopyFPSCRToCR1() {
                And(Truncate(Shr(fpscr, 28), INT8_TYPE), LoadConstantInt8(1)));
 }
 
+// SO is bit 31, OV bit 30, CA bit 29, with no byte count modelled.
 Value* PPCHIRBuilder::LoadXER() {
   Value* v = Shl(ZeroExtend(LoadCA(), INT64_TYPE), 29);
-  // TODO(benvanik): construct with other flags; overflow, etc?
-  return v;
+  v = Or(v, Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_ov), INT8_TYPE),
+                           INT64_TYPE),
+                30));
+  return Or(v,
+            Shl(ZeroExtend(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE),
+                           INT64_TYPE),
+                31));
 }
 
 void PPCHIRBuilder::StoreXER(Value* value) {
-  // TODO(benvanik): use other fields? For now, just pull out CA.
   StoreCA(Truncate(And(Shr(value, 29), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_ov),
+               Truncate(And(Shr(value, 30), LoadConstantInt64(1)), INT8_TYPE));
+  StoreContext(offsetof(PPCContext, xer_so),
+               Truncate(And(Shr(value, 31), LoadConstantInt64(1)), INT8_TYPE));
+}
+
+void PPCHIRBuilder::StoreOV(Value* value) {
+  assert_true(value->type == INT8_TYPE);
+  StoreContext(offsetof(PPCContext, xer_ov), value);
+  // Sticky until mtxer or mcrxr clears it.
+  StoreContext(offsetof(PPCContext, xer_so),
+               Or(LoadContext(offsetof(PPCContext, xer_so), INT8_TYPE), value));
 }
 
 Value* PPCHIRBuilder::LoadCA() {
@@ -746,10 +748,6 @@ Value* PPCHIRBuilder::LoadCA() {
 void PPCHIRBuilder::StoreCA(Value* value) {
   assert_true(value->type == INT8_TYPE);
   StoreContext(offsetof(PPCContext, xer_ca), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 66;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadSAT() {
@@ -759,10 +757,6 @@ Value* PPCHIRBuilder::LoadSAT() {
 void PPCHIRBuilder::StoreSAT(Value* value) {
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 44;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
@@ -772,10 +766,6 @@ Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
 void PPCHIRBuilder::StoreGPR(uint32_t reg, Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, r) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
@@ -785,10 +775,6 @@ Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
 void PPCHIRBuilder::StoreFPR(uint32_t reg, Value* value) {
   assert_true(value->type == FLOAT64_TYPE);
   StoreContext(offsetof(PPCContext, f) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg + 32;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
@@ -798,10 +784,6 @@ Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
 void PPCHIRBuilder::StoreVR(uint32_t reg, Value* value) {
   assert_true(value->type == VEC128_TYPE);
   StoreContext(offsetof(PPCContext, v) + reg * 16, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 128 + reg;
-  trace_reg.value = value;
 }
 
 void PPCHIRBuilder::SetReturnAddress(Value* value) {

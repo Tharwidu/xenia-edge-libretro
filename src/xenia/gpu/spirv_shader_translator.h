@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -428,16 +429,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t interpreter_cf_instr_count;
     uint32_t texture_integer_scale_pad[2];
 
-    // Integer num_format on fixed textures. Each dword packs the scale needed
-    // to turn normalized host samples back into guest integer values.
-    // bits 0:3 = component_bits - 1
-    // bit 4 = signed
-    // bit 5 = unsigned-biased
-    // bit 24 = normalized
-    // Zero means no scale.
+    // Packed fixed texture conversion (see GetIntegerScaleBits).
+    // Every component occupies 6 bits in bits 0:23
+    //   bits 0:3 = component_bits - 1
+    //   bits 4:5 = xenos::TextureSign
+    // bit 24 = normalized num_format
+    // bit 26 = point sampled fetch constant
+    // Zero means no conversion.
     // Appended at the very tail (std140 uint4 [35]) so it disturbs neither the
     // xenos_draw.glsli tessellation offsets nor the interpreter [34] slot.
     uint32_t texture_integer_scale_bits[32];
+
+    // PA_SC_WINDOW_OFFSET the PsParamGen position needs added when the offset
+    // is carried in the EDRAM bases rather than the viewport.
+    // 0 when it's in the viewport.
+    float param_gen_window_offset[2];
+    uint32_t param_gen_window_offset_padding[2];
   };
 
   // xenos_draw.glsli reads these tessellation fields from the system constants
@@ -596,14 +603,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // a float24 mode, the shader reads gl_FragCoord.z, converts to float24, and
   // writes the result to gl_FragDepth - matching the substitute pixel shader
   // the DXBC backend uses when a guest draw has no pixel shader.
+  // input_modification is the modification of the pixel shader stood in for.
+  // Its inputs are declared without being read so the signature links with
+  // the stage before it.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
       Modification::DepthStencilMode depth_stencil_mode =
           Modification::DepthStencilMode::kNoModifiers,
-      bool zpd_total = false);
+      bool zpd_total = false, bool viz_survey = false,
+      uint64_t input_modification = 0);
   // FSI variant - specialized for one guest sample count instead of a host
   // depth / stencil mode.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
-      xenos::MsaaSamples fsi_msaa_samples);
+      xenos::MsaaSamples fsi_msaa_samples, bool viz_survey = false,
+      uint64_t input_modification = 0);
+  // The part of a pixel shader modification that decides its input signature,
+  // the interpolator count and point coordinates, in a canonical form.
+  static uint64_t GetPixelShaderInputModification(uint64_t modification);
 
   // Common functions useful not only for the translator, but also for EDRAM
   // emulation via conventional render targets.
@@ -694,6 +709,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     xenos::TextureFilter min_filter;
     xenos::TextureFilter mip_filter;
     xenos::AnisoFilter aniso_filter;
+    bool border_color_forced;
+    xenos::BorderColor forced_border_color;
 
     spv::Id variable;
   };
@@ -937,21 +954,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
   size_t FindOrAddTextureBinding(uint32_t fetch_constant,
                                  xenos::FetchOpDimension dimension,
                                  bool is_signed);
-  size_t FindOrAddSamplerBinding(uint32_t fetch_constant,
-                                 xenos::TextureFilter mag_filter,
-                                 xenos::TextureFilter min_filter,
-                                 xenos::TextureFilter mip_filter,
-                                 xenos::AnisoFilter aniso_filter);
+  size_t FindOrAddSamplerBinding(
+      uint32_t fetch_constant, xenos::TextureFilter mag_filter,
+      xenos::TextureFilter min_filter, xenos::TextureFilter mip_filter,
+      xenos::AnisoFilter aniso_filter,
+      std::optional<xenos::BorderColor> forced_border_color = std::nullopt);
   // `texture_parameters` need to be set up except for `sampler`, which will be
   // set internally, optionally doing linear interpolation between the an
   // existing value and the new one (the result location may be the same as for
-  // the first lerp endpoint, but not across signedness).
+  // the first lerp endpoint, but not across signedness). getBCF samples one
+  // image in both slots, with its black and white border samplers.
   void SampleTexture(spv::Builder::TextureParameters& texture_parameters,
                      spv::ImageOperandsMask image_operands_mask,
                      spv::Id image_unsigned, spv::Id image_signed,
-                     spv::Id sampler, spv::Id is_any_unsigned,
-                     spv::Id is_any_signed, spv::Id& result_unsigned_out,
-                     spv::Id& result_signed_out,
+                     spv::Id sampler_unsigned, spv::Id sampler_signed,
+                     spv::Id is_any_unsigned, spv::Id is_any_signed,
+                     spv::Id& result_unsigned_out, spv::Id& result_signed_out,
                      spv::Id lerp_factor = spv::NoResult,
                      spv::Id lerp_first_unsigned = spv::NoResult,
                      spv::Id lerp_first_signed = spv::NoResult);
@@ -1069,6 +1087,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   uint32_t GetCurrentDrawResolutionScaleY() const {
     return IsCurrentDrawScaleNative() ? 1 : draw_resolution_scale_y_;
   }
+  // Whether point sampled fetches at an interpolated coordinate pick the guest
+  // texel sampled at the guest pixel center, rather than at the host pixel.
+  bool IsGuestPixelCenterFetchNeeded() const;
 
   // For safety with different drivers (even though fragment shader interlock in
   // SPIR-V only has one control flow requirement - that both begin and end must
@@ -1087,6 +1108,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
   bool is_depth_only_fragment_shader_ = false;
+  bool is_viz_survey_fragment_shader_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 
@@ -1207,6 +1229,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantInterpreterUcodeBaseDwords,
     kSystemConstantInterpreterCfInstrCount,
     kSystemConstantTextureIntegerScaleBits,
+    kSystemConstantParamGenWindowOffset,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -1343,6 +1366,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_tfetch_gradients_v_;
   // float4[register_count()].
   spv::Id var_main_registers_;
+  // Components of registers 0-15, 4 bits per register, that still hold the
+  // interpolant they were initialized with.
+  uint64_t main_interpolators_unmodified_;
+  // float4 each, the interpolant at the guest pixel center minus at the host
+  // pixel, for IsGuestPixelCenterFetchNeeded.
+  std::array<spv::Id, xenos::kMaxInterpolators>
+      var_main_interpolator_guest_center_deltas_;
 
   // Guest instruction bisect, snapshotting a register to color 0.
   bool BisectTargetsCurrentShader() const;

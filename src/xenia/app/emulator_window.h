@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "xenia/app/game_library.h"
 #include "xenia/emulator.h"
@@ -33,6 +34,8 @@
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/xbox.h"
+
+class wxTimer;
 
 namespace xe {
 namespace app {
@@ -86,6 +89,10 @@ class EmulatorWindow {
 
   void OnEmulatorInitialized();
 
+  // Starts a new xenia process continuing this session with |args|, then
+  // |target| (UTF-8, empty for the game list). Returns whether it started.
+  bool SpawnEmulatorProcess(const std::vector<std::string>& args,
+                            const std::string& target);
   void LaunchTitleInNewProcess(const std::filesystem::path& path_to_file);
   xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file);
   void UpdateTitle();
@@ -93,6 +100,7 @@ class EmulatorWindow {
   void SetFullscreen(bool fullscreen);
   void ToggleFullscreen();
   void SetInitializingShaderStorage(bool initializing);
+  void SetCompilingShaders(bool compiling);
 
   void TakeScreenshot();
   void ExportScreenshot(const xe::ui::RawImage& image);
@@ -106,6 +114,9 @@ class EmulatorWindow {
   void ToggleControllerVibration();
   void FileOpen();
   void FileAddGames();
+  // Tells the user which XeFu file an original Xbox game was missing and where
+  // to put it.
+  void ShowMissingXeFuFile(const std::string& file);
 
   // Helper methods for updating cvars from config dialogs.
   void UpdateAntiAliasingCvar(gpu::CommandProcessor::SwapPostEffect effect);
@@ -167,6 +178,11 @@ class EmulatorWindow {
   // Registers a just-launched title in the library so games opened outside the
   // import flow still appear in the list.
   void AddLaunchedTitleToLibrary(uint32_t title_id, const std::string& name);
+  // Records the disc a title was launched from as its release's default and
+  // stamps the release as played. Empty when the library declined the disc.
+  std::optional<LibraryKey> RecordLaunchedDisc(
+      uint32_t title_id, const std::string& name,
+      const std::filesystem::path& path);
 
   void OnKeyDown(ui::KeyEvent& e);
   void OnMouseDown(const ui::MouseEvent& e);
@@ -217,6 +233,8 @@ class EmulatorWindow {
 
   std::string base_title_;
   bool initializing_shader_storage_ = false;
+  bool compiling_shaders_ = false;
+  std::unique_ptr<wxTimer> compiling_shaders_hide_timer_;
 
   ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
   ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
@@ -270,6 +288,11 @@ class EmulatorWindow {
   // Reapply the "render visible iff title open or fullscreen, game list
   // otherwise" invariant. Called on every relevant state change.
   void ApplyContentVisibility();
+  // Shows the game list, windowed at the default size, after a title stops or
+  // fails to launch.
+  void RestoreListWindow();
+  // Puts the game list back and says why a launch failed.
+  void OnLaunchFailed();
   // Tear down the running title on a non-guest thread and refresh the UI to
   // show the game list. Skips the user prompt — caller is responsible for
   // confirmation. Returns true if the title is being reset in-process, false

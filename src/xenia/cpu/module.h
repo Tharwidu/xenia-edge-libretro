@@ -51,6 +51,11 @@ class Module {
   Symbol::Status DefineFunction(Function* symbol);
   Symbol::Status DefineVariable(Symbol* symbol);
 
+  // Drops the symbol at |address| so the next declaration compiles the code
+  // there again. The old symbol stays owned here rather than being deleted,
+  // because code that is already running still points into it.
+  void ForgetSymbol(uint32_t address);
+
   const std::vector<uint32_t> GetAddressedFunctions();
   void ForEachFunction(std::function<void(Function*)> callback);
   void ForEachSymbol(size_t start_index, size_t end_index,

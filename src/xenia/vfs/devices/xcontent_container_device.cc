@@ -169,7 +169,7 @@ XContentContainerDevice::ContentDataFromHeader(
   if (name.empty()) {
     // Find first filled language and use it. It might be incorrect, but meh
     // until stfs support is done.
-    for (uint8_t i = 0; i < header.content_metadata.kNumLanguagesV2; i++) {
+    for (uint32_t i = 1; i <= header.content_metadata.kNumLanguagesV2; i++) {
       name = header.content_metadata.display_name((XLanguage)i);
       if (!name.empty()) {
         break;
@@ -180,6 +180,17 @@ XContentContainerDevice::ContentDataFromHeader(
   data.set_display_name(name);
 
   return data;
+}
+
+uint32_t XContentContainerDevice::LicenseMaskFromHeader(
+    const XContentContainerHeader& header) {
+  uint32_t final_license = 0;
+  for (uint8_t i = 0; i < license_count; i++) {
+    if (header.content_header.licenses[i].license_flags) {
+      final_license |= header.content_header.licenses[i].license_bits;
+    }
+  }
+  return final_license;
 }
 
 kernel::xam::XCONTENT_AGGREGATE_DATA XContentContainerDevice::content_header()

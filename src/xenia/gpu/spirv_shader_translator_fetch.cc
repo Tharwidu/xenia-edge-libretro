@@ -34,6 +34,14 @@ spv::Op DerivativeYOp() {
 }
 }  // namespace
 
+bool SpirvShaderTranslator::IsGuestPixelCenterFetchNeeded() const {
+  return is_pixel_shader() && !is_depth_only_fragment_shader_ &&
+         (GetCurrentDrawResolutionScaleX() > 1 ||
+          GetCurrentDrawResolutionScaleY() > 1) &&
+         (current_shader().point_fetch_coordinate_registers() &
+          GetModificationInterpolatorMask());
+}
+
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   if (BisectSkipsInstruction()) {
@@ -596,11 +604,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     case ucode::FetchOpcode::kTextureFetch:
       break;
     case ucode::FetchOpcode::kGetTextureBorderColorFrac:
-      // TODO(Triang3l): Bind a black texture with a white border to calculate
-      // the border color fraction (in the X component of the result).
-      assert_always();
-      EmitTranslationError("getBCF is unimplemented", false);
-      used_result_nonzero_components = 0;
+      // Cube maps don't use the border.
+      if (instr.dimension == xenos::FetchOpDimension::kCube) {
+        used_result_nonzero_components = 0;
+      }
       break;
     case ucode::FetchOpcode::kGetTextureComputedLod:
       break;
@@ -638,6 +645,29 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
   spv::Id result[] = {const_float_0_, const_float_0_, const_float_0_,
                       const_float_0_};
+  // Stores the needed components of the result.
+  auto store_result = [&]() {
+    spv::Id result_vector;
+    if (used_result_component_count > 1) {
+      id_vector_temp_.clear();
+      uint32_t result_components_remaining = used_result_components;
+      uint32_t result_component_index;
+      while (xe::bit_scan_forward(result_components_remaining,
+                                  &result_component_index)) {
+        result_components_remaining &= ~(UINT32_C(1) << result_component_index);
+        id_vector_temp_.push_back(result[result_component_index]);
+      }
+      result_vector = builder_->createCompositeConstruct(
+          type_float_vectors_[used_result_component_count - 1],
+          id_vector_temp_);
+    } else {
+      uint32_t result_component_index;
+      xe::bit_scan_forward(used_result_components, &result_component_index);
+      result_vector = result[result_component_index];
+    }
+    StoreResult(instr.result, result_vector);
+    BisectSnapshotAfterInstruction();
+  };
 
   if (instr.opcode == ucode::FetchOpcode::kGetTextureGradients) {
     // Doesn't need the texture, handle separately.
@@ -680,7 +710,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                               : derivative_function_x);
     }
   } else {
-    // kTextureFetch, kGetTextureComputedLod or kGetTextureWeights.
+    // kTextureFetch, kGetTextureComputedLod, kGetTextureWeights or
+    // kGetTextureBorderColorFrac.
+
+    // getBCF samples the texture twice, with a transparent black and an opaque
+    // white border in place of the unsigned and the signed sample. The
+    // difference is the share of the border.
+    bool get_border_color_frac =
+        instr.opcode == ucode::FetchOpcode::kGetTextureBorderColorFrac;
 
     // Whether to use gradients (implicit or explicit) for LOD calculation.
     bool use_computed_lod = TextureFetchUsesComputedLod(instr);
@@ -704,7 +741,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             ? xenos::FetchOpDimension::k2D
             : instr.dimension;
 
+    // Texel center snap instead of the epsilon (see CanSnapToTexelCenter).
+    bool point_snap = instr.CanSnapToTexelCenter(use_computed_lod);
+
     spv::Id sampler = spv::NoResult;
+    spv::Id sampler_signed = spv::NoResult;
     spv::Id image_2d_array_or_cube_unsigned = spv::NoResult;
     spv::Id image_2d_array_or_cube_signed = spv::NoResult;
     spv::Id image_3d_unsigned = spv::NoResult;
@@ -731,16 +772,31 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               ? xenos::TextureFilter::kLinear
               : instr.attributes.mip_filter,
           use_computed_lod ? instr.attributes.aniso_filter
-                           : xenos::AnisoFilter::kDisabled);
+                           : xenos::AnisoFilter::kDisabled,
+          get_border_color_frac
+              ? std::optional(xenos::BorderColor::k_ABGR_Black)
+              : std::nullopt);
+      size_t sampler_signed_index =
+          get_border_color_frac
+              ? FindOrAddSamplerBinding(
+                    fetch_constant_index, instr.attributes.mag_filter,
+                    instr.attributes.min_filter, instr.attributes.mip_filter,
+                    use_computed_lod ? instr.attributes.aniso_filter
+                                     : xenos::AnisoFilter::kDisabled,
+                    xenos::BorderColor::k_ABGR_White)
+              : sampler_index;
       xenos::FetchOpDimension dimension_2d_array_or_cube =
           instr.dimension == xenos::FetchOpDimension::k3DOrStacked
               ? xenos::FetchOpDimension::k2D
               : instr.dimension;
       size_t image_2d_array_or_cube_unsigned_index = FindOrAddTextureBinding(
           fetch_constant_index, dimension_2d_array_or_cube, false);
-      size_t image_2d_array_or_cube_signed_index = FindOrAddTextureBinding(
-          fetch_constant_index, dimension_2d_array_or_cube, true);
-      if (sampler_index == SIZE_MAX ||
+      size_t image_2d_array_or_cube_signed_index =
+          get_border_color_frac
+              ? image_2d_array_or_cube_unsigned_index
+              : FindOrAddTextureBinding(fetch_constant_index,
+                                        dimension_2d_array_or_cube, true);
+      if (sampler_index == SIZE_MAX || sampler_signed_index == SIZE_MAX ||
           image_2d_array_or_cube_unsigned_index == SIZE_MAX ||
           image_2d_array_or_cube_signed_index == SIZE_MAX) {
         bindings_set_up = false;
@@ -750,8 +806,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
         image_3d_unsigned_index = FindOrAddTextureBinding(
             fetch_constant_index, xenos::FetchOpDimension::k3DOrStacked, false);
-        image_3d_signed_index = FindOrAddTextureBinding(
-            fetch_constant_index, xenos::FetchOpDimension::k3DOrStacked, true);
+        image_3d_signed_index =
+            get_border_color_frac
+                ? image_3d_unsigned_index
+                : FindOrAddTextureBinding(fetch_constant_index,
+                                          xenos::FetchOpDimension::k3DOrStacked,
+                                          true);
         if (image_3d_unsigned_index == SIZE_MAX ||
             image_3d_signed_index == SIZE_MAX) {
           bindings_set_up = false;
@@ -765,6 +825,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       }
       sampler = builder_->createLoad(sampler_bindings_[sampler_index].variable,
                                      spv::NoPrecision);
+      sampler_signed =
+          sampler_signed_index != sampler_index
+              ? builder_->createLoad(
+                    sampler_bindings_[sampler_signed_index].variable,
+                    spv::NoPrecision)
+              : sampler;
       const TextureBinding& image_2d_array_or_cube_unsigned_binding =
           texture_bindings_[image_2d_array_or_cube_unsigned_index];
       image_2d_array_or_cube_unsigned = builder_->createLoad(
@@ -813,7 +879,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // multiplication in texture sampling apparently round differently, so
       // `mul` gives a value that would be floored as expected, but the
       // left/upper pixel is still sampled instead.
-      constexpr float kRoundingOffset = 1.5f / 1024.0f;
+      const float kRoundingOffset = point_snap ? 0.0f : kTextureCoordEpsilon;
       switch (coordinate_dimension) {
         case xenos::FetchOpDimension::k1D:
           offset_values[0] = instr.attributes.offset_x + kRoundingOffset;
@@ -920,7 +986,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // A promoted tfetch1D always needs the size - the interpretation is
           // selected at runtime, and the width feeds the wide 1D remap.
           if (instr.dimension == xenos::FetchOpDimension::k1D ||
-              instr.attributes.unnormalized_coordinates) {
+              instr.attributes.unnormalized_coordinates || point_snap) {
             size_needed_components |= 0b0011;
           }
           break;
@@ -1119,7 +1185,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       spv::Id selected_mip_level = spv::NoResult;
       spv::Id selected_mip_locked = spv::NoResult;
       bool selected_mip_grid_possible =
-          instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+          (instr.opcode == ucode::FetchOpcode::kTextureFetch ||
+           get_border_color_frac) &&
           instr.dimension == xenos::FetchOpDimension::k2D &&
           instr.attributes.unnormalized_coordinates;
       if (selected_mip_grid_possible) {
@@ -1265,6 +1332,50 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                            &coordinate_component_index);
       coordinates[coordinate_component_index] = coordinates_operand;
     }
+    // How much the coordinates change from the host pixel to the guest pixel
+    // center if they're an unmodified interpolant (see
+    // StartFragmentShaderInMain), for picking the guest texel in point sampled
+    // fetches.
+    spv::Id guest_center_deltas[2] = {};
+    const InstructionOperand& coordinates_operand_info = instr.operands[0];
+    bool coordinates_interpolated =
+        point_snap &&
+        coordinates_operand_info.storage_source ==
+            InstructionStorageSource::kRegister &&
+        coordinates_operand_info.storage_addressing_mode ==
+            InstructionStorageAddressingMode::kAbsolute &&
+        coordinates_operand_info.storage_index < xenos::kMaxInterpolators &&
+        var_main_interpolator_guest_center_deltas_[coordinates_operand_info
+                                                       .storage_index] !=
+            spv::NoResult &&
+        !coordinates_operand_info.is_absolute_value;
+    for (uint32_t i = 0; coordinates_interpolated && i < 2; ++i) {
+      SwizzleSource component = coordinates_operand_info.GetComponent(i);
+      coordinates_interpolated = component >= SwizzleSource::k0 ||
+                                 ((main_interpolators_unmodified_ >>
+                                   (coordinates_operand_info.storage_index * 4 +
+                                    uint32_t(component))) &
+                                  1);
+    }
+    if (coordinates_interpolated) {
+      spv::Id guest_center_delta = builder_->createLoad(
+          var_main_interpolator_guest_center_deltas_[coordinates_operand_info
+                                                         .storage_index],
+          spv::NoPrecision);
+      for (uint32_t i = 0; i < 2; ++i) {
+        SwizzleSource component = coordinates_operand_info.GetComponent(i);
+        if (component >= SwizzleSource::k0) {
+          guest_center_deltas[i] = const_float_0_;
+          continue;
+        }
+        guest_center_deltas[i] = builder_->createCompositeExtract(
+            guest_center_delta, type_float_, uint32_t(component));
+        if (coordinates_operand_info.is_negated) {
+          guest_center_deltas[i] = builder_->createUnaryOp(
+              spv::OpFNegate, type_float_, guest_center_deltas[i]);
+        }
+      }
+    }
 
     // Resolution scale doesn't need reverting for texture weights - weights are
     // calculated from fractional parts of coordinates which are
@@ -1301,7 +1412,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         result[coordinate_component_index] = result_component;
       }
     } else {
-      // kTextureFetch or kGetTextureComputedLod.
+      // kTextureFetch, kGetTextureComputedLod or kGetTextureBorderColorFrac.
+
+      // The original X coordinate, for wide 1D textures that need it in texels
+      // without the loss of precision caused by normalization.
+      spv::Id coordinate_x_original = coordinates[0];
 
       // Normalize the XY coordinates, and apply the offset. When the texture
       // is resolution-scaled, size has already been scaled up to host texels
@@ -1411,9 +1526,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                                      row_width_float)),
               builder_->makeFloatConstant(float(xenos::kTexture1DWideMaxRows)));
 
-          // linear_x = coord * original_width (denormalize to texel space)
-          spv::Id linear_x = builder_->createNoContractionBinOp(
-              spv::OpFMul, type_float_, coordinates[0], original_width_float);
+          // linear_x = original coordinate in texels + offset.
+          spv::Id linear_x = coordinate_x_original;
+          if (!instr.attributes.unnormalized_coordinates) {
+            linear_x = builder_->createNoContractionBinOp(
+                spv::OpFMul, type_float_, linear_x, original_width_float);
+          }
+          if (offset_values[0]) {
+            linear_x = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, linear_x,
+                builder_->makeFloatConstant(offset_values[0]));
+          }
 
           // row_index = floor(linear_x / row_width)
           spv::Id row_index = builder_->createUnaryBuiltinCall(
@@ -1754,8 +1877,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                       swizzled_signs_all_signed);
         }
       } else {
-        // kTextureFetch.
-        assert_true(instr.opcode == ucode::FetchOpcode::kTextureFetch);
+        // kTextureFetch or kGetTextureBorderColorFrac.
+        assert_true(instr.opcode == ucode::FetchOpcode::kTextureFetch ||
+                    get_border_color_frac);
 
         // Extract the signedness for each component of the swizzled result, and
         // get which bindings (unsigned and signed) are needed.
@@ -1766,7 +1890,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id const_uint_sign_signed =
             builder_->makeUintConstant(uint32_t(xenos::TextureSign::kSigned));
-        {
+        if (get_border_color_frac) {
+          // Both border colors are always sampled.
+          is_all_signed = builder_->makeBoolConstant(false);
+          is_any_signed = builder_->makeBoolConstant(true);
+        } else {
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;
           while (xe::bit_scan_forward(result_remaining_components,
@@ -2081,6 +2209,118 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(kSystemConstantTextureIntegerScaleBits));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int32_t(fetch_constant_index >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int32_t(fetch_constant_index & 3)));
+        spv::Id integer_scale_bits_packed = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform,
+                                        uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        if (point_snap) {
+          // Point sampled fetch constant uses the texel center in host texels
+          // for a resolution scaled texture (the size already is) instead of
+          // the epsilon. Branching as the snapping is only needed for point
+          // sampled fetch constants and is uniform.
+          spv::Id snap = builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                  builder_->makeUintConstant(UINT32_C(1) << 26)),
+              const_uint_0_);
+          SpirvBuilder::IfBuilder if_snap(
+              snap, spv::SelectionControlDontFlattenMask, *builder_);
+          spv::Id coordinates_snapped[2];
+          for (uint32_t i = 0; i < 2; ++i) {
+            spv::Id snapped = builder_->createUnaryBuiltinCall(
+                type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+                builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
+                                                   coordinates[i], size[i]));
+            if (guest_center_deltas[i] != spv::NoResult) {
+              // Stay within the host texels of the guest texel that the guest
+              // pixel center samples, keeping the host texel of this host
+              // pixel within it for detail if the texture is
+              // resolution-scaled.
+              uint32_t axis_texture_scale =
+                  i ? draw_resolution_scale_y_ : draw_resolution_scale_x_;
+              spv::Id texture_scale = const_float_1_;
+              if (is_texture_resolved != spv::NoResult &&
+                  axis_texture_scale > 1) {
+                texture_scale = builder_->createTriOp(
+                    spv::OpSelect, type_float_, is_texture_resolved,
+                    builder_->makeFloatConstant(float(axis_texture_scale)),
+                    const_float_1_);
+              }
+              // The host texel at the guest pixel center, rounded like the one
+              // of this host pixel so they agree when the delta is 0.
+              spv::Id guest_center_host_texel =
+                  builder_->createNoContractionBinOp(
+                      spv::OpFMul, type_float_,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFAdd, type_float_, coordinates[i],
+                          guest_center_deltas[i]),
+                      size[i]);
+              if (texture_scale != const_float_1_ && offset_values[i]) {
+                // The offset was applied in host texels, while the guest
+                // steps by guest texels.
+                guest_center_host_texel = builder_->createNoContractionBinOp(
+                    spv::OpFAdd, type_float_, guest_center_host_texel,
+                    builder_->createNoContractionBinOp(
+                        spv::OpFMul, type_float_,
+                        builder_->makeFloatConstant(offset_values[i]),
+                        builder_->createNoContractionBinOp(
+                            spv::OpFSub, type_float_, texture_scale,
+                            const_float_1_)));
+              }
+              spv::Id guest_texel_host_texel_first =
+                  builder_->createNoContractionBinOp(
+                      spv::OpFMul, type_float_,
+                      builder_->createUnaryBuiltinCall(
+                          type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+                          builder_->createNoContractionBinOp(
+                              spv::OpFDiv, type_float_,
+                              builder_->createUnaryBuiltinCall(
+                                  type_float_, ext_inst_glsl_std_450_,
+                                  GLSLstd450Floor, guest_center_host_texel),
+                              texture_scale)),
+                      texture_scale);
+              snapped = builder_->createTriBuiltinCall(
+                  type_float_, ext_inst_glsl_std_450_, GLSLstd450FClamp,
+                  snapped, guest_texel_host_texel_first,
+                  builder_->createNoContractionBinOp(
+                      spv::OpFAdd, type_float_, guest_texel_host_texel_first,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFSub, type_float_, texture_scale,
+                          const_float_1_)));
+            }
+            coordinates_snapped[i] = builder_->createNoContractionBinOp(
+                spv::OpFDiv, type_float_,
+                builder_->createNoContractionBinOp(
+                    spv::OpFAdd, type_float_, snapped,
+                    builder_->makeFloatConstant(0.5f)),
+                size[i]);
+          }
+          if_snap.makeBeginElse();
+          spv::Id coordinates_epsilon[2];
+          for (uint32_t i = 0; i < 2; ++i) {
+            coordinates_epsilon[i] = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, coordinates[i],
+                builder_->createNoContractionBinOp(
+                    spv::OpFDiv, type_float_,
+                    builder_->makeFloatConstant(kTextureCoordEpsilon),
+                    size[i]));
+          }
+          if_snap.makeEndIf();
+          for (uint32_t i = 0; i < 2; ++i) {
+            coordinates[i] = if_snap.createMergePhi(coordinates_snapped[i],
+                                                    coordinates_epsilon[i]);
+          }
+        }
+
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
             use_lod_bias ? spv::ImageOperandsBiasMask
@@ -2116,7 +2356,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 type_float3_, id_vector_temp_);
             SampleTexture(texture_parameters, image_operands_mask,
                           image_3d_unsigned, image_3d_signed, sampler,
-                          is_any_unsigned, is_any_signed,
+                          sampler_signed, is_any_unsigned, is_any_signed,
                           sample_result_unsigned_3d, sample_result_signed_3d);
           }
           if_data_is_3d.makeBeginElse();
@@ -2249,7 +2489,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             SampleTexture(
                 texture_parameters, image_operands_mask,
                 image_2d_array_or_cube_unsigned, image_2d_array_or_cube_signed,
-                sampler, is_any_unsigned, is_any_signed,
+                sampler, sampler_signed, is_any_unsigned, is_any_signed,
                 sample_result_unsigned_stacked, sample_result_signed_stacked);
             // Sample the second layer if linear filtering is potentially needed
             // (conditionally or unconditionally, depending on whether the
@@ -2286,13 +2526,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   layer_coordinate);
               spv::Id sample_result_unsigned_stacked_filtered;
               spv::Id sample_result_signed_stacked_filtered;
-              SampleTexture(
-                  texture_parameters, image_operands_mask,
-                  image_2d_array_or_cube_unsigned,
-                  image_2d_array_or_cube_signed, sampler, is_any_unsigned,
-                  is_any_signed, sample_result_unsigned_stacked_filtered,
-                  sample_result_signed_stacked_filtered, layer_lerp_factor,
-                  sample_result_unsigned_stacked, sample_result_signed_stacked);
+              SampleTexture(texture_parameters, image_operands_mask,
+                            image_2d_array_or_cube_unsigned,
+                            image_2d_array_or_cube_signed, sampler,
+                            sampler_signed, is_any_unsigned, is_any_signed,
+                            sample_result_unsigned_stacked_filtered,
+                            sample_result_signed_stacked_filtered,
+                            layer_lerp_factor, sample_result_unsigned_stacked,
+                            sample_result_signed_stacked);
               if (vol_filter_is_linear != spv::NoResult) {
                 // Get the actual build point after the SampleTexture call for
                 // phi.
@@ -2352,9 +2593,34 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
           SampleTexture(texture_parameters, image_operands_mask,
                         image_2d_array_or_cube_unsigned,
-                        image_2d_array_or_cube_signed, sampler, is_any_unsigned,
-                        is_any_signed, sample_result_unsigned,
+                        image_2d_array_or_cube_signed, sampler, sampler_signed,
+                        is_any_unsigned, is_any_signed, sample_result_unsigned,
                         sample_result_signed);
+        }
+
+        if (get_border_color_frac) {
+          // The samples differ by the border share in components with texture
+          // data and not at all in constant ones.
+          spv::Id border_difference = builder_->createNoContractionBinOp(
+              spv::OpFSub, type_float4_, sample_result_signed,
+              sample_result_unsigned);
+          spv::Id border_difference_components[4];
+          for (uint32_t i = 0; i < 4; ++i) {
+            border_difference_components[i] = builder_->createCompositeExtract(
+                border_difference, type_float_, i);
+          }
+          result[0] = builder_->createBinBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax,
+              builder_->createBinBuiltinCall(
+                  type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax,
+                  border_difference_components[0],
+                  border_difference_components[1]),
+              builder_->createBinBuiltinCall(
+                  type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax,
+                  border_difference_components[2],
+                  border_difference_components[3]));
+          store_result();
+          return;
         }
 
         // Swizzle the result components manually if needed, to `result`.
@@ -2524,6 +2790,34 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             }
             // Unsigned biased.
             builder_->setBuildPoint(&block_sign_unsigned_biased);
+            // Decode as signed offset binary: (n - 2^(w - 1)) / (2^(w - 1) - 1)
+            // This maps 128 to zero for 8 bit components, avoiding the 1/255
+            // bias of 2 * u - 1. Leave the result unclamped until num_format is
+            // applied, and keep 2 * u - 1 when the width is unknown or 1 bit.
+            spv::Id biased_width_minus_1 = builder_->createTriOp(
+                spv::OpBitFieldUExtract, type_uint_, integer_scale_bits_packed,
+                builder_->makeUintConstant(6 * result_component_index),
+                builder_->makeUintConstant(4));
+            spv::Id biased_half = builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float_,
+                builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_,
+                                      builder_->makeUintConstant(1),
+                                      biased_width_minus_1));
+            spv::Id biased_exact = builder_->createNoContractionBinOp(
+                spv::OpFSub, type_float_,
+                builder_->createNoContractionBinOp(
+                    spv::OpFMul, type_float_, sample_result_component_unsigned,
+                    builder_->createNoContractionBinOp(
+                        spv::OpFSub, type_float_,
+                        builder_->createNoContractionBinOp(
+                            spv::OpFMul, type_float_, biased_half,
+                            const_float_2),
+                        const_float_1_)),
+                biased_half);
+            biased_exact = builder_->createNoContractionBinOp(
+                spv::OpFDiv, type_float_, biased_exact,
+                builder_->createNoContractionBinOp(
+                    spv::OpFSub, type_float_, biased_half, const_float_1_));
             spv::Id sample_result_component_unsigned_biased =
                 builder_->createNoContractionBinOp(
                     spv::OpFMul, type_float_, sample_result_component_unsigned,
@@ -2533,6 +2827,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     spv::OpFAdd, type_float_,
                     sample_result_component_unsigned_biased,
                     const_float_minus_1);
+            sample_result_component_unsigned_biased = builder_->createTriOp(
+                spv::OpSelect, type_float_,
+                builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                                      biased_width_minus_1, const_uint_0_),
+                biased_exact, sample_result_component_unsigned_biased);
             builder_->createBranch(&block_sign_merge);
             // Gamma.
             builder_->setBuildPoint(&block_sign_gamma_start);
@@ -2567,32 +2866,20 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // num_format is applied after signs/gamma. Fixed textures sample as
-        // normalized host values, so integer num_format scales them back to
-        // guest integer units here. Bit 24 requests rounding for normalized
-        // unsigned values.
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(
-            builder_->makeIntConstant(kSystemConstantTextureIntegerScaleBits));
-        id_vector_temp_.push_back(
-            builder_->makeIntConstant(int32_t(fetch_constant_index >> 2)));
-        id_vector_temp_.push_back(
-            builder_->makeIntConstant(int32_t(fetch_constant_index & 3)));
-        spv::Id integer_scale_bits_packed = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassUniform,
-                                        uniform_system_constants_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
+        // Apply num_format after signs/gamma.
         id_vector_temp_.clear();
         id_vector_temp_.insert(id_vector_temp_.cend(), result, result + 4);
         spv::Id integer_scale_result =
             builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
         {
-          // Uniform early out. Zero means leave the sample alone. Only integer
-          // num_format on fixed textures has scale bits.
+          // Uniform early out. Zero means leave the sample alone.
+          // Bit 26 is the coordinate snap, not a scale.
           spv::Id integer_scale_active = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
-              builder_->makeUintConstant(0));
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                  builder_->makeUintConstant((UINT32_C(1) << 26) - 1)),
+              const_uint_0_);
           SpirvBuilder::IfBuilder if_integer_scale(
               integer_scale_active, spv::SelectionControlMaskNone, *builder_);
           spv::Id integer_scale_result_converted;
@@ -2605,15 +2892,133 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 builder_->makeUintConstant(0));
             SpirvBuilder::IfBuilder if_normalized(
                 normalized, spv::SelectionControlMaskNone, *builder_);
-            spv::Id normalized_result = builder_->createNoContractionBinOp(
-                spv::OpVectorTimesScalar, type_float4_, integer_scale_result,
-                builder_->makeFloatConstant(65536.0f));
-            normalized_result = builder_->createUnaryBuiltinCall(
-                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
-                normalized_result);
-            normalized_result = builder_->createNoContractionBinOp(
+            spv::Id normalized_result = integer_scale_result;
+            if (instr.AllowsPointSampling(use_computed_lod)) {
+              // Reconstruct point sampled 4 to 7 bit unsigned components
+              // using the guest conversion (see GetIntegerScaleBits).
+              spv::Id has_grid = builder_->createBinOp(
+                  spv::OpINotEqual, type_bool_,
+                  builder_->createBinOp(
+                      spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                      builder_->makeUintConstant((UINT32_C(1) << 24) - 1)),
+                  const_uint_0_);
+              SpirvBuilder::IfBuilder if_grid(
+                  has_grid, spv::SelectionControlMaskNone, *builder_);
+              id_vector_temp_.clear();
+              for (uint32_t i = 0; i < 4; ++i) {
+                id_vector_temp_.push_back(builder_->makeUintConstant(i * 6));
+              }
+              spv::Id lane_bits = builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint4_,
+                  builder_->createBinOp(
+                      spv::OpShiftRightLogical, type_uint4_,
+                      builder_->smearScalar(spv::NoPrecision,
+                                            integer_scale_bits_packed,
+                                            type_uint4_),
+                      builder_->makeCompositeConstant(type_uint4_,
+                                                      id_vector_temp_)),
+                  builder_->smearScalar(spv::NoPrecision,
+                                        builder_->makeUintConstant(0x3F),
+                                        type_uint4_));
+              spv::Id width = builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint4_, lane_bits,
+                  builder_->smearScalar(spv::NoPrecision,
+                                        builder_->makeUintConstant(0xF),
+                                        type_uint4_));
+              spv::Id pow2_width = builder_->createUnaryOp(
+                  spv::OpConvertUToF, type_float4_,
+                  builder_->createBinOp(
+                      spv::OpShiftLeftLogical, type_uint4_,
+                      builder_->smearScalar(spv::NoPrecision,
+                                            builder_->makeUintConstant(2),
+                                            type_uint4_),
+                      width));
+              // The texel n from the host's n / (2^w - 1).
+              spv::Id texel = builder_->createUnaryBuiltinCall(
+                  type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                  builder_->createNoContractionBinOp(
+                      spv::OpFMul, type_float4_, integer_scale_result,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFSub, type_float4_, pow2_width,
+                          const_float4_1_)));
+              // n * (2^w + 1) / 2^(2w), where the packed component field
+              // is 1 to 15 (unsigned with a nonzero width field).
+              spv::Id snapped = builder_->createTriOp(
+                  spv::OpSelect, type_float4_,
+                  builder_->createBinOp(
+                      spv::OpULessThan, type_bool4_,
+                      builder_->createBinOp(
+                          spv::OpISub, type_uint4_, lane_bits,
+                          builder_->smearScalar(spv::NoPrecision,
+                                                builder_->makeUintConstant(1),
+                                                type_uint4_)),
+                      builder_->smearScalar(spv::NoPrecision,
+                                            builder_->makeUintConstant(15),
+                                            type_uint4_)),
+                  builder_->createNoContractionBinOp(
+                      spv::OpFDiv, type_float4_,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFMul, type_float4_, texel,
+                          builder_->createNoContractionBinOp(
+                              spv::OpFAdd, type_float4_, pow2_width,
+                              const_float4_1_)),
+                      builder_->createNoContractionBinOp(
+                          spv::OpFMul, type_float4_, pow2_width, pow2_width)),
+                  integer_scale_result);
+              if_grid.makeEndIf();
+              normalized_result =
+                  if_grid.createMergePhi(snapped, integer_scale_result);
+            }
+            // Only round unsigned normalized components to 16 fractional bits.
+            spv::Id rounded_result = builder_->createNoContractionBinOp(
                 spv::OpVectorTimesScalar, type_float4_, normalized_result,
+                builder_->makeFloatConstant(65536.0f));
+            rounded_result = builder_->createUnaryBuiltinCall(
+                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                rounded_result);
+            rounded_result = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, rounded_result,
                 builder_->makeFloatConstant(1.0f / 65536.0f));
+            id_vector_temp_.clear();
+            for (uint32_t i = 0; i < 4; ++i) {
+              id_vector_temp_.push_back(builder_->makeUintConstant(i * 6 + 4));
+            }
+            spv::Id lane_signs = builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint4_,
+                builder_->createBinOp(
+                    spv::OpShiftRightLogical, type_uint4_,
+                    builder_->smearScalar(spv::NoPrecision,
+                                          integer_scale_bits_packed,
+                                          type_uint4_),
+                    builder_->makeCompositeConstant(type_uint4_,
+                                                    id_vector_temp_)),
+                builder_->smearScalar(spv::NoPrecision,
+                                      builder_->makeUintConstant(3),
+                                      type_uint4_));
+            normalized_result = builder_->createTriOp(
+                spv::OpSelect, type_float4_,
+                builder_->createBinOp(spv::OpIEqual, type_bool4_, lane_signs,
+                                      const_uint4_0_),
+                rounded_result, normalized_result);
+            // Clamp normalized unsigned-biased components to -1. Post-filtering
+            // clamping can put mixtures with a stored value of 0 up to one
+            // component code below the result of clamping each texel before.
+            // TODO(boma): Guest clamping needs to be verified on real hardware.
+            normalized_result = builder_->createTriOp(
+                spv::OpSelect, type_float4_,
+                builder_->createBinOp(
+                    spv::OpIEqual, type_bool4_, lane_signs,
+                    builder_->smearScalar(
+                        spv::NoPrecision,
+                        builder_->makeUintConstant(
+                            uint32_t(xenos::TextureSign::kUnsignedBiased)),
+                        type_uint4_)),
+                builder_->createBinBuiltinCall(
+                    type_float4_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                    normalized_result,
+                    builder_->smearScalar(spv::NoPrecision, const_float_minus_1,
+                                          type_float4_)),
+                normalized_result);
             if_normalized.makeBeginElse();
             spv::Id const_uint_1 = builder_->makeUintConstant(1);
             id_vector_temp_.clear();
@@ -2632,6 +3037,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                       type_uint4_));
             spv::Id const_uint4_1 = builder_->smearScalar(
                 spv::NoPrecision, const_uint_1, type_uint4_);
+            // Restore integer values with 2^w - 1 for unsigned components
+            // and 2^(w - 1) - 1 for signed and unsigned-biased.
             spv::Id scale_shift = builder_->createBinOp(
                 spv::OpIAdd, type_uint4_,
                 builder_->createBinOp(
@@ -2640,52 +3047,71 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                           builder_->makeUintConstant(0xF),
                                           type_uint4_)),
                 const_uint4_1);
-            scale_shift = builder_->createBinOp(
-                spv::OpISub, type_uint4_, scale_shift,
+            // Signed (1) and biased (2) take one off the shift.
+            spv::Id scale_halved = builder_->createBinOp(
+                spv::OpULessThan, type_bool4_,
                 builder_->createBinOp(
-                    spv::OpBitwiseAnd, type_uint4_,
+                    spv::OpISub, type_uint4_,
                     builder_->createBinOp(
                         spv::OpShiftRightLogical, type_uint4_, scale_bits,
                         builder_->smearScalar(spv::NoPrecision,
                                               builder_->makeUintConstant(4),
                                               type_uint4_)),
-                    const_uint4_1));
+                    const_uint4_1),
+                builder_->smearScalar(spv::NoPrecision,
+                                      builder_->makeUintConstant(2),
+                                      type_uint4_));
+            scale_shift = builder_->createBinOp(
+                spv::OpISub, type_uint4_, scale_shift,
+                builder_->createTriOp(spv::OpSelect, type_uint4_, scale_halved,
+                                      const_uint4_1, const_uint4_0_));
             spv::Id scale_uint = builder_->createBinOp(
                 spv::OpISub, type_uint4_,
                 builder_->createBinOp(spv::OpShiftLeftLogical, type_uint4_,
                                       const_uint4_1, scale_shift),
                 const_uint4_1);
-            // Unsigned biased samples are already mapped [0, 1] to [-1, 1],
-            // so use half of the unsigned scale and subtract 0.5 to restore
-            // the guest's integer value.
-            spv::Id biased = builder_->createBinOp(
-                spv::OpINotEqual, type_bool4_,
-                builder_->createBinOp(
-                    spv::OpBitwiseAnd, type_uint4_,
-                    builder_->createBinOp(
-                        spv::OpShiftRightLogical, type_uint4_, scale_bits,
-                        builder_->smearScalar(spv::NoPrecision,
-                                              builder_->makeUintConstant(5),
-                                              type_uint4_)),
-                    const_uint4_1),
-                const_uint4_0_);
-            spv::Id scale_float = builder_->createTriOp(
-                spv::OpSelect, type_float4_, biased,
-                builder_->smearScalar(spv::NoPrecision,
-                                      builder_->makeFloatConstant(0.5f),
-                                      type_float4_),
-                const_float4_1_);
+            // For 1 bit unsigned-biased components, use a scale of 0.5 and
+            // an offset of -0.5 to recover -1 and 0.
+            spv::Id scale_float = builder_->createUnaryOp(
+                spv::OpConvertUToF, type_float4_, scale_uint);
+            spv::Id const_float4_half = builder_->smearScalar(
+                spv::NoPrecision, builder_->makeFloatConstant(0.5f),
+                type_float4_);
+            spv::Id scale_offset = builder_->createNoContractionBinOp(
+                spv::OpFSub, type_float4_,
+                builder_->createBinBuiltinCall(
+                    type_float4_, ext_inst_glsl_std_450_, GLSLstd450FMin,
+                    scale_float, const_float4_half),
+                const_float4_half);
+            scale_float = builder_->createBinBuiltinCall(
+                type_float4_, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                scale_float, const_float4_half);
             spv::Id scaled_result = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float4_,
-                builder_->createNoContractionBinOp(
-                    spv::OpFMul, type_float4_, integer_scale_result,
-                    builder_->createNoContractionBinOp(
-                        spv::OpFMul, type_float4_,
-                        builder_->createUnaryOp(spv::OpConvertUToF,
-                                                type_float4_, scale_uint),
-                        scale_float)),
-                builder_->createNoContractionBinOp(
-                    spv::OpFSub, type_float4_, scale_float, const_float4_1_));
+                builder_->createNoContractionBinOp(spv::OpFMul, type_float4_,
+                                                   integer_scale_result,
+                                                   scale_float),
+                scale_offset);
+            if (instr.AllowsPointSampling(use_computed_lod)) {
+              // Host decode precision varies since NVIDIA bit replication turns
+              // 1/31 into 8/255, giving a scaled value of 0.9725. Point
+              // sampling gives the guest an integer texel value, while
+              // filtering keeps the fractional result.
+              spv::Id point_sampled = builder_->createBinOp(
+                  spv::OpINotEqual, type_bool_,
+                  builder_->createBinOp(
+                      spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                      builder_->makeUintConstant(UINT32_C(1) << 26)),
+                  const_uint_0_);
+              scaled_result = builder_->createTriOp(
+                  spv::OpSelect, type_float4_,
+                  builder_->smearScalar(spv::NoPrecision, point_sampled,
+                                        type_bool4_),
+                  builder_->createUnaryBuiltinCall(
+                      type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                      scaled_result),
+                  scaled_result);
+            }
             if_normalized.makeEndIf();
             integer_scale_result_converted =
                 if_normalized.createMergePhi(normalized_result, scaled_result);
@@ -2730,26 +3156,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     }
   }
 
-  // Store the needed components of the result.
-  spv::Id result_vector;
-  if (used_result_component_count > 1) {
-    id_vector_temp_.clear();
-    uint32_t result_components_remaining = used_result_components;
-    uint32_t result_component_index;
-    while (xe::bit_scan_forward(result_components_remaining,
-                                &result_component_index)) {
-      result_components_remaining &= ~(UINT32_C(1) << result_component_index);
-      id_vector_temp_.push_back(result[result_component_index]);
-    }
-    result_vector = builder_->createCompositeConstruct(
-        type_float_vectors_[used_result_component_count - 1], id_vector_temp_);
-  } else {
-    uint32_t result_component_index;
-    xe::bit_scan_forward(used_result_components, &result_component_index);
-    result_vector = result[result_component_index];
-  }
-  StoreResult(instr.result, result_vector);
-  BisectSnapshotAfterInstruction();
+  store_result();
 }
 
 size_t SpirvShaderTranslator::FindOrAddTextureBinding(
@@ -2816,7 +3223,8 @@ size_t SpirvShaderTranslator::FindOrAddTextureBinding(
 size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
     uint32_t fetch_constant, xenos::TextureFilter mag_filter,
     xenos::TextureFilter min_filter, xenos::TextureFilter mip_filter,
-    xenos::AnisoFilter aniso_filter) {
+    xenos::AnisoFilter aniso_filter,
+    std::optional<xenos::BorderColor> forced_border_color) {
   if (aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
     // TODO(Triang3l): Limit to what's actually supported by the implementation.
     aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
@@ -2827,7 +3235,11 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
         sampler_binding.mag_filter == mag_filter &&
         sampler_binding.min_filter == min_filter &&
         sampler_binding.mip_filter == mip_filter &&
-        sampler_binding.aniso_filter == aniso_filter) {
+        sampler_binding.aniso_filter == aniso_filter &&
+        sampler_binding.border_color_forced ==
+            forced_border_color.has_value() &&
+        (!forced_border_color ||
+         sampler_binding.forced_border_color == *forced_border_color)) {
       return i;
     }
   }
@@ -2840,6 +3252,9 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
   new_sampler_binding.min_filter = min_filter;
   new_sampler_binding.mip_filter = mip_filter;
   new_sampler_binding.aniso_filter = aniso_filter;
+  new_sampler_binding.border_color_forced = forced_border_color.has_value();
+  new_sampler_binding.forced_border_color =
+      forced_border_color.value_or(xenos::BorderColor::k_ABGR_Black);
   std::ostringstream name;
   static constexpr char kFilterSuffixes[] = {'p', 'l', 'b', 'f'};
   name << "xe_sampler" << fetch_constant << '_'
@@ -2852,6 +3267,11 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
     } else {
       name << "_a" << (UINT32_C(1) << (uint32_t(aniso_filter) - 1));
     }
+  }
+  if (forced_border_color) {
+    name << (*forced_border_color == xenos::BorderColor::k_ABGR_White
+                 ? "_border_white"
+                 : "_border_black");
   }
   new_sampler_binding.variable = builder_->createVariable(
       spv::NoPrecision, spv::StorageClassUniformConstant,
@@ -2871,10 +3291,11 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(
 void SpirvShaderTranslator::SampleTexture(
     spv::Builder::TextureParameters& texture_parameters,
     spv::ImageOperandsMask image_operands_mask, spv::Id image_unsigned,
-    spv::Id image_signed, spv::Id sampler, spv::Id is_any_unsigned,
-    spv::Id is_any_signed, spv::Id& result_unsigned_out,
-    spv::Id& result_signed_out, spv::Id lerp_factor,
-    spv::Id lerp_first_unsigned, spv::Id lerp_first_signed) {
+    spv::Id image_signed, spv::Id sampler_unsigned, spv::Id sampler_signed,
+    spv::Id is_any_unsigned, spv::Id is_any_signed,
+    spv::Id& result_unsigned_out, spv::Id& result_signed_out,
+    spv::Id lerp_factor, spv::Id lerp_first_unsigned,
+    spv::Id lerp_first_signed) {
   for (uint32_t i = 0; i < 2; ++i) {
     SpirvBuilder::IfBuilder sign_if(i ? is_any_signed : is_any_unsigned,
                                     spv::SelectionControlDontFlattenMask,
@@ -2886,7 +3307,7 @@ void SpirvShaderTranslator::SampleTexture(
       texture_parameters.sampler = builder_->createBinOp(
           spv::OpSampledImage,
           builder_->makeSampledImageType(builder_->getTypeId(image)), image,
-          sampler);
+          i ? sampler_signed : sampler_unsigned);
       sign_result = builder_->createTextureCall(
           spv::NoPrecision, type_float4_, false, false, false, false, false,
           texture_parameters, image_operands_mask);

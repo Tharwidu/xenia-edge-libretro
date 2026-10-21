@@ -51,8 +51,7 @@ static void* AllocateContext() {
     }
   }
 
-  assert_always("giving up on allocating context, likely leaking contexts");
-  return nullptr;
+  xe::FatalError("Unable to allocate PPC thread context memory.");
 }
 
 static void FreeContext(void* ctx) {

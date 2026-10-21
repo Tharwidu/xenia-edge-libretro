@@ -114,6 +114,7 @@ DECLARE_bool(widescreen);
 
 DECLARE_uint32(launch_flags);
 DECLARE_string(launch_data);
+DECLARE_string(launch_xbox_disc);
 
 #if XE_PLATFORM_WIN32 && XE_ARCH_AMD64 == 1
 DEFINE_bool(enable_rdrand_ntdll_patch, false,
@@ -188,6 +189,14 @@ static void do_ntdll_rdrand_patch() {
 
 namespace xe {
 namespace app {
+
+// The file a launch's per-game config comes from: for a XeFu build, the
+// original Xbox game the launching process left in the drive.
+static std::filesystem::path GameConfigFile(
+    const std::filesystem::path& target) {
+  return cvars::launch_xbox_disc.empty() ? target
+                                         : xe::to_path(cvars::launch_xbox_disc);
+}
 
 class EmulatorApp final : public xe::ui::WindowedApp {
  public:
@@ -551,7 +560,7 @@ bool EmulatorApp::OnInitialize() {
 
   // Load game-specific config if a target is specified.
   if (!cvars::target.empty()) {
-    config::LoadGameConfigForFile(cvars::target);
+    config::LoadGameConfigForFile(GameConfigFile(cvars::target));
   }
 
 #if XE_ARCH_AMD64 == 1
@@ -711,6 +720,12 @@ void EmulatorApp::EmulatorThread() {
         });
       });
 
+  emulator_->on_shader_compilation.AddListener([this](bool compiling) {
+    app_context().CallInUIThread([this, compiling]() {
+      emulator_window_->SetCompilingShaders(compiling);
+    });
+  });
+
   emulator_->on_patch_apply.AddListener([this]() {
     app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
   });
@@ -743,12 +758,15 @@ void EmulatorApp::EmulatorThread() {
 
   // Set up launch data BEFORE LaunchPath — LaunchPath starts the game thread,
   // and the game may query XamLoaderGetLaunchData during early init.
-  auto xam = emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(
-      "xam.xex");
+  // Unowned, this frame outlives every relaunch.
+  auto* xam = emulator_->kernel_state()
+                  ->GetKernelModule<kernel::xam::XamModule>("xam.xex")
+                  .get();
 
   if (xam && (cvars::launch_flags != 0 || !cvars::launch_data.empty())) {
     auto& loader_data = xam->loader_data();
-    loader_data.launch_data_present = true;
+    // Flags alone carry no data, as with an in-process relaunch.
+    loader_data.launch_data_present = !cvars::launch_data.empty();
     loader_data.launch_flags = cvars::launch_flags;
 
     // Decode hex-encoded launch_data
@@ -763,6 +781,11 @@ void EmulatorApp::EmulatorThread() {
     }
   }
 
+  // The original Xbox game the launching process left in the drive.
+  if (!cvars::launch_xbox_disc.empty()) {
+    emulator_->InsertXboxGame(xe::to_path(cvars::launch_xbox_disc));
+  }
+
   if (!path.empty()) {
     // Normalize the path and make absolute.
     auto abs_path = std::filesystem::absolute(path);
@@ -775,7 +798,7 @@ void EmulatorApp::EmulatorThread() {
 
     // Apply per-game cvar overrides before bringing up subsystems so the
     // graphics/audio backends pick up the right values.
-    config::LoadGameConfigForFile(abs_path);
+    config::LoadGameConfigForFile(GameConfigFile(abs_path));
     if (XFAILED(result = emulator_->SetupSubsystems())) {
       xe::FatalError(fmt::format("Failed to setup subsystems: {:08X}", result));
       app_context().RequestDeferredQuit();
@@ -787,6 +810,13 @@ void EmulatorApp::EmulatorThread() {
 
     // TODO(has207): Add archive format check like in RunTitle?
     result = emulator_->LaunchPath(abs_path);
+    if (const std::string file = emulator_->TakeMissingXeFuFile();
+        !file.empty()) {
+      app_context().CallInUIThreadSynchronous(
+          [this, &file]() { emulator_window_->ShowMissingXeFuFile(file); });
+      app_context().RequestDeferredQuit();
+      return;
+    }
     if (XFAILED(result)) {
       xe::FatalError(fmt::format("Failed to launch target: {:08X}", result));
       app_context().RequestDeferredQuit();

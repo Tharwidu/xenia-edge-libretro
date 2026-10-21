@@ -52,6 +52,9 @@ class EntryTable {
   void MarkReady(Entry* entry, Function* function, uint32_t end_address);
   void MarkFailed(Entry* entry);
   void Delete(uint32_t address);
+  // Drops every ready entry overlapping [start, end] and returns what they
+  // compiled, so the caller can let their modules forget them too.
+  std::vector<Function*> DeleteRange(uint32_t start, uint32_t end);
 
   std::vector<Function*> FindWithAddress(uint32_t address);
 

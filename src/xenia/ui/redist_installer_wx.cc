@@ -545,7 +545,10 @@ void RelaunchAndExit() {
   if (length == 0 || length >= xe::countof(exe_path)) {
     return;
   }
+  // Continues this session's log rather than truncating it.
   std::wstring command_line = GetCommandLineW();
+  command_line += L" --log_append=true";
+  xe::FlushLog();
   STARTUPINFOW startup_info = {};
   startup_info.cb = sizeof(startup_info);
   PROCESS_INFORMATION process_info = {};

@@ -162,6 +162,11 @@ class VulkanDevice {
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
 
+    // VK_EXT_sample_locations (#144)
+
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
+    bool variableSampleLocations = false;
+
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
     bool shaderDemoteToHelperInvocation = false;
@@ -197,6 +202,10 @@ class VulkanDevice {
     // VK_EXT_external_memory_host (#179). Alignment a host pointer must satisfy
     // to be imported. 0 if the extension is not enabled.
     VkDeviceSize minImportedHostPointerAlignment = 0;
+
+    // VK_EXT_conditional_rendering (#82)
+
+    bool conditionalRendering = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -213,6 +222,7 @@ class VulkanDevice {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_EXT_sample_locations = false;              // #144
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.
@@ -230,6 +240,7 @@ class VulkanDevice {
     // VK_KHR_fragment_shader_barycentric (#322) or
     // VK_NV_fragment_shader_barycentric (#203)
     bool ext_KHR_fragment_shader_barycentric = false;
+    bool ext_EXT_conditional_rendering = false;  // #82
 #if XE_PLATFORM_WIN32
     // VK_EXT_full_screen_exclusive (#256, Windows only)
     bool ext_EXT_full_screen_exclusive = false;
@@ -269,6 +280,8 @@ class VulkanDevice {
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+    // VK_EXT_conditional_rendering (#82)
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

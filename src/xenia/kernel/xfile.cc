@@ -14,33 +14,28 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
-#include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xthread.h"
 
 namespace xe {
 namespace kernel {
 
-namespace {
-// What the I/O manager waits with for a title's synchronous request.
-constexpr uint32_t kWaitReasonExecutive = 0;
-constexpr uint32_t kUserMode = 1;
-}  // namespace
-
 XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
-             bool alertable)
+             bool alertable, bool buffered)
     : XObject(kernel_state, kObjectType),
       file_(file),
       is_synchronous_(synchronous),
-      is_alertable_(alertable) {
-  async_event_ = threading::Event::CreateAutoResetEvent(false);
+      is_alertable_(alertable),
+      is_buffered_(buffered) {
+  async_event_ = threading::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }
 
 XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
-  async_event_ = threading::Event::CreateAutoResetEvent(false);
+  async_event_ = threading::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }
 
@@ -48,13 +43,6 @@ XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
   file_->Destroy();
-  // A worker still signaling one holds a reference; a table reset may have
-  // taken the handles already.
-  for (auto& event : idle_io_events_) {
-    if (!event->handles().empty()) {
-      event->ReleaseHandle();
-    }
-  }
 }
 
 GuestScheduler::BlockingCallClass XFile::io_call_class() const {
@@ -64,60 +52,7 @@ GuestScheduler::BlockingCallClass XFile::io_call_class() const {
 }
 
 void XFile::RunSynchronousIo(const std::function<void()>& fn) {
-  auto* scheduler = kernel_state()->guest_scheduler();
-  if (!GuestScheduler::CurrentThreadOffloadsBlockingCalls()) {
-    fn();
-    return;
-  }
-  auto event = AcquireIoEvent();
-  // The worker writes into this frame, so only |done| may end the wait, and a
-  // terminate must not end it either.
-  std::atomic<bool> done{false};
-  scheduler->PostHostCall(
-      [&fn, &done, signal = retain_object(event.get())]() {
-        fn();
-        done.store(true, std::memory_order_release);
-        signal->Set(kIoDiskIncrement, false);
-      },
-      io_call_class());
-  uint32_t alertable = is_alertable_ ? 1 : 0;
-  while (!done.load(std::memory_order_acquire)) {
-    X_STATUS status =
-        event->Wait(kWaitReasonExecutive, kUserMode, alertable, nullptr, false);
-    if (status == X_STATUS_USER_APC) {
-      // An alert cannot cancel the host request. The APCs run at the next
-      // alertable wait, after the caller writes its status block.
-      alertable = 0;
-    } else if (status != X_STATUS_SUCCESS) {
-      // A failed poll does not wait, so give up the CPU instead of spinning.
-      XELOGW("XFile: I/O wait on {} returned {:08X}", name(), status);
-      scheduler->YieldCurrentThread(false);
-    }
-  }
-  ReleaseIoEvent(std::move(event));
-}
-
-object_ref<XEvent> XFile::AcquireIoEvent() {
-  {
-    std::lock_guard<std::mutex> lock(io_event_lock_);
-    if (!idle_io_events_.empty()) {
-      auto event = std::move(idle_io_events_.back());
-      idle_io_events_.pop_back();
-      return event;
-    }
-  }
-  auto event = object_ref<XEvent>(new XEvent(kernel_state(), true));
-  event->Initialize(false, false);
-  // One signal per request would crowd the guest signals out of the ring.
-  event->set_signal_ring_quiet(true);
-  return event;
-}
-
-void XFile::ReleaseIoEvent(object_ref<XEvent> event) {
-  // The completion can land after |done|, leaving it armed for the next user.
-  event->Reset();
-  std::lock_guard<std::mutex> lock(io_event_lock_);
-  idle_io_events_.push_back(std::move(event));
+  kernel_state()->RunBlockingIo(fn, io_call_class(), is_alertable_);
 }
 
 uint64_t XFile::position() const { return position_.load(); }
@@ -257,6 +192,16 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
                 memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
+          if (buffer_physical_heap) {
+            // Resolve output is copied in whole pages, so the pages this read
+            // only partly covers get it now, for the read to land over it.
+            uint64_t file_size = entry()->size();
+            buffer_physical_heap->ProvideReadWatchedEdgePages(
+                buffer_guest_address,
+                uint32_t(std::min<uint64_t>(
+                    buffer_length,
+                    byte_offset < file_size ? file_size - byte_offset : 0)));
+          }
           result = file_->ReadSync(
               std::span<uint8_t>(
                   buffer_physical_heap
@@ -286,10 +231,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
               }
             }
 
-            if (byte_offset) {
-              position_.store(byte_offset);
-            }
-            position_.fetch_add(bytes_read);
+            position_.store(byte_offset + bytes_read);
           }
         }
       }
@@ -307,9 +249,63 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
   return result;
 }
 
-void XFile::PostIo(std::function<void()> fn) {
-  kernel_state()->guest_scheduler()->PostHostCall(std::move(fn),
-                                                  io_call_class());
+void XFile::PostIo(XThread* thread, std::function<void(bool cancelled)> fn) {
+  {
+    std::lock_guard<std::mutex> lock(posted_lock_);
+    posted_.emplace_back(thread, std::move(fn));
+    if (posted_running_) {
+      return;
+    }
+    posted_running_ = true;
+  }
+  // Outside the lock, as a post after shutdown began runs inline.
+  kernel_state()->guest_scheduler()->PostHostCall(
+      [file = retain_object(this)]() { file->RunPostedIo(); }, io_call_class());
+}
+
+void XFile::RunPostedIo() {
+  std::unique_lock<std::mutex> lock(posted_lock_);
+  while (!posted_.empty()) {
+    auto [thread, fn] = std::move(posted_.front());
+    posted_.pop_front();
+    posted_running_thread_ = thread;
+    lock.unlock();
+    fn(false);
+    lock.lock();
+    posted_running_thread_ = nullptr;
+  }
+  posted_running_ = false;
+}
+
+void XFile::CancelPostedIo(XThread* thread) {
+  std::vector<std::function<void(bool)>> cancelled;
+  {
+    std::lock_guard<std::mutex> lock(posted_lock_);
+    for (auto it = posted_.begin(); it != posted_.end();) {
+      if (it->first == thread) {
+        cancelled.push_back(std::move(it->second));
+        it = posted_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& fn : cancelled) {
+    fn(true);
+  }
+}
+
+bool XFile::HasPostedIo(XThread* thread) {
+  std::lock_guard<std::mutex> lock(posted_lock_);
+  if (posted_running_thread_ == thread) {
+    return true;
+  }
+  for (const auto& posted : posted_) {
+    if (posted.first == thread) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint64_t XFile::ReserveDriveTime(uint64_t byte_offset, uint32_t length) {
@@ -353,6 +349,14 @@ void XFile::AwaitDriveTime(uint64_t deadline_ms) {
   self->set_cooperative_wait_shape(XThread::CooperativeWaitKind::kDelay,
                                    nullptr, 0);
   while (Clock::QueryHostUptimeMillis() < deadline_ms) {
+    // A kernel APC runs during the wait, which then goes on.
+    if (self->HasDeliverableKernelApc()) {
+      self->clear_cooperative_wait_shape();
+      xboxkrnl::xeProcessKernelApcs(self->thread_state()->context());
+      self->set_cooperative_wait_shape(XThread::CooperativeWaitKind::kDelay,
+                                       nullptr, 0);
+      continue;
+    }
     scheduler->BlockCurrentThread(deadline_ms, 0, false);
   }
   self->clear_cooperative_wait_shape();
@@ -401,13 +405,10 @@ X_STATUS XFile::ReadScatterInternal(uint32_t segments_guest_address,
     }
 
     uint32_t bytes_read = 0;
-    result =
-        ReadInternal(read_buffer, read_length,
-                     byte_offset ? ((byte_offset != -1 && byte_offset != -2)
-                                        ? byte_offset + read_total
-                                        : byte_offset)
-                                 : -1,
-                     &bytes_read, apc_context, false);
+    result = ReadInternal(
+        read_buffer, read_length,
+        byte_offset != uint64_t(-1) ? byte_offset + read_total : byte_offset,
+        &bytes_read, apc_context, false);
 
     if (result != X_STATUS_SUCCESS) {
       break;
@@ -430,19 +431,19 @@ X_STATUS XFile::ReadScatterInternal(uint32_t segments_guest_address,
 
 X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
                       uint64_t byte_offset, uint32_t* out_bytes_written,
-                      uint32_t apc_context) {
+                      uint32_t apc_context, bool notify_completion) {
   X_STATUS result = X_STATUS_SUCCESS;
   RunSynchronousIo([&]() {
     result = WriteInternal(buffer_guest_address, buffer_length, byte_offset,
-                           out_bytes_written, apc_context);
+                           out_bytes_written, apc_context, notify_completion);
   });
   return result;
 }
 
 X_STATUS XFile::WriteInternal(uint32_t buffer_guest_address,
                               uint32_t buffer_length, uint64_t byte_offset,
-                              uint32_t* out_bytes_written,
-                              uint32_t apc_context) {
+                              uint32_t* out_bytes_written, uint32_t apc_context,
+                              bool notify_completion) {
   // Physical memory is read through the unprotected physical view, as a host
   // write from a watched page would fail rather than fault into its callbacks.
   // Those are triggered first as for a guest read, which brings in resolve
@@ -467,20 +468,27 @@ X_STATUS XFile::WriteInternal(uint32_t buffer_guest_address,
   if (byte_offset == uint64_t(-1)) {
     // Write from current position.
     byte_offset = position_.load();
+  } else if (byte_offset == kEndOfFile) {
+    // The entry's size is only refreshed on request.
+    entry()->update();
+    byte_offset = entry()->size();
   }
 
   size_t bytes_written = 0;
   X_STATUS result = file_->WriteSync(std::span<uint8_t>(buffer, buffer_length),
                                      size_t(byte_offset), &bytes_written);
-  if (XSUCCEEDED(result)) {
-    position_.fetch_add(bytes_written);
+  // A zero-length write leaves the position alone.
+  if (XSUCCEEDED(result) && buffer_length) {
+    position_.store(byte_offset + bytes_written);
   }
 
   if (out_bytes_written) {
     *out_bytes_written = uint32_t(bytes_written);
   }
 
-  NotifyCompletion(result, uint32_t(bytes_written), apc_context);
+  if (notify_completion) {
+    NotifyCompletion(result, uint32_t(bytes_written), apc_context);
+  }
   return result;
 }
 
@@ -492,16 +500,27 @@ X_STATUS XFile::SetLength(size_t length) {
   });
   return result;
 }
-X_STATUS XFile::Rename(const std::filesystem::path file_path) {
-  entry()->Rename(file_path);
-  return X_STATUS_SUCCESS;
+X_STATUS XFile::Rename(const std::filesystem::path file_path,
+                       bool replace_existing) {
+  X_STATUS result = X_STATUS_SUCCESS;
+  RunSynchronousIo(
+      [&]() { result = entry()->Rename(file_path, replace_existing); });
+  return result;
 }
 
-void XFile::RegisterIOCompletionPort(uint32_t key,
+bool XFile::RegisterIOCompletionPort(uint32_t key,
                                      object_ref<XIOCompletion> port) {
   std::lock_guard<std::mutex> lock(completion_port_lock_);
-
+  if (!completion_ports_.empty()) {
+    return false;
+  }
   completion_ports_.push_back({key, port});
+  return true;
+}
+
+bool XFile::HasCompletionPort() {
+  std::lock_guard<std::mutex> lock(completion_port_lock_);
+  return !completion_ports_.empty();
 }
 
 void XFile::RemoveIOCompletionPort(uint32_t key) {
@@ -570,11 +589,14 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
 
 void XFile::NotifyCompletion(X_STATUS status, uint32_t num_bytes,
                              uint32_t apc_context) {
-  XIOCompletion::IONotification notify;
-  notify.apc_context = apc_context;
-  notify.num_bytes = num_bytes;
-  notify.status = status;
-  NotifyIOCompletionPorts(notify);
+  // A request without an APC context posts no packet.
+  if (apc_context) {
+    XIOCompletion::IONotification notify;
+    notify.apc_context = apc_context;
+    notify.num_bytes = num_bytes;
+    notify.status = status;
+    NotifyIOCompletionPorts(notify);
+  }
   async_event_->Set();
 }
 

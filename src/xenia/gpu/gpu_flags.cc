@@ -214,10 +214,16 @@ DEFINE_bool(
     async_shader_skip_draws, true,
     "Skip draws whose shaders can't render immediately via a placeholder "
     "(no interpreter stand-in, e.g. tessellation or textured/memexport/loop "
-    "vertex shaders) until their real pipeline compiles in the background, "
-    "instead of translating them on the draw thread. Avoids stutter but the "
-    "geometry pops in a few frames later.",
+    "vertex shaders, or no pixel shader) until their real pipeline compiles in "
+    "the background. Avoids stutter but what they draw appears a few frames "
+    "late.",
     "GPU");
+DEFINE_string(
+    async_shader_inline_hashes, "",
+    "Comma-separated vertex or pixel shader ucode hashes (hex, as logged) "
+    "whose draws always wait for their real pipeline instead of using an "
+    "async stand-in. For bisecting which stand-in causes a rendering issue.",
+    "GPU.Debug");
 
 DEFINE_bool(
     shader_profiling, false,
@@ -264,3 +270,19 @@ DEFINE_bool(
     "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
     "this requires depthClamp support.",
     "GPU");
+
+DEFINE_bool(
+    mulsc_round_toward_zero, false,
+    "Round mulsc products toward zero instead of to nearest even. This fixes "
+    "bad geometry in several Volition Engine titles and possibly others. "
+    "This rounding behavior hasn't been confirmed on real hardware, so it's "
+    "disabled by default.",
+    "GPU");
+
+DEFINE_bool(xenos_sample_positions, false,
+            "Rasterize 2x and 4x MSAA render targets at the Xenos sample "
+            "positions, like real hardware, if the GPU and driver support it.\n"
+            "Only applies to RTV/FBO - ROV/FSI render targets always use Xenos "
+            "positions since they safely map coverage and calculate depth "
+            "in-shader.",
+            "GPU");

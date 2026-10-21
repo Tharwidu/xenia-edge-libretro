@@ -48,8 +48,10 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
 
   // Setting change handlers
   void OnMemexportEnableChanged(bool enabled);
-  void OnMemexportAwaitFencesChanged(bool enabled);
+  void OnMemexportAwaitPixelExportsChanged(bool enabled);
+  void OnMemexportAwaitVertexExportsChanged(bool enabled);
   void OnOcclusionQueryChanged(int value);
+  void OnOcclusionQueryVIZChanged(bool enabled);
   void OnEmulatedDisplayUncappedChanged(bool uncapped);
   void OnFramerateLimitChanged(int value);
 
@@ -58,8 +60,10 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
 
   // Current settings state (selected values)
   bool memexport_enable_ = true;
-  bool memexport_await_fences_ = true;
+  bool memexport_await_pixel_exports_ = true;
+  bool memexport_await_vertex_exports_ = false;
   int occlusion_query_mode_ = 0;  // 0=Fake, 1=Fast, 2=Fast-Alt, 3=Strict
+  bool occlusion_query_viz_ = false;
   bool display_uncapped_ = false;
   int framerate_limit_ = 0;  // FPS, 0 = unlimited
 

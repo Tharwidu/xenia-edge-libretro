@@ -38,6 +38,11 @@ enum class SimpleMessageBoxType {
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
 
+#if XE_PLATFORM_MAC
+// Whether the running executable carries an x86_64 slice Rosetta can launch.
+bool ExecutableHasX86_64Slice();
+#endif
+
 }  // namespace xe
 
 #endif  // XENIA_BASE_SYSTEM_H_

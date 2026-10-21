@@ -30,7 +30,8 @@ DECLARE_bool(shared_memory_zero_copy);
 DECLARE_bool(enable_host_buffer);
 
 DECLARE_bool(memexport_enable);
-DECLARE_bool(memexport_await_fences);
+DECLARE_bool(memexport_await_pixel_exports);
+DECLARE_bool(memexport_await_vertex_exports);
 
 DECLARE_bool(non_seamless_cube_map);
 
@@ -45,6 +46,8 @@ DECLARE_int32(occlusion_query_fake_upper_threshold);
 DECLARE_bool(occlusion_query_log);
 
 DECLARE_bool(occlusion_query_full_counters);
+
+DECLARE_bool(occlusion_query_viz);
 
 // Returns the guest vblank rate in Hz (50 for PAL, 60 for NTSC).
 // Based on use_50Hz_mode cvar.
@@ -71,6 +74,7 @@ DECLARE_bool(async_shader_compilation);
 DECLARE_bool(async_shader_vs_interpreter);
 DECLARE_bool(async_shader_vs_interpreter_debug_color);
 DECLARE_bool(async_shader_skip_draws);
+DECLARE_string(async_shader_inline_hashes);
 
 DECLARE_bool(shader_profiling);
 
@@ -81,6 +85,10 @@ DECLARE_bool(gpu_3d_to_2d_texture);
 DECLARE_bool(use_fuzzy_alpha_epsilon);
 
 DECLARE_bool(force_depth_clamp);
+
+DECLARE_bool(mulsc_round_toward_zero);
+
+DECLARE_bool(xenos_sample_positions);
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 

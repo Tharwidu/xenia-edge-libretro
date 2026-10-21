@@ -7,17 +7,27 @@
  ******************************************************************************
  */
 
+#include <atomic>
+#include <charconv>
+#include <functional>
+
 #include "xenia/base/logging.h"
+#include "xenia/base/string.h"
+#include "xenia/base/utf8.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xiocompletion.h"
 #include "xenia/kernel/xsymboliclink.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/ui/window.h"
+#include "xenia/ui/windowed_app_context.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
 
@@ -25,9 +35,127 @@ namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-// File-pointer reads (offset -1) and reads at or past EOF complete inline.
-static bool CompletesAsync(XFile* file, uint64_t byte_offset) {
-  return !file->is_synchronous() && byte_offset < file->entry()->size();
+// Bit 0 only picks the APC mode, see QueueIoApc.
+static bool QueuesApc(uint32_t apc_routine, uint32_t apc_context) {
+  return (apc_routine & ~1u) && apc_context;
+}
+
+// The console queues an I/O completion routine as a kernel APC, which runs
+// before the service returns on an inline completion. Bit 0 asks for a user APC
+// instead, as XAPI's ReadFileEx completion trampoline does.
+static void QueueIoApc(XThread* thread, uint32_t apc_routine,
+                       uint32_t apc_context, uint32_t status_block_address) {
+  thread->EnqueueApc(apc_routine & ~1u, apc_context, status_block_address, 0,
+                     apc_routine & 1);
+}
+
+// Status last, so a caller polling it for completion reads a valid count.
+static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status,
+                          uint32_t information) {
+  status_block->information = information;
+  std::atomic_thread_fence(std::memory_order_release);
+  status_block->status = status;
+}
+
+// A handle bound to a completion port takes no APC routine. A synchronous
+// handle uses its file position, marked -1, without an offset or with
+// FILE_USE_FILE_POINTER_POSITION (-2). An async handle needs an offset. A write
+// given FILE_WRITE_TO_END_OF_FILE (-1) appends at XFile::kEndOfFile. Any other
+// negative offset is invalid.
+static X_STATUS ValidateRequest(XFile* file, uint32_t apc_routine,
+                                lpqword_t byte_offset_ptr, bool is_write,
+                                uint64_t* out_byte_offset) {
+  *out_byte_offset = uint64_t(-1);
+  if (apc_routine && file->HasCompletionPort()) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!byte_offset_ptr) {
+    return file->is_synchronous() ? X_STATUS_SUCCESS
+                                  : X_STATUS_INVALID_PARAMETER;
+  }
+  int64_t byte_offset = int64_t(uint64_t(*byte_offset_ptr));
+  if (byte_offset == -2 && file->is_synchronous()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset == -1 && is_write) {
+    *out_byte_offset = XFile::kEndOfFile;
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset < 0) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  *out_byte_offset = uint64_t(byte_offset);
+  return X_STATUS_SUCCESS;
+}
+
+// Without a file system that queues every request, a zero-length transfer, a
+// read at or past EOF, a write that extends the file and a buffered transfer
+// complete inline.
+static bool CompletesAsync(XFile* file, uint32_t length, uint64_t byte_offset,
+                           bool is_write) {
+  if (file->is_synchronous()) {
+    return false;
+  }
+  if (file->device()->queues_all_requests()) {
+    return true;
+  }
+  if (file->is_buffered() || !length) {
+    return false;
+  }
+  uint64_t file_size = file->entry()->size();
+  return is_write ? byte_offset + length <= file_size : byte_offset < file_size;
+}
+
+// Runs |transfer|, which returns a status and fills in the bytes moved, then
+// reports the completion. A request that pends runs on an I/O worker.
+static X_STATUS SubmitRequest(const object_ref<XFile>& file,
+                              const object_ref<XEvent>& ev,
+                              uint32_t apc_routine, uint32_t apc_context,
+                              X_IO_STATUS_BLOCK* status_block,
+                              uint32_t status_block_address, bool pends,
+                              std::function<X_STATUS(uint32_t*)> transfer) {
+  auto thread = retain_object(XThread::GetCurrentThread());
+  // Cleared at issue, so a wait cannot return on an earlier completion.
+  if (ev) {
+    ev->Reset();
+  }
+  file->ResetWaitState();
+  auto complete = [file, ev, thread, apc_routine, apc_context, status_block,
+                   status_block_address, transfer = std::move(transfer)](
+                      bool posted, bool cancelled) {
+    uint32_t bytes = 0;
+    X_STATUS status = cancelled ? X_STATUS_CANCELLED : transfer(&bytes);
+    // A failure the caller was not told PENDING for completes nothing.
+    if (!posted && XFAILED(status)) {
+      return status;
+    }
+    if (status_block) {
+      WriteIoStatus(status_block, status, bytes);
+    }
+    if (QueuesApc(apc_routine, apc_context)) {
+      QueueIoApc(thread.get(), apc_routine, apc_context, status_block_address);
+    }
+    file->NotifyCompletion(status, bytes, apc_context);
+    if (ev) {
+      ev->Set(KernelState::kIoDiskIncrement, false);
+    }
+    return status;
+  };
+  if (pends) {
+    if (status_block) {
+      status_block->status = X_STATUS_PENDING;
+      status_block->information = 0;
+    }
+    file->PostIo(thread.get(),
+                 [complete = std::move(complete)](bool cancelled) {
+                   complete(true, cancelled);
+                 });
+    return X_STATUS_PENDING;
+  }
+  X_STATUS status = complete(false, false);
+  // A kernel APC the completion queued runs before the service returns.
+  xeProcessKernelApcs(thread->thread_state()->context());
+  return status;
 }
 
 struct CreateOptions {
@@ -35,12 +163,83 @@ struct CreateOptions {
   static constexpr uint32_t FILE_DIRECTORY_FILE = 0x00000001;
   // Optimization - files access will be sequential, not random.
   static constexpr uint32_t FILE_SEQUENTIAL_ONLY = 0x00000004;
+  static constexpr uint32_t FILE_NO_INTERMEDIATE_BUFFERING = 0x00000008;
   static constexpr uint32_t FILE_SYNCHRONOUS_IO_ALERT = 0x00000010;
   static constexpr uint32_t FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
   static constexpr uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
   // Optimization - file access will be random, not sequential.
   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
+
+// XeFu, the original Xbox emulator, opens the running Xbox title's data
+// directory, Xbox1\TDATA\<title id> in the HDD's Compatibility directory, as
+// the title starts. The certificate of the XBE it loaded, at 0x10000 in user
+// mode, names the title.
+static void NoteXeFuTitle(std::string_view path) {
+  constexpr std::string_view kTitleData = "\\xbox1\\tdata\\";
+  const std::string lower = xe::utf8::lower_ascii(path);
+  const size_t found = lower.rfind(kTitleData);
+  if (found == std::string::npos) {
+    return;
+  }
+  const std::string_view id =
+      std::string_view(lower).substr(found + kTitleData.size());
+  uint32_t title_id = 0;
+  if (id.size() != 8 ||
+      std::from_chars(id.data(), id.data() + id.size(), title_id, 16).ptr !=
+          id.data() + id.size()) {
+    return;
+  }
+  // XeFu's own system data, such as the soundtrack database it opens at boot.
+  if ((title_id >> 16) == 0xFFFE) {
+    return;
+  }
+  auto memory = kernel_memory();
+  // Little-endian like everything the x86 side keeps. Each field is translated
+  // on its own, as consecutive user pages need not map to consecutive kernel
+  // addresses.
+  auto read_user = [memory](uint32_t address, auto* out) {
+    const uint32_t kernel_address = memory->UserModeKernelAddress(address);
+    if (kernel_address == address) {
+      return false;
+    }
+    *out = xe::load<std::remove_pointer_t<decltype(out)>>(
+        memory->TranslateForRead(kernel_address));
+    return true;
+  };
+  std::string name;
+  uint32_t magic = 0, certificate = 0, certificate_title_id = 0;
+  // XBEH.
+  if (read_user(0x10000, &magic) && magic == 0x48454258 &&
+      read_user(0x10118, &certificate) &&
+      read_user(certificate + 0x8, &certificate_title_id) &&
+      certificate_title_id == title_id) {
+    std::u16string title_name;
+    for (uint32_t i = 0; i < 40; ++i) {
+      uint16_t c = 0;
+      if (!read_user(certificate + 0xC + i * 2, &c) || !c) {
+        break;
+      }
+      title_name.push_back(char16_t(c));
+    }
+    name = xe::to_utf8(title_name);
+  }
+  if (name.empty()) {
+    name = fmt::format("{:08X}", title_id);
+  }
+  // On the UI thread, which reads the name.
+  auto emulator = kernel_state()->emulator();
+  auto set_name = [emulator, name]() {
+    if (emulator->title_name() != name) {
+      emulator->SetTitleName(name);
+    }
+  };
+  if (auto window = emulator->display_window()) {
+    window->app_context().CallInUIThread(set_name);
+  } else {
+    set_name();
+  }
+}
 
 dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
                                   pointer_t<X_OBJECT_ATTRIBUTES> object_attrs,
@@ -60,13 +259,23 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
   assert_not_null(handle_out);
 
+  // A null name opens what the root directory handle refers to. That's how a
+  // file is reopened from a handle.
   auto object_name =
-      kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+      util::TranslateAnsiStringPointer(kernel_memory(), object_attrs->name_ptr);
 
   vfs::Entry* root_entry = nullptr;
 
+  const bool has_root_handle =
+      object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+      object_attrs->root_directory != 0;
+
   // Compute path, possibly attrs relative.
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  // A name relative to a directory handle is never under \??\.
+  if (!has_root_handle) {
+    xeObStripDosDevicesPrefix(target_path);
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -74,8 +283,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
-  if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
-      object_attrs->root_directory != 0) {
+  if (has_root_handle) {
     auto root_file = kernel_state()->object_table()->LookupObject<XFile>(
         object_attrs->root_directory);
     assert_not_null(root_file);
@@ -84,15 +292,21 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     root_entry = root_file->entry();
   }
 
-  // Attempt open (or create).
+  // Attempt open (or create). The host open can block on a slow drive.
   vfs::File* vfs_file;
   vfs::FileAction file_action;
-  X_STATUS result = kernel_state()->file_system()->OpenFile(
-      root_entry, target_path,
-      vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
-      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
-      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
-      &file_action);
+  X_STATUS result;
+  kernel_state()->RunBlockingIo(
+      [&]() {
+        result = kernel_state()->file_system()->OpenFile(
+            root_entry, target_path,
+            vfs::FileDisposition((uint32_t)creation_disposition),
+            desired_access,
+            (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+            (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0,
+            &vfs_file, &file_action);
+      },
+      GuestScheduler::BlockingCallClass::kConcurrent);
   object_ref<XFile> file = nullptr;
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
@@ -103,8 +317,10 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     bool synchronous =
         alertable ||
         (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
+    bool buffered =
+        !(create_options & CreateOptions::FILE_NO_INTERMEDIATE_BUFFERING);
     file = object_ref<XFile>(
-        new XFile(kernel_state(), vfs_file, synchronous, alertable));
+        new XFile(kernel_state(), vfs_file, synchronous, alertable, buffered));
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
@@ -119,6 +335,9 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   XELOGFS("NtCreateFile({}) = {:08X}, handle={:08X}", target_path, result,
           handle);
+  if (XSUCCEEDED(result) && kernel_state()->title_id() == kXeFuTitleId) {
+    NoteXeFuTitle(target_path);
+  }
 
   return result;
 }
@@ -149,71 +368,35 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t buffer_address = buffer.guest_address();
     uint32_t length = buffer_length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
-    uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
-    X_IO_STATUS_BLOCK* status_block = io_status_block;
-    uint32_t status_block_address = io_status_block.guest_address();
-    auto thread = retain_object(XThread::GetCurrentThread());
-    auto complete = [file, ev, thread, buffer_address, length, byte_offset,
-                     apc_routine, apc_context_address, status_block,
-                     status_block_address]() {
-      uint32_t bytes_read = 0;
-      X_STATUS status = file->Read(buffer_address, length, byte_offset,
-                                   &bytes_read, apc_context_address, false);
-      if (XSUCCEEDED(status)) {
-        if (auto patch = kernel_state()->xmp_volume_patch()) {
-          auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
-          patch->OnFileRead(file->entry()->name(), host_buf, length,
-                            buffer_address);
-        }
-      }
-      if (status_block) {
-        status_block->status = status;
-        status_block->information = bytes_read;
-      }
-      // Low bit probably means do not queue to IO ports.
-      if ((apc_routine & ~1u) && apc_context_address &&
-          status == X_STATUS_SUCCESS) {
-        thread->EnqueueApc(apc_routine & ~1u, apc_context_address,
-                           status_block_address, 0);
-      }
-      file->NotifyCompletion(status, bytes_read, apc_context_address);
-      if (ev) {
-        ev->Set(XFile::kIoDiskIncrement, false);
-      }
-      return status;
-    };
-
-    if (CompletesAsync(file.get(), byte_offset)) {
-      if (ev) {
-        ev->Reset();
-      }
-      if (status_block) {
-        status_block->status = X_STATUS_PENDING;
-        status_block->information = 0;
-      }
-      file->PostIo(std::move(complete));
-      result = X_STATUS_PENDING;
-    } else {
-      result = complete();
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
-        result = X_STATUS_PENDING;
-      }
-    }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+    result = SubmitRequest(
+        file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
+        io_status_block, io_status_block.guest_address(),
+        CompletesAsync(file.get(), length, byte_offset, false),
+        [file, buffer_address, length, byte_offset,
+         apc_context_address](uint32_t* bytes_read) {
+          X_STATUS status = file->Read(buffer_address, length, byte_offset,
+                                       bytes_read, apc_context_address, false);
+          if (XSUCCEEDED(status)) {
+            if (auto patch = kernel_state()->xmp_volume_patch()) {
+              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
+              patch->OnFileRead(file->entry()->name(), host_buf, length,
+                                buffer_address);
+            }
+          }
+          return status;
+        });
   }
 
   return result;
@@ -232,64 +415,31 @@ dword_result_t NtReadFileScatter_entry(
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result) &&
+             (file->is_buffered() || file->device()->name() == "STFS")) {
+    // Scatter reads need an unbuffered handle. STFS takes none.
+    result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t segments_address = segment_array.guest_address();
     uint32_t read_length = length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
-    uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
-    X_IO_STATUS_BLOCK* status_block = io_status_block;
-    uint32_t status_block_address = io_status_block.guest_address();
-    auto thread = retain_object(XThread::GetCurrentThread());
-    auto complete = [file, ev, thread, segments_address, read_length,
-                     byte_offset, apc_routine, apc_context_address,
-                     status_block, status_block_address]() {
-      uint32_t bytes_read = 0;
-      X_STATUS status =
-          file->ReadScatter(segments_address, read_length, byte_offset,
-                            &bytes_read, apc_context_address, false);
-      if (status_block) {
-        status_block->status = status;
-        status_block->information = bytes_read;
-      }
-      // Low bit probably means do not queue to IO ports.
-      if ((apc_routine & ~1u) && apc_context_address) {
-        thread->EnqueueApc(apc_routine & ~1u, apc_context_address,
-                           status_block_address, 0);
-      }
-      file->NotifyCompletion(status, bytes_read, apc_context_address);
-      if (ev) {
-        ev->Set(XFile::kIoDiskIncrement, false);
-      }
-      return status;
-    };
-
-    if (CompletesAsync(file.get(), byte_offset)) {
-      if (ev) {
-        ev->Reset();
-      }
-      if (status_block) {
-        status_block->status = X_STATUS_PENDING;
-        status_block->information = 0;
-      }
-      file->PostIo(std::move(complete));
-      result = X_STATUS_PENDING;
-    } else {
-      result = complete();
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
-      }
-    }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+    result = SubmitRequest(
+        file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
+        io_status_block, io_status_block.guest_address(),
+        CompletesAsync(file.get(), read_length, byte_offset, false),
+        [file, segments_address, read_length, byte_offset,
+         apc_context_address](uint32_t* bytes_read) {
+          return file->ReadScatter(segments_address, read_length, byte_offset,
+                                   bytes_read, apc_context_address, false);
+        });
   }
 
   return result;
@@ -303,80 +453,42 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
                                  lpqword_t byte_offset_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
-  // Grab event to signal.
-  bool signal_event = false;
   auto ev = kernel_state()->object_table()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
   }
 
-  // Grab file.
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), apc_routine, byte_offset_ptr, true,
+                             &byte_offset);
   }
 
-  // Execute write.
   if (XSUCCEEDED(result)) {
-    // TODO(benvanik): async path.
-    if (true || file->is_synchronous()) {
-      // Synchronous request.
-      uint32_t bytes_written = 0;
-      result = file->Write(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_written, apc_context);
-
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = static_cast<uint32_t>(bytes_written);
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      // Low bit probably means do not queue to IO ports.
-      if ((uint32_t)apc_routine & ~1) {
-        if (apc_context) {
-          auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u,
-                             apc_context, io_status_block, 0);
-        }
-      }
-
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-
-      if (XSUCCEEDED(result)) {
-        if (auto patch = kernel_state()->xmp_volume_patch()) {
-          auto host_buf =
-              kernel_memory()->TranslateVirtual(buffer.guest_address());
-          patch->OnFileWrite(file->entry()->name(), host_buf, buffer_length,
-                             buffer.guest_address());
-        }
-      }
-    } else {
-      // X_STATUS_PENDING if not returning immediately.
-      result = X_STATUS_PENDING;
-
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-    }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
-  }
-
-  if (ev && signal_event) {
-    ev->Set(XFile::kIoDiskIncrement, false);
+    uint32_t buffer_address = buffer.guest_address();
+    uint32_t length = buffer_length;
+    uint32_t apc_context_address = apc_context.guest_address();
+    result = SubmitRequest(
+        file, ev, apc_routine, apc_context_address, io_status_block,
+        io_status_block.guest_address(),
+        CompletesAsync(file.get(), length, byte_offset, true),
+        [file, buffer_address, length, byte_offset,
+         apc_context_address](uint32_t* bytes_written) {
+          X_STATUS status =
+              file->Write(buffer_address, length, byte_offset, bytes_written,
+                          apc_context_address, false);
+          if (XSUCCEEDED(status)) {
+            if (auto patch = kernel_state()->xmp_volume_patch()) {
+              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
+              patch->OnFileWrite(file->entry()->name(), host_buf, length,
+                                 buffer_address);
+            }
+          }
+          return status;
+        });
   }
 
   return result;
@@ -456,21 +568,32 @@ dword_result_t NtRemoveIoCompletion_entry(
 DECLARE_XBOXKRNL_EXPORT2(NtRemoveIoCompletion, kFileSystem, kImplemented,
                          kHighFrequency);
 
-dword_result_t NtCancelIoFile_entry(dword_t handle) {
+dword_result_t NtCancelIoFile_entry(dword_t handle,
+                                    const ppc_context_t& context) {
   auto file = kernel_state()->object_table()->LookupObject<XFile>(handle);
   if (!file) {
     return X_STATUS_INVALID_HANDLE;
   }
-
+  // The calling thread's requests on the file that have yet to start complete
+  // as cancelled. The call returns once the one running has completed,
+  // polling every 10 ms.
+  XThread* thread = XThread::GetCurrentThread();
+  file->CancelPostedIo(thread);
+  while (file->HasPostedIo(thread)) {
+    uint64_t interval = uint64_t(-100000);
+    KeDelayExecutionThread(0, false, &interval, context);
+  }
+  // A kernel APC the completions queued runs before the service returns.
+  xeProcessKernelApcs(context);
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kStub);
+DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kImplemented);
 
 dword_result_t NtQueryFullAttributesFile_entry(
     pointer_t<X_OBJECT_ATTRIBUTES> obj_attribs,
     pointer_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
   auto object_name =
-      kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
+      util::TranslateAnsiStringPointer(kernel_memory(), obj_attribs->name_ptr);
 
   object_ref<XFile> root_file;
   if (obj_attribs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
@@ -483,17 +606,29 @@ dword_result_t NtQueryFullAttributesFile_entry(
   }
 
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
+  // A name relative to a directory handle is never under \??\.
+  if (!root_file) {
+    xeObStripDosDevicesPrefix(target_path);
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
-  // Resolve the file using the virtual file system.
-  auto entry = kernel_state()->file_system()->ResolvePath(target_path);
+  // Resolve the file using the virtual file system. The host lookup can block
+  // on a slow drive.
+  vfs::Entry* entry = nullptr;
+  kernel_state()->RunBlockingIo(
+      [&]() {
+        entry = kernel_state()->file_system()->ResolvePath(target_path);
+        if (entry) {
+          entry->update();
+        }
+      },
+      GuestScheduler::BlockingCallClass::kConcurrent);
   if (entry) {
     // Found.
-    entry->update();
     file_info->creation_time = entry->create_timestamp();
     file_info->last_access_time = entry->access_timestamp();
     file_info->last_write_time = entry->write_timestamp();
@@ -555,16 +690,18 @@ DECLARE_XBOXKRNL_EXPORT1(NtQueryDirectoryFile, kFileSystem, kImplemented);
 
 dword_result_t NtFlushBuffersFile_entry(
     dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
-  auto result = X_STATUS_SUCCESS;
-
-  if (io_status_block_ptr) {
-    io_status_block_ptr->status = result;
-    io_status_block_ptr->information = 0;
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    return X_STATUS_INVALID_HANDLE;
   }
-
-  return result;
+  // Writes reach the host as they run. On an async handle the flush queues
+  // behind the handle's pending requests, so it completes after them.
+  return SubmitRequest(file, nullptr, 0, 0, io_status_block_ptr,
+                       io_status_block_ptr.guest_address(),
+                       !file->is_synchronous(),
+                       [](uint32_t*) { return X_STATUS_SUCCESS; });
 }
-DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kStub);
+DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kImplemented);
 
 // https://docs.microsoft.com/en-us/windows/win32/devnotes/ntopensymboliclinkobject
 dword_result_t NtOpenSymbolicLinkObject_entry(
@@ -577,7 +714,7 @@ dword_result_t NtOpenSymbolicLinkObject_entry(
   assert_true(object_attrs->attributes == 64);  // case insensitive
 
   auto object_name =
-      kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+      util::TranslateAnsiStringPointer(kernel_memory(), object_attrs->name_ptr);
 
   auto target_path = xeObSymbolicLinkName(
       util::TranslateAnsiPath(kernel_memory(), object_name));

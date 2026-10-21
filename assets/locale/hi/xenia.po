@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"फ़ाइल को मैन्युअल रूप से ढूँढें?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu पहले से इंस्टॉल किए गए"
@@ -1654,3 +1644,83 @@ msgstr "Xenia %s के अंतर्गत वितरित की जा�
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "सामग्री"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "वैकल्पिक गिटार"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "बेस गिटार"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"मूल Xbox के गेम XeFu के ज़रिए चलते हैं, जो Xbox 360 का बैकवर्ड कम्पैटिबिलिटी एमुलेटर है, लेकिन इसके फ़ोल्डर में %s मौजूद नहीं है:\n"
+"\n"
+"%s\n"
+"\n"
+"कृपया Xbox 360 की हार्ड ड्राइव के Compatibility फ़ोल्डर से xbox.xex और xefu*.xex फ़ाइलें इस फ़ोल्डर में कॉपी करें।"
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu नहीं मिला"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"टाइटल लॉन्च करने में विफल।\n"
+"\n"
+"तकनीकी विवरण के लिए xenia.log देखें।"
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "टाइटल लॉन्च विफल!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "डेटा माइग्रेशन"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"आपका कुछ मौजूदा डेटा नई प्रोफ़ाइल में माइग्रेट नहीं किया जा सका। विफल आइटम: %u\n"
+"\n"
+"तकनीकी विवरण के लिए xenia.log देखें।"
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "आपका मौजूदा डेटा नई प्रोफ़ाइल में माइग्रेट कर दिया गया।"
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"इस टाइटल के लिए कोई फ़ाइल पथ सेट नहीं है।\n"
+"\n"
+"फ़ाइल को मैन्युअल रूप से ढूँढें?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"फ़ाइल नहीं मिली:\n"
+"%s\n"
+"\n"
+"फ़ाइल को मैन्युअल रूप से ढूँढें?"

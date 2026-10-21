@@ -31,10 +31,10 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
+#include "xenia/gpu/d3d12/d3d12_query_pool.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
-#include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
 #include "xenia/gpu/draw_util.h"
@@ -246,13 +246,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
                                D3D12_RESOURCE_STATES new_state);
 
   // If this shared memory range holds memexport output (which lives in the host
-  // buffer under two-buffer routing), copies just it into the device buffer so
-  // a following texture load reading the device buffer sees it. No-op for
-  // normal ranges and when the host buffer is unavailable. Called by the
-  // texture cache before loading.
+  // buffer under two-buffer routing), copies the pages holding it into the
+  // device buffer so a following texture load reading the device buffer sees
+  // it, or all of the range with whole_range. No-op for normal ranges and when
+  // the host buffer is unavailable. Called by the texture cache before loading.
   // Returns whether it copied, so an upload of the same range can be skipped.
   bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
-                                          uint32_t size_bytes);
+                                          uint32_t size_bytes,
+                                          bool whole_range = false);
 
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
@@ -269,11 +270,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
 
-  std::string GetTitleStateSuffix() const override;
+  // Sets Xenos MSAA sample positions based on ForcedSampleCount for ROV, or
+  // target sample count, or the default pattern at 1x. Submits pending
+  // barriers under the old pattern first.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
+  bool xenos_sample_positions_used() const {
+    return xenos_sample_positions_used_;
+  }
 
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  std::string MakeTitleStateSuffix() const override;
   XE_FORCEINLINE
   void WriteRegisterForceinline(uint32_t index, uint32_t value);
   void WriteRegister(uint32_t index, uint32_t value) override;
@@ -414,12 +422,24 @@ class D3D12CommandProcessor final : public CommandProcessor {
 #include "../command_processor_readback_staging.inc"
   void StageMemexportReadback();
   void FlushMemexportStagingReadback();
+  void AwaitMemexportSubmission(uint64_t submission) {
+    CheckSubmissionCompletion(submission);
+  }
+  // Without the host buffer or zero-copy, export output reaches guest RAM only
+  // through the staging copy, which a wait makes.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->GetHostBuffer() != nullptr ||
+           shared_memory_->is_zero_copy();
+  }
+  void EndSubmissionForMemexport() { EndResolveSubmission(); }
   // Export ranges staged but not yet copied out, in record order - a later
   // copy of an overlapping range has to win.
   struct MemexportStagedRange {
     uint64_t key;
     uint32_t address;
     uint32_t length;
+    // Where address lies in the slot's buffer.
+    uint32_t offset;
   };
   std::vector<MemexportStagedRange> memexport_staged_;
 
@@ -494,11 +514,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  // Checks if ending a submission right now would not cause potentially more
-  // delay than it would reduce by making the GPU start working earlier - such
-  // as when there are unfinished graphics pipeline creation requests that would
-  // need to be fulfilled before actually submitting the command list.
-  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletion(GetCurrentSubmission());
     return GetCompletedSubmission() + 1u >= GetCurrentSubmission();
@@ -525,7 +540,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
       const draw_util::Scissor& scissor, bool primitive_polygonal,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      uint32_t bound_depth_and_color_render_target_bits);
+      uint32_t bound_depth_and_color_render_target_bits,
+      bool depth_bias_in_pixel_shader);
 
   // Parallel binding for the spirv_to_dxil guest path (Mesa root signature).
   // Fills a SpirvShaderTranslator::SystemConstants (mirroring the Vulkan
@@ -540,7 +556,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
       const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
-      bool interpreter_placeholder);
+      bool interpreter_placeholder, int32_t window_offset_tiles);
   // Resolves a sampler to its index in the bindless sampler heap for the Mesa
   // path, allocating and writing the descriptor on first use. Returns
   // UINT32_MAX if the heap is full, so the caller switches to a fresh heap and
@@ -556,16 +572,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void WriteZPDCounterRawUAVDescriptor(
       D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
-  // ZPD occlusion queries backend.
+  // Query segments backend for both ZPD occlusion query reports and
+  // VIZ visibility surveys & conditional rendering.
+  //
   // BeginQuery/EndQuery must be in the same command list, segments split at
-  // EndSubmission, resume at BeginSubmission. RecordZPDResolveBatch emits
-  // coalesced ResolveQueryData and counter copies at submit.
-  void EnsureZPDQueryResources() override;
-  void ShutdownZPDQueryResources() override {
-    zpd_resolves_in_flight_.clear();
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_rov_ = false;
+  // EndSubmission, resume at BeginSubmission. Coalesced ResolveQueryData and
+  // counter copies are emitted at submit.
+  void EnsureQueryResources() override;
+  void ShutdownQueryResources() override {
+    query_resolves_in_flight_.clear();
+    active_query_index_ = UINT32_MAX;
+    active_query_generation_ = 0;
+    active_query_is_rov_ = false;
     zpd_rov_path_ = false;
     bindful_zpd_counter_buffer_ = nullptr;
     bindful_zpd_counter_capacity_ = 0;
@@ -573,22 +591,33 @@ class D3D12CommandProcessor final : public CommandProcessor {
       draw_view_bindful_heap_index_ =
           ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
     }
-    if (zpd_host_query_pool_) {
-      zpd_host_query_pool_->Shutdown();
+    if (host_query_pool_) {
+      host_query_pool_->Shutdown();
     }
   }
 
-  bool IsZPDQueryPoolReady() const override;
-  bool CanOpenZPDQuery() const override;
+  bool IsQueryPoolReady() const override;
+  bool CanOpenQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
-  bool CloseZPDQuery(ReportHandle report_handle,
-                     uint64_t& out_submission) override;
+  QueryOpenResult OpenQuery(bool can_close_submission) override;
+  bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                  uint64_t& out_submission) override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
 
-  void RecordZPDResolveBatch();
+  bool EnsureVIZPredicateBuffer();
+  // The tracked transition without recording it, so it can batch with other
+  // barriers. False when none is needed.
+  bool GetVIZPredicateBufferBarrier(D3D12_RESOURCE_STATES new_state,
+                                    D3D12_RESOURCE_BARRIER& barrier_out);
+  void AwaitVIZQueryResolve(uint64_t wait_for_submission) override;
+  void ShutdownVIZQueryResources() {
+    viz_predicate_buffer_.Reset();
+    viz_predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+    viz_predicate_buffer_state_submission_ = UINT64_MAX;
+    viz_predicate_buffer_failed_ = false;
+  }
 
   bool device_removed_ = false;
 
@@ -602,13 +631,16 @@ class D3D12CommandProcessor final : public CommandProcessor {
     bool rov = false;
     bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
+    VIZQueryHandle viz;
   };
-  uint32_t zpd_active_query_index_ = UINT32_MAX;
-  uint32_t zpd_active_query_generation_ = 0;
-  bool zpd_active_query_is_rov_ = false;
+  uint32_t active_query_index_ = UINT32_MAX;
+  uint32_t active_query_generation_ = 0;
+  bool active_query_is_rov_ = false;
   bool zpd_rov_path_ = false;
   bool zpd_hybrid_supported_ = false;
-  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  // Depth bias is set on the command list instead of baked into pipelines.
+  bool depth_bias_dynamic_ = false;
+  std::deque<PendingQueryResolve> query_resolves_in_flight_;
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
   bool submission_open_ = false;
@@ -641,6 +673,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   ID3D12GraphicsCommandList2* command_list_2_ = nullptr;
+  ID3D12GraphicsCommandList9* command_list_9_ = nullptr;
   DeferredCommandList deferred_command_list_;
 
   // Should bindless textures and samplers be used - many times faster
@@ -649,15 +682,27 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // of UpdateBindings time, and that's outside the emulator's control even).
   bool bindless_resources_used_ = false;
 
+  // SetSamplePositions and ResolveSubresourceRegion remove the device
+  // without tier 1 support.
+  bool xenos_sample_positions_used_ = false;
+
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
+  std::unique_ptr<D3D12QueryPool> host_query_pool_;
   // Tracks the counter buffer captured by the current bindful page so we can
   // invalidate the page when the counter resource changes.
   ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
   uint32_t bindful_zpd_counter_capacity_ = 0;
+
+  // The tracked state is only valid within the recorded submission. Buffers
+  // decay to COMMON when the previous submission's command list finishes.
+  Microsoft::WRL::ComPtr<ID3D12Resource> viz_predicate_buffer_;
+  D3D12_RESOURCE_STATES viz_predicate_buffer_state_ =
+      D3D12_RESOURCE_STATE_COMMON;
+  uint64_t viz_predicate_buffer_state_submission_ = UINT64_MAX;
+  bool viz_predicate_buffer_failed_ = false;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
@@ -845,10 +890,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   D3D12_RECT ff_scissor_;
   float ff_blend_factor_[4];
   uint32_t ff_stencil_ref_;
+  float ff_depth_bias_;
+  float ff_depth_bias_slope_scaled_;
   bool ff_viewport_update_needed_;
   bool ff_scissor_update_needed_;
   bool ff_blend_factor_update_needed_;
   bool ff_stencil_ref_update_needed_;
+  bool ff_depth_bias_update_needed_;
 
   // Currently bound pipeline, either a graphics pipeline from the pipeline
   // cache (with potentially deferred creation - current_external_pipeline_ is
@@ -934,6 +982,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+
+  // MSAA mode the command list's sample positions are programmed for.
+  xenos::MsaaSamples current_sample_positions_;
 
   draw_util::GetViewportInfoArgs previous_viewport_info_args_;
   draw_util::ViewportInfo previous_viewport_info_;

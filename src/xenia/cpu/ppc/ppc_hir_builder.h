@@ -97,9 +97,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   void CopyFPSCRToCR1();
   Value* LoadXER();
   void StoreXER(Value* value);
-  // void UpdateXERWithOverflow();
-  // void UpdateXERWithOverflowAndCarry();
-  // void StoreOV(Value* value);
+  // Call before UpdateCR, which copies XER[SO] into the CR field.
+  void StoreOV(Value* value);
   Value* LoadCA();
   void StoreCA(Value* value);
   Value* LoadSAT();
@@ -134,15 +133,6 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   uint64_t instr_count_;
   Instr** instr_offset_list_;
   Label** label_list_;
-
-  // Reset each instruction.
-  struct {
-    uint32_t dest_count;
-    struct {
-      uint8_t reg;
-      Value* value;
-    } dests[4];
-  } trace_info_;
 };
 
 }  // namespace ppc

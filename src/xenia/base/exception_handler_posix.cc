@@ -41,6 +41,9 @@ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
+  // The faulting thread may hold the guest's FP control. Returning from the
+  // signal restores the interrupted value from the signal context.
+  SetHostDefaultFpControl();
   if (signal_number == SIGTRAP && signal_info->si_code <= 0) {
     // raise()/kill(), not a trap instruction - xenia_assert uses this. Nothing
     // here can claim it, and the handlers below would swallow it.
@@ -203,9 +206,17 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       {
         // On Darwin, determine access direction from the faulting instruction.
         uint64_t fault_pc = mcontext->__ss.__pc;
-        uint32_t fault_insn = *reinterpret_cast<const uint32_t*>(fault_pc);
+        // A jump to an unmapped address faults on the fetch, with no
+        // instruction to read.
+        const bool fetch_faulted =
+            fault_pc == reinterpret_cast<uint64_t>(signal_info->si_addr);
+        uint32_t fault_insn =
+            fetch_faulted ? 0 : *reinterpret_cast<const uint32_t*>(fault_pc);
         bool instruction_is_store;
-        if (IsArm64LoadPrefetchStore(fault_insn, instruction_is_store)) {
+        if (fetch_faulted) {
+          access_violation_operation =
+              Exception::AccessViolationOperation::kUnknown;
+        } else if (IsArm64LoadPrefetchStore(fault_insn, instruction_is_store)) {
           access_violation_operation =
               instruction_is_store ? Exception::AccessViolationOperation::kWrite
                                    : Exception::AccessViolationOperation::kRead;
@@ -240,6 +251,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
             (mcontext_esr->esr & (UINT64_C(1) << 6))
                 ? Exception::AccessViolationOperation::kWrite
                 : Exception::AccessViolationOperation::kRead;
+      } else if (mcontext.pc ==
+                 reinterpret_cast<uint64_t>(signal_info->si_addr)) {
+        // A jump to an unmapped address faults on the fetch, with no
+        // instruction to read.
+        access_violation_operation =
+            Exception::AccessViolationOperation::kUnknown;
       } else {
         // Determine the memory access direction based on which instruction has
         // requested it.

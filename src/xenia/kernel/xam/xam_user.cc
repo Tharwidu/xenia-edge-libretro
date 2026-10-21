@@ -17,6 +17,7 @@
 #include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xenumerator.h"
+#include "xenia/kernel/xsession.h"
 #include "xenia/xbox.h"
 
 #include "third_party/stb/stb_image.h"
@@ -50,21 +51,22 @@ X_HRESULT_result_t XamUserGetXUID_entry(dword_t user_index, dword_t type_mask,
   const auto& user_profile =
       kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  uint32_t result = X_E_NO_SUCH_USER;
-  uint64_t xuid = 0;
-
-  auto type = user_profile->type() & type_mask;
-  if (type & (2 | 4)) {
-    // maybe online profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
-  } else if (type & 1) {
-    // maybe offline profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
+  // Only a user signed in to Live has an online XUID to give.
+  uint32_t types = X_USER_XUID_OFFLINE;
+  if (user_profile->signin_state() ==
+      static_cast<uint32_t>(SignInState::SignedInToLive)) {
+    types |= X_USER_XUID_ONLINE;
   }
-  *xuid_ptr = xuid;
-  return result;
+  types &= type_mask;
+
+  if (types & X_USER_XUID_ONLINE) {
+    *xuid_ptr = user_profile->GetOnlineXUID();
+  } else if (types & X_USER_XUID_OFFLINE) {
+    *xuid_ptr = user_profile->xuid();
+  } else {
+    return X_E_NO_SUCH_USER;
+  }
+  return X_E_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserGetXUID, kUserProfiles, kImplemented);
 
@@ -127,8 +129,17 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
   xe::string_util::copy_truncating(info->name, user_profile->name(),
                                    xe::countof(info->name));
 
-  if (!flags || flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
+  if (user_profile->IsLiveEnabled()) {
+    info->flags = X_USER_INFO_FLAG_LIVE_ENABLED;
+  }
+
+  // ONLINE_XUID_ONLY wins when both are set.
+  if (flags & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) {
+    info->xuid = user_profile->GetOnlineXUID();
+  } else if (flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
     info->xuid = user_profile->xuid();
+  } else {
+    info->xuid = user_profile->GetLogonXUID();
   }
 
   info->signin_state = user_profile->signin_state();
@@ -406,16 +417,27 @@ DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
 dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
                                            lpdword_t out_value) {
+  *out_value = 0;
+
+  // With no Live service, a user signed in to Live holds every Live privilege.
+  const bool granted = mask >= 0xD1 && mask <= 0xFF;
+
+  // Every Live user holds the same privileges so the first one answers.
   if (user_index == XUserIndexAny) {
-    for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
-      const auto result = XamUserCheckPrivilege_entry(i, mask, out_value);
-      if (result != X_ERROR_NO_SUCH_USER) {
-        *out_value = 0;
-        return result;
+    X_RESULT result = X_ERROR_NO_SUCH_USER;
+    for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
+      const auto user_profile = kernel_state()->xam_state()->GetUserProfile(i);
+      if (!user_profile) {
+        continue;
       }
+      if (user_profile->signin_state() ==
+          static_cast<uint32_t>(SignInState::SignedInToLive)) {
+        *out_value = granted;
+        return X_ERROR_SUCCESS;
+      }
+      result = X_ERROR_NOT_LOGGED_ON;
     }
-    *out_value = 0;
-    return X_ERROR_NO_SUCH_USER;
+    return result;
   }
 
   if (user_index >= XUserMaxUserCount) {
@@ -428,15 +450,13 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
 
   if (kernel_state()->xam_state()->GetUserProfile(user_index)->signin_state() !=
       static_cast<uint32_t>(SignInState::SignedInToLive)) {
-    *out_value = 0;
     return X_ERROR_NOT_LOGGED_ON;
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  *out_value = granted;
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kSketchy);
 
 dword_result_t XamUserContentRestrictionGetFlags_entry(dword_t user_index,
                                                        lpdword_t out_flags) {
@@ -550,7 +570,6 @@ dword_result_t XamUserAreUsersFriends_entry(
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
         // No friends!
-        are_friends = true;
         result = X_ERROR_SUCCESS;
       }
     } else {
@@ -1004,20 +1023,29 @@ dword_result_t XamWriteGamerTile_entry(
 DECLARE_XAM_EXPORT1(XamWriteGamerTile, kUserProfiles, kSketchy);
 
 dword_result_t XamSessionCreateHandle_entry(lpdword_t handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  auto session = object_ref<XSession>(new XSession(kernel_state()));
+  const X_STATUS result = session->Initialize();
+  if (XFAILED(result)) {
+    return result;
+  }
+  *handle_ptr = session->handle();
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamSessionCreateHandle, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamSessionCreateHandle, kUserProfiles, kImplemented);
 
+// The caller drops the reference with ObDereferenceObject.
 dword_result_t XamSessionRefObjByHandle_entry(dword_t handle,
                                               lpdword_t obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  *obj_ptr = 0;
+  auto session = kernel_state()->object_table()->LookupObject<XSession>(handle);
+  if (!session) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  session->RetainHandle();
+  *obj_ptr = session->guest_object();
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamSessionRefObjByHandle, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamSessionRefObjByHandle, kUserProfiles, kImplemented);
 
 dword_result_t XamUserIsUnsafeProgrammingAllowed_entry(dword_t user_index,
                                                        dword_t pc_check,
@@ -1139,36 +1167,35 @@ dword_result_t XamUserIsParentalControlled_entry(dword_t user_index) {
 DECLARE_XAM_EXPORT1(XamUserIsParentalControlled, kUserProfiles, kImplemented);
 
 dword_result_t XamUserCreateStatsEnumerator_entry(
-    dword_t title_id, dword_t user_index, dword_t count, dword_t flags,
-    dword_t size, pointer_t<X_STATS_DETAILS> stats_ptr,
+    dword_t title_id, dword_t type, qword_t pivot, dword_t num_rows,
+    dword_t num_specs,
+    pointer_t<XUserStatsEnumerator::XUSER_STATS_SPEC> specs_ptr,
     lpdword_t buffer_size_ptr, lpdword_t handle_ptr) {
-  if (!count || !buffer_size_ptr || !handle_ptr || !stats_ptr) {
+  if (!num_specs || !specs_ptr || !num_rows || num_rows > 100 ||
+      !buffer_size_ptr || !handle_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index >= XUserMaxUserCount) {
-    return X_ERROR_INVALID_PARAMETER;
+  // The buffer has room for every requested row: 0x30 bytes per row and 0x1C
+  // per column.
+  const XUserStatsEnumerator::XUSER_STATS_SPEC* specs = specs_ptr;
+  std::vector<uint32_t> view_ids;
+  uint32_t buffer_size = sizeof(XUserStatsEnumerator::XUSER_STATS_READ_RESULTS);
+  for (uint32_t i = 0; i < num_specs; ++i) {
+    view_ids.push_back(specs[i].ViewId);
+    buffer_size += sizeof(XUserStatsEnumerator::XUSER_STATS_VIEW) +
+                   num_rows * (0x30 + specs[i].NumColumnIds * 0x1C);
   }
 
-  if (!flags || flags > 0x64) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  if (!size) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  if (buffer_size_ptr) {
-    *buffer_size_ptr = 0;  // sizeof(X_STATS_DETAILS) * stats_ptr->stats_amount;
-  }
-
-  auto e = object_ref<XUserStatsEnumerator>(
-      new XUserStatsEnumerator(kernel_state(), 0));
-  const X_STATUS result = e->Initialize(user_index, 0xFB, 0xB0023, 0xB0024, 0);
+  auto e = object_ref<XUserStatsEnumerator>(new XUserStatsEnumerator(
+      kernel_state(), num_rows, std::move(view_ids), buffer_size));
+  const X_STATUS result =
+      e->Initialize(XUserIndexNone, 0xFB, 0xB0023, 0xB0024, 0);
   if (XFAILED(result)) {
     return result;
   }
 
+  *buffer_size_ptr = buffer_size;
   *handle_ptr = e->handle();
   return X_ERROR_SUCCESS;
 }
@@ -1214,15 +1241,15 @@ DECLARE_XAM_EXPORT1(XamUserGetUserTenure, kUserProfiles, kImplemented);
 // https://github.com/TeaModz/XeLiveStealth-Full-Source/blob/d4a7439ac6241c4a13e883a6f156623d1c08f6eb/XeLive/Utils.cpp#L416
 dword_result_t XamUserLogon_entry(lpqword_t xuids_ptr, dword_t flags,
                                   pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!xuids_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   const auto host_xuids_ptr =
       kernel_memory()->TranslateVirtual<xe::be<uint64_t>*>(xuids_ptr);
 
   const auto xuids = std::vector<xe::be<uint64_t>>(
       host_xuids_ptr, host_xuids_ptr + XUserMaxUserCount);
-
-  if (!xuids_ptr) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
 
   auto run = [xuids, flags](uint32_t& extended_error,
                             uint32_t& length) -> X_RESULT {
@@ -1251,12 +1278,24 @@ dword_result_t XamUserLogon_entry(lpqword_t xuids_ptr, dword_t flags,
       }
     }
 
-    // Log everyone out
-    if (flags & static_cast<uint32_t>(UserLogonFlags::ForceLiveLogOff)) {
-      for (uint32_t user_index = 0; user_index < XUserMaxUserCount;
+    // Without Add or Remove the array is one XUID per slot, and only
+    // ForceLiveLogOff signs out an empty slot.
+    if (!(flags & (static_cast<uint32_t>(UserLogonFlags::AddUser) |
+                   static_cast<uint32_t>(UserLogonFlags::RemoveUser)))) {
+      const bool sign_out_empty =
+          flags & static_cast<uint32_t>(UserLogonFlags::ForceLiveLogOff);
+      for (uint8_t user_index = 0; user_index < XUserMaxUserCount;
            user_index++) {
-        if (kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
+        if (!xuids[user_index] && sign_out_empty &&
+            kernel_state()->xam_state()->IsUserSignedIn(
+                static_cast<uint32_t>(user_index))) {
           profile_manager->Logout(user_index, true);
+        }
+      }
+      for (uint8_t user_index = 0; user_index < XUserMaxUserCount;
+           user_index++) {
+        if (xuids[user_index]) {
+          profile_manager->Login(xuids[user_index], user_index, true);
         }
       }
     }

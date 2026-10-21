@@ -74,9 +74,9 @@ class XamGamepadDialog : public xe::ui::ImGuiGamepadDialog {
 class MessageBoxDialog : public XamGamepadDialog {
  public:
   MessageBoxDialog(xe::ui::ImGuiDrawer* imgui_drawer,
-                   xe::hid::InputSystem* input_system, std::string& title,
-                   std::string& description, std::vector<std::string> buttons,
-                   uint32_t default_button)
+                   xe::hid::InputSystem* input_system, const std::string& title,
+                   const std::string& description,
+                   std::vector<std::string> buttons, uint32_t default_button)
       : XamGamepadDialog(imgui_drawer, input_system),
         title_(title),
         description_(description),

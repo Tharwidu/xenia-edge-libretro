@@ -2649,7 +2649,8 @@ static xenos::ClampMode NormalizeClampModeStatic(xenos::ClampMode clamp_mode) {
 static MetalTextureCache::SamplerParameters BuildSamplerParametersFromFetch(
     const RegisterFile& regs, uint32_t fetch_constant,
     xenos::TextureFilter req_mag_filter, xenos::TextureFilter req_min_filter,
-    xenos::TextureFilter req_mip_filter, xenos::AnisoFilter req_aniso_filter) {
+    xenos::TextureFilter req_mip_filter, xenos::AnisoFilter req_aniso_filter,
+    bool border_color_forced, xenos::BorderColor forced_border_color) {
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
 
   MetalTextureCache::SamplerParameters parameters;
@@ -2664,7 +2665,8 @@ static MetalTextureCache::SamplerParameters BuildSamplerParametersFromFetch(
   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
-    parameters.border_color = fetch.border_color;
+    parameters.border_color =
+        border_color_forced ? forced_border_color : fetch.border_color;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }
@@ -2722,7 +2724,8 @@ MetalTextureCache::SamplerParameters MetalTextureCache::GetSamplerParameters(
   SCOPE_profile_cpu_f("gpu");
   return BuildSamplerParametersFromFetch(
       register_file(), binding.fetch_constant, binding.mag_filter,
-      binding.min_filter, binding.mip_filter, binding.aniso_filter);
+      binding.min_filter, binding.mip_filter, binding.aniso_filter,
+      binding.border_color_forced, binding.forced_border_color);
 }
 
 MTL::SamplerState* MetalTextureCache::GetOrCreateSampler(

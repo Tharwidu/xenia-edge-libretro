@@ -411,7 +411,8 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     return false;
   }
   bool is_write = operation == Exception::AccessViolationOperation::kWrite;
-  // User mode views are never protected, so no MMIO range or watch applies.
+  // No MMIO range applies to the user mode views. The memory callback takes
+  // their faults, write watches included.
   const uint64_t user_membase =
       uint64_t(user_membase_.load(std::memory_order_relaxed));
   if (user_membase && ex->fault_address() - user_membase < 0x100000000ull) {
@@ -420,7 +421,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     }
     return access_violation_callback_(
         global_critical_region_.Acquire(), access_violation_callback_context_,
-        reinterpret_cast<void*>(ex->fault_address()), is_write);
+        reinterpret_cast<void*>(ex->fault_address()), is_write, ex);
   }
   if (ex->fault_address() < uint64_t(virtual_membase_) ||
       ex->fault_address() > uint64_t(memory_end_)) {
@@ -463,7 +464,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock),
                                         access_violation_callback_context_,
-                                        fault_host_address, is_write);
+                                        fault_host_address, is_write, ex);
     }
     return false;
 #else
@@ -481,7 +482,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock),
                                         access_violation_callback_context_,
-                                        fault_host_address, is_write);
+                                        fault_host_address, is_write, ex);
     }
     return false;
 #endif

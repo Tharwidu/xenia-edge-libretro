@@ -659,6 +659,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = true;
         break;
       }
+      case PM4_WAIT_IB_PFD_COMPLETE: {
+        // Waits for earlier INDIRECT_BUFFER_PFD base and size writes.
+        // No wait is needed since we process indirect buffers synchronously.
+        reader_.AdvanceRead(count * sizeof(uint32_t));
+        result = true;
+        break;
+      }
       case PM4_WAIT_FOR_IDLE: {
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
@@ -668,6 +675,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
                                                value);
         }
         XELOGGPU("GPU wait for idle = {:08X}", value);
+        // Writes after this have to land after the GPU's work before it.
+        COMMAND_PROCESSOR::AwaitHeldSignalsAndMemexport();
         result = true;
         break;
       }
@@ -761,17 +770,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
   }
 
   // The handler runs as if everything before this point in the command stream
-  // is done, so export output it may read has to be in guest RAM first.
-  if (cvars::memexport_await_fences) {
-    COMMAND_PROCESSOR::AwaitMemexportForFence();
-  }
+  // is done, export output reaching guest RAM included.
   COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
-
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      graphics_system_->DispatchInterruptCallback(1, n);
-    }
-  }
+  COMMAND_PROCESSOR::DispatchGuestInterrupt(cpu_mask);
   return true;
 }
 XE_NOINLINE
@@ -872,6 +873,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // Don't read what a held-back fence is yet to write there.
+  if (is_memory) {
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr & ~uint32_t(0x3));
+  }
 
   do {
     uint32_t value = value_ref;
@@ -883,10 +888,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     } else {
       if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
         // A pending request (non-zero status, cleared by MakeCoherent) is the
-        // guest asking for a range to be made visible to it, so any export
+        // guest asking for a range to be made visible to it, so awaited export
         // output landing there has to have reached guest RAM first.
-        if (cvars::memexport_await_fences &&
-            register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
+        if (register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
           COMMAND_PROCESSOR::AwaitMemexportForCoherency(
               register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
               register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
@@ -898,6 +902,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
     if (!matched) {
+      // The guest may be waiting for a held-back signal before it writes what
+      // this waits for. Checked again before waiting if any was performed.
+      if (!held_guest_signals_.empty()) {
+        size_t held_count = held_guest_signals_.size();
+        COMMAND_PROCESSOR::SubmitHeldSignals();
+        if (held_guest_signals_.size() != held_count) {
+          continue;
+        }
+      }
       // Wait using the duration specified by the guest.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1033,9 +1046,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
 
   uint32_t value;
   if (wait_info & 0x10) {
-    // Memory.
+    // Memory, which a held-back fence may be yet to write.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr);
     trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
@@ -1106,11 +1120,6 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(event_type);
 
-  // The guest treats this fence as "the GPU is done", so any export output it
-  // is about to read has to be in guest RAM first.
-  if (cvars::memexport_await_fences) {
-    COMMAND_PROCESSOR::AwaitMemexportForFence();
-  }
   COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   uint32_t data_value;
@@ -1125,6 +1134,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
+  uint32_t write_physical_address = address;
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base =
         register_file_->values[XE_GPU_REG_WRITEBACK_START];
@@ -1135,9 +1145,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
     if (writeback_base != 0 && writeback_offset < writeback_size) {
       write_destination =
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+      // The same memory as this physical address.
+      write_physical_address = writeback_offset;
     }
   }
-  xe::store(write_destination, data_value);
+  // The guest treats this fence as "the GPU is done", export output ahead of it
+  // included.
+  COMMAND_PROCESSOR::WriteGuestFence(write_destination, write_physical_address,
+                                     data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1258,11 +1273,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
     uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,
     uint32_t count_remaining) XE_RESTRICT {
-  // if viz_query_condition != 0, this is a conditional draw based on viz query.
-  // This ID matches the one issued in PM4_VIZ_QUERY
-  // uint32_t viz_id = viz_query_condition & 0x3F;
-  // when true, render conditionally based on query result
-  // uint32_t viz_use = viz_query_condition & 0x100;
+  // viz_query_condition is the VIZ token.
+  // Bit 8 makes the draw conditional on the ID's visibility in bits 0:5,
+  // from an earlier PM4_VIZ_QUERY.
 
   assert_not_zero(count_remaining);
   if (!count_remaining) {
@@ -1344,13 +1357,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   reader_.AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
-    auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
-
+    // A consumer draw whose survey is still outstanding runs under the
+    // backend's predicate instead of blocking. Surveys themselves are
+    // ordinary draws here.
+    if (COMMAND_PROCESSOR::PrepareVIZDraw(viz_query_condition)) {
       // Push PM4 command marker as parent for IssueDraw/IssueCopy operations.
       if (COMMAND_PROCESSOR::debug_markers_enabled()) {
         COMMAND_PROCESSOR::PushDebugMarker("%s", opcode_name);
@@ -1361,6 +1371,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
           is_indexed ? &index_buffer_info : nullptr,
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
                                      vgt_draw_initiator.prim_type));
+      viz_draw_predicate_ = {};
 
       // Pop PM4 command marker.
       if (COMMAND_PROCESSOR::debug_markers_enabled()) {
@@ -1374,6 +1385,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
                uint32_t(vgt_draw_initiator.source_select));
       }
     }
+  }
+
+  if (!draw_succeeded) {
+    COMMAND_PROCESSOR::OnVIZSurveyDraw(false);
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1649,8 +1664,22 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INVALIDATE_STATE(
 
 bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // begin/end initiator for viz query extent processing
   // https://www.google.com/patents/US20050195186
+  // VIZ_QUERY (VIZ) is Xenos' GPU-side conditional rendering / predication
+  // query mechanism. It's not actually an occlusion query like EVENT_WRITE_ZPD.
+  // There's no sample counts to return to the guest and no buffer that the CPU
+  // needs to read. Mercifully, VIZ has distinct BEGIN and END event types which
+  // clear the internal state of the scan converter.
+  //
+  // The scan converter tracks a state of 64 IDs, and geometry submissions
+  // between BEGIN/END events update one of those IDs, and later draw packets
+  // can use the results so the command processor can discard them. It's
+  // actually pretty similar to modern D3D12 predication or Vulkan conditional
+  // rendering, except geometry can be killed by hi-Z before any later tests.
+  //
+  // As a close-enough approximation, native occlusion queries are used for host
+  // RT and ZPass-like counting in-shader for interlock, and any passing sample
+  // is treated like a visible result.
   assert_true(count == 1);
 
   uint32_t dword0 = reader_.ReadAndSwap<uint32_t>();
@@ -1664,23 +1693,16 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
   }
 
   if (!end) {
-    // begin a new viz query @ id
-    // On hardware this clears the internal state of the scan converter (which
-    // is different to the register)
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_START);
-    // XELOGGPU("Begin viz query ID {:02X}", id);
+    COMMAND_PROCESSOR::SyncVIZEnabled();
+    if (viz_enabled_) {
+      COMMAND_PROCESSOR::BeginVIZQuery(id);
+    }
   } else {
-    // end the viz query
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_END);
-    // XELOGGPU("End viz query ID {:02X}", id);
-    // The scan converter writes the internal result back to the register here.
-    // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1)
-                                                                     << id;
-    } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |=
-          uint32_t(1) << (id - 32);
+    COMMAND_PROCESSOR::SyncVIZEnabled();
+    if (viz_enabled_) {
+      COMMAND_PROCESSOR::EndVIZQuery(id);
     }
   }
 
@@ -1745,6 +1767,8 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
     // the end of the burst, and then there is nothing honest to publish.
     if (writeback_stride && remaining <= remaining_at_writeback &&
         remaining_at_writeback - remaining >= writeback_stride) {
+      // Held-back signals the GPU is past go out at the same pace.
+      COMMAND_PROCESSOR::PerformCompletedHeldSignals();
       // Re-read the target, the guest can re-point or disable the write-back
       // from its own thread while we are draining.
       uint32_t writeback_ptr = read_ptr_writeback_ptr_;

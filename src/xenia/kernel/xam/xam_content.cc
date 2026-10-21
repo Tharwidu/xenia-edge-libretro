@@ -514,6 +514,8 @@ dword_result_t XamContentGetCreator_entry(
   if (!is_creator_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
+  // xam clears it before anything can fail.
+  *is_creator_ptr = 0;
 
   const auto& user = kernel_state()->xam_state()->GetUserProfile(user_index);
 
@@ -545,7 +547,6 @@ dword_result_t XamContentGetCreator_entry(
           }
         }
       } else {
-        *is_creator_ptr = 0;
         if (creator_xuid_ptr) {
           *creator_xuid_ptr = 0;
         }
@@ -952,7 +953,7 @@ dword_result_t XamContentLaunchImageFromFileInternal_entry(
   auto on_launch_new_title = kernel_state()->emulator()->on_launch_new_title();
   if (on_launch_new_title) {
     XELOGI("XamContentLaunchImageFromFileInternal: spawning new title process");
-    on_launch_new_title(xe::path_to_utf8(host_path), xex_name_, 0, "");
+    on_launch_new_title(xe::path_to_utf8(host_path), xex_name_, 0, "", "");
   }
 
   kernel_state()->TerminateTitle();
@@ -1013,7 +1014,8 @@ dword_result_t XamContentLaunchImageInternal_entry(lpvoid_t content_data_ptr,
   auto on_launch_new_title = kernel_state()->emulator()->on_launch_new_title();
   if (on_launch_new_title) {
     XELOGI("XamContentLaunchImageInternal: spawning new title process");
-    on_launch_new_title(xe::path_to_utf8(host_path), xex_path.value(), 0, "");
+    on_launch_new_title(xe::path_to_utf8(host_path), xex_path.value(), 0, "",
+                        "");
   }
 
   kernel_state()->TerminateTitle();

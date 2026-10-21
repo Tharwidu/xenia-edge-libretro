@@ -45,8 +45,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
 
   auto fs = kernel_state_->file_system();
   if (std::filesystem::is_directory(package_path)) {
-    auto device = std::make_unique<vfs::HostPathDevice>(device_path_,
-                                                        package_path, false);
+    auto device = std::make_unique<vfs::HostPathDevice>(
+        device_path_, package_path, false, false, "STFS");
     mounted_ = device->Initialize();
     fs->RegisterDevice(std::move(device));
   } else {
@@ -74,6 +74,12 @@ ContentPackage::~ContentPackage() {
 
 void ContentPackage::LoadPackageLicenseMask(
     const std::filesystem::path header_path) {
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(header_path);
+  if (header && header->content_header.is_magic_valid()) {
+    license_ = vfs::XContentContainerDevice::LicenseMaskFromHeader(*header);
+    return;
+  }
+
   if (!std::filesystem::exists(header_path)) {
     return;
   }
@@ -172,27 +178,14 @@ std::filesystem::path ContentManager::ResolvePackagePath(
   return get_package_path(data.title_id);
 }
 
-std::filesystem::path ContentManager::ResolvePackageHeaderPath(
-    const std::string_view file_name, uint64_t xuid, uint32_t title_id,
-    const XContentType content_type) const {
-  if (title_id == kCurrentlyRunningTitleId) {
-    title_id = kernel_state_->title_id();
-  }
-
-  if (content_type == XContentType::kMarketplaceContent) {
-    xuid = 0;
-  }
-
-  auto xuid_str = fmt::format("{:016X}", xuid);
-  auto title_id_str = fmt::format("{:08X}", title_id);
-  auto content_type_str = fmt::format("{:08X}", uint32_t(content_type));
-  std::string final_name =
-      xe::string_util::trim(std::string(file_name)) + ".header";
-
-  // Header root path:
-  // content_root/xuid/title_id/Headers/content_type/
-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName /
-         content_type_str / final_name;
+static std::filesystem::path PackageHeaderPath(
+    const std::filesystem::path& package_path) {
+  // Header path:
+  // content_root/xuid/title_id/Headers/content_type/package_name.header
+  const auto content_type_path = package_path.parent_path();
+  return content_type_path.parent_path() / kGameContentHeaderDirName /
+         content_type_path.filename() /
+         package_path.filename().concat(".header");
 }
 
 std::unordered_set<uint32_t> ContentManager::FindPublisherTitleIds(
@@ -249,7 +242,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
 
     for (const auto& file_info : file_infos) {
       XCONTENT_AGGREGATE_DATA content_data;
-      if (XSUCCEEDED(ReadContentHeaderFile(xe::path_to_utf8(file_info.name),
+      if (XSUCCEEDED(ReadContentHeaderFile(file_info.path / file_info.name,
                                            xuid, title_id, content_type,
                                            content_data))) {
         result.emplace_back(std::move(content_data));
@@ -358,11 +351,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
   if (data.xuid == -1) {
     data.xuid = xuid;
   }
-  uint64_t used_xuid =
-      (data.xuid != -1 && data.xuid != 0) ? data.xuid.get() : xuid;
 
-  auto header_path = ResolvePackageHeaderPath(data.file_name(), used_xuid,
-                                              data.title_id, data.content_type);
+  auto header_path = PackageHeaderPath(ResolvePackagePath(xuid, data));
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
@@ -383,15 +373,40 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
 }
 
 X_RESULT ContentManager::ReadContentHeaderFile(
-    const std::string_view file_name, const uint64_t xuid,
+    const std::filesystem::path& package_path, const uint64_t xuid,
     const uint32_t title_id, XContentType content_type,
     XCONTENT_AGGREGATE_DATA& data) const {
-  auto header_file_path =
-      ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
+  auto header_file_path = PackageHeaderPath(package_path);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
   if (std::filesystem::exists(header_file_path)) {
     auto file = xe::filesystem::OpenFile(header_file_path, "rb");
+    if (!file) {
+      return X_STATUS_NO_SUCH_FILE;
+    }
+
+    // Upstream canary rewrites the header file as the whole container header,
+    // followed by the file name the save was created with.
+    auto header = vfs::XContentContainerDevice::ReadContainerHeader(file);
+    if (header && header->content_header.is_magic_valid()) {
+      char saved_name[sizeof(XCONTENT_DATA::file_name_raw)] = {};
+      fread(saved_name, 1, sizeof(saved_name), file);
+      fclose(file);
+      data = vfs::XContentContainerDevice::ContentDataFromHeader(*header);
+      // Identify the package by its location, as listing without a header does.
+      data.content_type = content_type;
+      data.title_id = title_id;
+      data.xuid = xuid;
+      const std::string file_name = xe::path_to_utf8(package_path.filename());
+      // Only a save has its name there, an extracted package has other data.
+      data.set_file_name(
+          content_type == XContentType::kSavedGame && saved_name[0]
+              ? std::string_view(saved_name,
+                                 strnlen(saved_name, sizeof(saved_name)))
+              : std::string_view(file_name));
+      return X_STATUS_SUCCESS;
+    }
+    fseek(file, 0, SEEK_SET);
 
     std::array<uint8_t, header_size> buffer;
 
@@ -469,8 +484,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  package->LoadPackageLicenseMask(PackageHeaderPath(package_path));
 
   content_license = package->GetPackageLicense();
   if (static_cast<uint32_t>(cvars::license_mask) > 0) {
@@ -524,9 +538,30 @@ X_RESULT ContentManager::GetContentThumbnail(
     fread(const_cast<uint8_t*>(buffer->data()), 1, buffer->size(), file);
     fclose(file);
     return X_ERROR_SUCCESS;
-  } else {
+  }
+
+  // A deleted package leaves its header behind.
+  if (!std::filesystem::exists(package_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
+
+  // Upstream canary moves the thumbnail into the header file.
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(
+      PackageHeaderPath(package_path));
+  if (!header || !header->content_header.is_magic_valid()) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  const auto& metadata = header->content_metadata;
+  const uint32_t max_thumbnail_size =
+      metadata.metadata_version >= 2 ? vfs::XContentMetadata::kThumbLengthV2
+                                     : vfs::XContentMetadata::kThumbLengthV1;
+  if (metadata.thumbnail_size == 0 ||
+      metadata.thumbnail_size > max_thumbnail_size) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  buffer->assign(metadata.thumbnail,
+                 metadata.thumbnail + metadata.thumbnail_size);
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::SetContentThumbnail(

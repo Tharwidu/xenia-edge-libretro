@@ -39,11 +39,11 @@
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_primitive_processor.h"
+#include "xenia/gpu/vulkan/vulkan_query_pool.h"
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
-#include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
@@ -52,6 +52,7 @@
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_provider.h"
 #include "xenia/ui/vulkan/vulkan_upload_buffer_pool.h"
+#include "xenia/ui/vulkan/vulkan_util.h"
 
 namespace xe {
 namespace gpu {
@@ -213,6 +214,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       bool skip_if_equal = true);
+  // sample_locations has to stay valid until barriers are submitted.
   bool PushImageMemoryBarrier(
       VkImage image, const VkImageSubresourceRange& subresource_range,
       VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
@@ -220,20 +222,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
       VkImageLayout old_layout, VkImageLayout new_layout,
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-      bool skip_if_equal = true);
+      bool skip_if_equal = true,
+      const VkSampleLocationsInfoEXT* sample_locations = nullptr);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
 
   // If [base_bytes, base_bytes + size_bytes) holds memexport output (which
   // under two-buffer routing lives in the host-imported buffer aliasing guest
-  // RAM), copies it into the device-local buffer so a following device-buffer
-  // read - a texture load - sees it. No-op for non-memexport ranges (already in
-  // the device buffer) and when the host buffer is unavailable. Called by the
+  // RAM), copies the pages holding it into the device-local buffer so a
+  // following device-buffer read - a texture load - sees it, or all of the
+  // range with whole_range. No-op for non-memexport ranges (already in the
+  // device buffer) and when the host buffer is unavailable. Called by the
   // texture cache before loading a texture. Ends the render pass.
   // Returns whether it copied, so an upload of the same range can be skipped.
   bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
-                                          uint32_t size_bytes);
+                                          uint32_t size_bytes,
+                                          bool whole_range = false);
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -295,8 +300,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void SetViewport(const VkViewport& viewport);
   void SetScissor(const VkRect2D& scissor);
 
-  std::string GetTitleStateSuffix() const override;
-
   // Debug marker methods - public so subsystems can annotate their operations.
   void PushDebugMarker(const char* format, ...);
   void PopDebugMarker();
@@ -306,6 +309,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  std::string MakeTitleStateSuffix() const override;
   XE_FORCEINLINE
   void WriteRegister(uint32_t index, uint32_t value) override;
   XE_FORCEINLINE
@@ -361,14 +365,28 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void OrderReadbackStagingWrite(VkBuffer staging_buffer);
   void StageMemexportReadback();
   void FlushMemexportStagingReadback();
+  void AwaitMemexportSubmission(uint64_t submission) {
+    CheckSubmissionCompletionAndDeviceLoss(submission);
+  }
+  // Without the host buffer or zero-copy, export output reaches guest RAM only
+  // through the staging copy, which a wait makes.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->host_buffer() != VK_NULL_HANDLE ||
+           shared_memory_->is_zero_copy();
+  }
+  void EndSubmissionForMemexport() { EndResolveSubmission(); }
   // Export ranges staged but not yet copied out, in record order - a later
   // copy of an overlapping range has to win.
   struct MemexportStagedRange {
     uint64_t key;
     uint32_t address;
     uint32_t length;
+    // Where address lies in the slot's buffer.
+    uint32_t offset;
   };
   std::vector<MemexportStagedRange> memexport_staged_;
+  // For EnsureMemexportRangeInDeviceBuffer.
+  std::vector<VkBufferCopy> memexport_copy_regions_;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -520,10 +538,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  // Checks if ending a submission right now would not cause potentially more
-  // delay than it would reduce - such as when there are unfinished graphics
-  // pipeline creation requests.
-  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ &&
@@ -536,52 +550,74 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void DestroyScratchBuffer();
 
-  // ZPD occlusion queries backend.
+  // Query segments backend for both ZPD occlusion query reports and
+  // VIZ visibility surveys & conditional rendering.
+  //
   // vkCmdBeginQuery is only valid inside a render pass, so segments split at
-  // pass end and resume at the next pass begin. If a report starts outside a
-  // pass, segment_pending_begin waits for the next. FSI queries clear a
+  // pass end and resume at the next pass begin. If a report or survey starts
+  // outside a pass, the segment waits for the next. FSI queries clear a
   // dedicated counter with vkCmdFillBuffer, so they may need to open before a
   // pass begins or split an active pass around the clear.
-  void EnsureZPDQueryResources() override;
-  void ShutdownZPDQueryResources() override {
-    zpd_resolves_in_flight_.clear();
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_fsi_ = false;
+  void EnsureQueryResources() override;
+  void ShutdownQueryResources() override {
+    query_resolves_in_flight_.clear();
+    active_query_index_ = UINT32_MAX;
+    active_query_generation_ = 0;
+    active_query_is_fsi_ = false;
     zpd_fsi_path_ = false;
     zpd_counter_index_force_update_ = true;
-    if (zpd_host_query_pool_) {
-      zpd_host_query_pool_->Shutdown();
+    if (host_query_pool_) {
+      host_query_pool_->Shutdown();
     }
   }
 
-  bool IsZPDQueryPoolReady() const override;
-  bool CanOpenZPDQuery() const override;
+  bool IsQueryPoolReady() const override;
+  bool CanOpenQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
-  bool CloseZPDQuery(ReportHandle report_handle,
-                     uint64_t& out_submission) override;
+  QueryOpenResult OpenQuery(bool can_close_submission) override;
+  bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                  uint64_t& out_submission) override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
+
+  bool EnsureVIZPredicateBuffer();
+  // Drains the queued predicate copies.
+  void RecordVIZPredicateCopies();
+  // Drains the queued copies if the draw's predicate is among them.
+  VkBuffer BindVIZPredicate(VkDeviceSize& offset_out);
+  void AwaitVIZQueryResolve(uint64_t wait_for_submission) override;
+  void ShutdownVIZQueryResources() {
+    viz_pending_copies_.clear();
+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           viz_predicate_buffer_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           viz_predicate_buffer_memory_);
+    viz_predicate_buffer_failed_ = false;
+  }
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control,
                           uint32_t draw_resolution_scale_x,
                           uint32_t draw_resolution_scale_y,
-                          bool depth_bias_in_pixel_shader);
+                          bool depth_bias_in_pixel_shader,
+                          bool window_offset_in_edram);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
   bool UpdateBindings(const VulkanShader* vertex_shader,
                       const VulkanShader* pixel_shader,
-                      bool interpreter_placeholder = false,
-                      bool placeholder_pixel_shader = false);
+                      bool interpreter_placeholder,
+                      bool placeholder_pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -637,14 +673,15 @@ class VulkanCommandProcessor final : public CommandProcessor {
     bool fsi = false;
     bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
+    VIZQueryHandle viz;
   };
-  uint32_t zpd_active_query_index_ = UINT32_MAX;
-  uint32_t zpd_active_query_generation_ = 0;
-  bool zpd_active_query_is_fsi_ = false;
+  uint32_t active_query_index_ = UINT32_MAX;
+  uint32_t active_query_generation_ = 0;
+  bool active_query_is_fsi_ = false;
   bool zpd_fsi_path_ = false;
   bool zpd_hybrid_supported_ = false;
   bool zpd_counter_index_force_update_ = true;
-  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  std::deque<PendingQueryResolve> query_resolves_in_flight_;
   // Fallback buffer for ZPD counter descriptor binding 1.
   VkBuffer zpd_counter_sink_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory zpd_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
@@ -778,7 +815,17 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
+  std::unique_ptr<VulkanQueryPool> host_query_pool_;
+
+  VkBuffer viz_predicate_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory viz_predicate_buffer_memory_ = VK_NULL_HANDLE;
+  bool viz_predicate_buffer_failed_ = false;
+  struct PendingVIZCopy {
+    uint32_t id;
+    uint32_t query_index;
+    bool fsi;
+  };
+  std::vector<PendingVIZCopy> viz_pending_copies_;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 

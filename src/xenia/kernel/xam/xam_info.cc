@@ -32,6 +32,7 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/ui/windowed_app_context.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/xbox.h"
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -344,15 +345,16 @@ dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
 }
 DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
 
-dword_result_t XamGetSystemVersion_entry() {
-  // eh, just picking one. If we go too low we may break new games, but
-  // this value seems to be used for conditionally loading symbols and if
-  // we pretend to be old we have less to worry with implementing.
-  // 0x200A3200
-  // 0x20096B00
-  return 0;
+// A kernel version packed as 4.4.16.8 bits.
+static uint32_t PackSystemVersion(const KernelVersion& version) {
+  return uint32_t(version.major) << 28 | (uint32_t(version.minor) & 0xF) << 24 |
+         uint32_t(version.build) << 8 | (uint32_t(version.qfe) & 0xFF);
 }
-DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kStub);
+
+dword_result_t XamGetSystemVersion_entry() {
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
+}
+DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kImplemented);
 
 void XCustomRegisterDynamicActions_entry() {
   // ???
@@ -380,6 +382,23 @@ dword_result_t XamIsCurrentTitleDash_entry(const ppc_context_t& ctx) {
   return ctx->kernel_state->title_id() == kDashboardID;
 }
 DECLARE_XAM_EXPORT1(XamIsCurrentTitleDash, kNone, kImplemented);
+
+dword_result_t XamSetDashContext_entry(dword_t value,
+                                       const ppc_context_t& ctx) {
+  // checks XexCheckExecutablePrivilege(8) but we don't care
+  if (value != ctx->kernel_state->dash_context_) {
+    ctx->kernel_state->dash_context_ = value;
+    kernel_state()->BroadcastNotification(
+        kXNotificationSystemDashContextChanged, 0);
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamSetDashContext, kNone, kImplemented);
+
+dword_result_t XamGetDashContext_entry(const ppc_context_t& ctx) {
+  return ctx->kernel_state->dash_context_;
+}
+DECLARE_XAM_EXPORT1(XamGetDashContext, kNone, kImplemented);
 
 dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
   auto module = kernel_state()->GetExecutableModule();
@@ -513,14 +532,49 @@ static std::filesystem::path ResolveHostFileName(
   return path;
 }
 
-void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
-  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+// Whether |path| names a device rather than a file next to the title.
+static bool NamesDevice(std::string_view path) {
+  return path.find(':') != std::string_view::npos || path.starts_with('\\');
+}
+
+// The console's XamLoaderLaunchTitleEx, which XamLoaderLaunchTitle calls with
+// flag 4. The D: drive path is only checked for flag 4.
+static void LaunchTitle(std::string path, std::string_view d_drive_path,
+                        uint32_t flags) {
+  // Unowned, this frame never unwinds.
+  auto* xam = kernel_state()->GetKernelModule<XamModule>("xam.xex").get();
 
   auto& loader_data = xam->loader_data();
   loader_data.launch_flags = flags;
 
-  // A null or empty path means exit to dashboard.
-  const std::string path = raw_name_ptr ? raw_name_ptr.value() : std::string();
+  // Flag 4 exits to the dashboard for a path rooted at a device. Flag 2 boots
+  // the disc in the tray in place of the path, and with no tray to emulate
+  // that exits to the dashboard too.
+  if ((flags & 2) || ((flags & 4) && (path.starts_with('\\') ||
+                                      d_drive_path.starts_with('\\')))) {
+    path.clear();
+  }
+  // A path on a device that doesn't resolve can't be launched, like the
+  // X:\xbox.xex XeFu exits to.
+  const vfs::Entry* entry = nullptr;
+  if (NamesDevice(path)) {
+    entry = kernel_state()->file_system()->ResolvePath(path);
+    if (!entry) {
+      XELOGW("XamLoaderLaunchTitle: {} does not exist, exiting to dashboard",
+             path);
+      // xbox.xex starts the XeFu build it picked for the game from XeFu's
+      // folder. XeFu exits to xbox.xex, which a folder can do without.
+      auto emulator = kernel_state()->emulator();
+      const std::string name = xe::utf8::find_name_from_guest_path(path);
+      if (emulator->title_id() == kXeFuTitleId &&
+          !xe::utf8::equal_case(name, "xbox.xex")) {
+        emulator->ReportMissingXeFuFile(name);
+      }
+      path.clear();
+    }
+  }
+
+  // An empty path means exit to dashboard.
   if (!path.empty()) {
     loader_data.launch_data_present = true;
 
@@ -540,7 +594,20 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
     remove_prefix("game:\\");
     remove_prefix("d:\\");
 
-    if (host_path.extension() == ".xex") {
+    if (NamesDevice(launch_path)) {
+      // Any other device is outside the title. Only a file a host directory
+      // backs can be launched from there.
+      auto host_entry = dynamic_cast<const vfs::HostPathEntry*>(entry);
+      if (!host_entry ||
+          (host_entry->attributes() & vfs::kFileAttributeDirectory)) {
+        XELOGW("XamLoaderLaunchTitle: can't launch {}, exiting to dashboard",
+               path);
+        kernel_state()->ExitToDashboard();
+        return;
+      }
+      host_path = host_entry->host_path();
+      launch_path = "";
+    } else if (host_path.extension() == ".xex") {
       host_path.remove_filename();
       host_path = ResolveHostFileName(host_path / launch_path);
       launch_path = "";
@@ -591,8 +658,13 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
         kernel_state()->emulator()->on_launch_new_title();
     if (on_launch_new_title) {
       XELOGI("XamLoaderLaunchTitle: spawning new title process");
+      // The new process has no drive of its own to find the game in.
+      auto* emulator = kernel_state()->emulator();
       on_launch_new_title(xe::path_to_utf8(host_path), launch_path,
-                          loader_data.launch_flags, launch_data_hex);
+                          loader_data.launch_flags, launch_data_hex,
+                          emulator->KeepsXboxGame(host_path)
+                              ? xe::path_to_utf8(emulator->xbox_disc_path())
+                              : std::string());
     }
 
     XELOGI("XamLoaderLaunchTitle: terminating to launch new title");
@@ -602,10 +674,39 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   XELOGI("XamLoaderLaunchTitle: game requested exit to dashboard");
   kernel_state()->ExitToDashboard();
 }
+
+void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
+  LaunchTitle(raw_name_ptr ? raw_name_ptr.value() : std::string(), {},
+              flags | 4);
+}
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
+
+// Nothing mounts the D: drive path, and the command line isn't passed on.
+void XamLoaderLaunchTitleEx_entry(lpstring_t raw_name_ptr,
+                                  lpstring_t raw_d_drive_path_ptr,
+                                  lpstring_t raw_command_line_ptr,
+                                  dword_t flags) {
+  const std::string d_drive_path =
+      raw_d_drive_path_ptr ? raw_d_drive_path_ptr.value() : std::string();
+  if (!d_drive_path.empty() || raw_command_line_ptr) {
+    XELOGW(
+        "XamLoaderLaunchTitleEx: not mounting D: drive path {} or passing "
+        "command line {}",
+        d_drive_path,
+        raw_command_line_ptr ? raw_command_line_ptr.value() : std::string());
+  }
+  LaunchTitle(raw_name_ptr ? raw_name_ptr.value() : std::string(), d_drive_path,
+              flags);
+}
+DECLARE_XAM_EXPORT1(XamLoaderLaunchTitleEx, kNone, kSketchy);
 
 void XamLoaderTerminateTitle_entry() { kernel_state()->ExitToDashboard(); }
 DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
+
+// Navigates to the URI pushed with XamPushBackURI, or with none reboots to the
+// dashboard.
+void XamNavigateBack_entry() { kernel_state()->ExitToDashboard(); }
+DECLARE_XAM_EXPORT1(XamNavigateBack, kNone, kSketchy);
 
 uint32_t XamAllocImpl(uint32_t flags, uint32_t size,
                       xe::be<uint32_t>* out_ptr) {
@@ -1082,6 +1183,16 @@ dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
   return X_E_NOT_IMPLEMENTED;
 }
 DECLARE_XAM_EXPORT1(XamLogLocalizationEtx, kNone, kStub);
+
+dword_result_t XamUpdateGetBaseSystemVersion_entry() {
+  return PackSystemVersion(KernelVersion(kBaseKernelBuildVersion));
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetBaseSystemVersion, kNone, kImplemented);
+
+dword_result_t XamUpdateGetCurrentSystemVersion_entry() {
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kImplemented);
 
 }  // namespace xam
 }  // namespace kernel

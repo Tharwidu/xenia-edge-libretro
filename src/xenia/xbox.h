@@ -35,6 +35,7 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_SUCCESS                                ((X_STATUS)0x00000000L)
 #define X_STATUS_ABANDONED_WAIT_0                       ((X_STATUS)0x00000080L)
 #define X_STATUS_USER_APC                               ((X_STATUS)0x000000C0L)
+#define X_STATUS_KERNEL_APC                             ((X_STATUS)0x00000100L)
 #define X_STATUS_ALERTED                                ((X_STATUS)0x00000101L)
 #define X_STATUS_TIMEOUT                                ((X_STATUS)0x00000102L)
 #define X_STATUS_PENDING                                ((X_STATUS)0x00000103L)
@@ -78,6 +79,7 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
 #define X_STATUS_NOT_A_DIRECTORY                        ((X_STATUS)0xC0000103L)
 #define X_STATUS_PROCESS_IS_TERMINATING                 ((X_STATUS)0xC000010AL)
+#define X_STATUS_CANCELLED                              ((X_STATUS)0xC0000120L)
 #define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)
 #define X_STATUS_ENTRYPOINT_NOT_FOUND                   ((X_STATUS)0xC0000139L)
 #define X_STATUS_MAPPED_ALIGNMENT                       ((X_STATUS)0xC0000220L)
@@ -594,9 +596,20 @@ enum X_MARKETPLACE_ENTRYPOINT : uint32_t {
   ContentList_Background = 4,
   ContentItem_Background = 5,
   ForcedNameChangeV1 = 6,
+  PrepaidCode = 7,
   ForcedNameChangeV2 = 8,
-  ProfileNameChange = 9,
-  ActiveDownloads = 12
+  GamerTagPurchase = 9,
+  SignUpCreditCard = 10,
+  SignUpParentCreditCard = 11,
+  ActiveDownloads = 12,
+  ViewDownloadDetails = 13,
+  GoldUpsell = 15,
+  TermsOfUse = 16,
+  PaymentOptions = 19,
+  PurchaseOrder = 21,
+  AccountSecurity = 23,
+  ViewTermsOfUse = 24,
+  MaxEntrypoint = 25
 };
 
 enum X_MARKETPLACE_DOWNLOAD_ITEMS_ENTRYPOINTS : uint32_t {

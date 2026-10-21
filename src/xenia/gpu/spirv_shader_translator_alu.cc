@@ -16,6 +16,7 @@
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
 namespace xe {
@@ -1404,6 +1405,59 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
           operand_storage[1], instr.scalar_operands[1], 0b0001);
       spv::Id result = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, operand_0, operand_1);
+      // TODO(boma): Experimental round to zero for Volition titles (5451080D,
+      // 4B4D07F6, 5451086D) that experience camera-independent, batch-boundary
+      // vertex explosions with the default round-to-nearest behavior.
+      // Real hardware rounding behavior needs to be verified.
+      if (cvars::mulsc_round_toward_zero) {
+        // Fma isn't guaranteed to be fused (spirv_to_dxil splits 32-bit Fma
+        // into a multiply and an add), so recover the product error with a
+        // Veltkamp split and Dekker error sum instead.
+        auto mul = [&](spv::Id a, spv::Id b) {
+          return builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a,
+                                                    b);
+        };
+        auto add = [&](spv::Id a, spv::Id b) {
+          return builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, a,
+                                                    b);
+        };
+        auto sub = [&](spv::Id a, spv::Id b) {
+          return builder_->createNoContractionBinOp(spv::OpFSub, type_float_, a,
+                                                    b);
+        };
+        spv::Id const_float_split = builder_->makeFloatConstant(4097.0f);
+        auto split = [&](spv::Id value, spv::Id& high, spv::Id& low) {
+          spv::Id scaled = mul(value, const_float_split);
+          high = sub(scaled, sub(scaled, value));
+          low = sub(value, high);
+        };
+        spv::Id operand_0_high, operand_0_low, operand_1_high, operand_1_low;
+        split(operand_0, operand_0_high, operand_0_low);
+        split(operand_1, operand_1_high, operand_1_low);
+        spv::Id error = sub(mul(operand_0_high, operand_1_high), result);
+        error = add(error, mul(operand_0_high, operand_1_low));
+        error = add(error, mul(operand_0_low, operand_1_high));
+        error = add(error, mul(operand_0_low, operand_1_low));
+        spv::Id rounded_away = builder_->createBinOp(
+            spv::OpLogicalNotEqual, type_bool_,
+            builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, error,
+                                  const_float_0_),
+            builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, result,
+                                  const_float_0_));
+        rounded_away = builder_->createBinOp(
+            spv::OpLogicalAnd, type_bool_, rounded_away,
+            builder_->createBinOp(spv::OpFOrdNotEqual, type_bool_, error,
+                                  const_float_0_));
+        // Opposite signs mean the product rounded away from zero.
+        spv::Id result_toward_zero = builder_->createUnaryOp(
+            spv::OpBitcast, type_float_,
+            builder_->createBinOp(
+                spv::OpISub, type_uint_,
+                builder_->createUnaryOp(spv::OpBitcast, type_uint_, result),
+                builder_->makeUintConstant(1)));
+        result = builder_->createTriOp(spv::OpSelect, type_float_, rounded_away,
+                                       result_toward_zero, result);
+      }
       if (!(instr.scalar_operands[0].GetIdenticalComponents(
                 instr.scalar_operands[1]) &
             0b0001)) {

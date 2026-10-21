@@ -354,6 +354,11 @@ constexpr bool IsAnySignSigned(uint8_t packed_signs) {
       packed_signs ^ (uint32_t(xenos::TextureSign::kSigned) * 0b01010101);
   return ((xor_signed | (xor_signed >> 1)) & 0b01010101) != 0b01010101;
 }
+// Whether a shader binding gets the signed view. Unsigned bindings of a fully
+// signed texture, which getBCF samples, get it as there is no unsigned view.
+constexpr bool IsSignedViewBound(uint8_t packed_signs, bool is_signed) {
+  return is_signed || !IsAnySignNotSigned(packed_signs);
+}
 
 // Returns normalized clamp modes specified in the fetch constant based on the
 // texture data dimension in it.

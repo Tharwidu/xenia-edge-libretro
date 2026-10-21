@@ -14,6 +14,7 @@
 #include "xenia/xbox.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <pwd.h>
@@ -216,14 +217,21 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
     open_access = O_RDONLY;
   }
   // pwrite(2) ignores the offset on an O_APPEND descriptor.
-  const bool append_only = (desired_access & FileAccess::kFileAppendData) &&
-                           !(desired_access & (FileAccess::kGenericWrite |
-                                               FileAccess::kFileWriteData |
-                                               FileAccess::kGenericAll));
+  bool append_only = (desired_access & FileAccess::kFileAppendData) &&
+                     !(desired_access &
+                       (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                        FileAccess::kGenericAll));
   if (append_only) {
     open_access |= O_APPEND;
   }
   int handle = open(path.c_str(), open_access);
+  if (handle == -1 && errno == EISDIR) {
+    // Win32 hands out a directory handle for any access through
+    // FILE_FLAG_BACKUP_SEMANTICS, and neither platform can write file data
+    // through one, so drop the write intent rather than fail.
+    append_only = false;
+    handle = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  }
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;

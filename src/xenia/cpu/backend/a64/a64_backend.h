@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -122,6 +123,24 @@ struct A64BackendContext {
   ReserveHelper* reserve_helper_;
   uint64_t cached_reserve_value_;
   uint64_t* guest_tick_count;
+  // Fixed for the life of the process, so generated code loads them with one
+  // ldr instead of building each as an immediate.
+  uint64_t indirection_table_bias;
+  uint64_t code_execute_base;
+  uint64_t external_indirection_table;
+  uint64_t guest_to_host_thunk_address;
+  // Same thunk without the q4-q31 save/restore, for CallExtern.
+  uint64_t guest_to_host_thunk_no_vec_address;
+  // Helpers Initialize emits into the code cache. The stack-repair entry is
+  // null unless --a64_enable_host_guest_stack_synchronization, which also
+  // gates every site that reads it.
+  uint64_t synchronize_guest_and_host_stack_helper_address;
+  uint64_t vrsqrtefp_scalar_helper_address;
+  uint64_t vrsqrtefp_vector_helper_address;
+  uint64_t frsqrte_helper_address;
+  // The address of the yield handler pointer, not the handler: the scheduler
+  // installs the handler after guest threads exist and drops it on shutdown.
+  uint64_t preempt_yield_handler_address;
   A64BackendStackpoint* stackpoints;
   // allocated by the first dynamic call resolve on this thread
   A64DynamicCallCacheEntry* dynamic_call_cache;
@@ -144,6 +163,29 @@ struct A64BackendContext {
 constexpr unsigned int DEFAULT_FPU_FPCR = 0;
 // Default FPCR for VMX mode (flush to zero, preserve NaN payloads).
 constexpr unsigned int DEFAULT_VMX_FPCR = (1 << 24);  // FZ
+// PPC rounding control (RN in bits 0-1, NI in bit 2) to FPCR. RMode is bits
+// 23:22, and NI maps to FZ (bit 24).
+inline constexpr uint32_t kGuestFpcrTable[8] = {
+    (0b00 << 22),              // PPC 0: nearest, IEEE
+    (0b11 << 22),              // PPC 1: toward zero, IEEE
+    (0b01 << 22),              // PPC 2: toward +inf, IEEE
+    (0b10 << 22),              // PPC 3: toward -inf, IEEE
+    (0b00 << 22) | (1 << 24),  // PPC 4: nearest, flush-to-zero
+    (0b11 << 22) | (1 << 24),  // PPC 5: toward zero, flush-to-zero
+    (0b01 << 22) | (1 << 24),  // PPC 6: toward +inf, flush-to-zero
+    (0b10 << 22) | (1 << 24),  // PPC 7: toward -inf, flush-to-zero
+};
+// The NaN fixups rely on FPCR.DN (bit 25) and FPCR.AH (bit 1) being clear in
+// every FPCR the guest runs with. SET_NJM only toggles FZ.
+static_assert([] {
+  constexpr uint32_t kNaNControl = (1u << 25) | (1u << 1);
+  for (uint32_t fpcr : kGuestFpcrTable) {
+    if (fpcr & kNaNControl) {
+      return false;
+    }
+  }
+  return !(DEFAULT_FPU_FPCR & kNaNControl) && !(DEFAULT_VMX_FPCR & kNaNControl);
+}());
 
 class A64Backend : public Backend {
  public:
@@ -158,16 +200,9 @@ class A64Backend : public Backend {
   std::string name() const override { return "a64"; }
 
   HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
-  GuestToHostThunk guest_to_host_thunk() const { return guest_to_host_thunk_; }
   ResolveFunctionThunk resolve_function_thunk() const {
     return resolve_function_thunk_;
   }
-  void* synchronize_guest_and_host_stack_helper() const {
-    return synchronize_guest_and_host_stack_helper_;
-  }
-  void* vrsqrtefp_scalar_helper() const { return vrsqrtefp_scalar_helper_; }
-  void* vrsqrtefp_vector_helper() const { return vrsqrtefp_vector_helper_; }
-  void* frsqrte_helper() const { return frsqrte_helper_; }
 
   bool Initialize(Processor* processor) override;
 
@@ -234,6 +269,7 @@ class A64Backend : public Backend {
 
   HostToGuestThunk host_to_guest_thunk_ = nullptr;
   GuestToHostThunk guest_to_host_thunk_ = nullptr;
+  GuestToHostThunk guest_to_host_thunk_no_vec_ = nullptr;
   ResolveFunctionThunk resolve_function_thunk_ = nullptr;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
   void* vrsqrtefp_scalar_helper_ = nullptr;
