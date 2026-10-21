@@ -53,14 +53,15 @@ struct Pair {
   std::unique_ptr<Associations> Make(
       KeyStore& keys, Address address, std::array<uint8_t, 4> reason = {},
       bool sequence_zero = false,
-      std::optional<CrossPlatform> cross_platform = std::nullopt) {
+      std::optional<CrossPlatform> cross_platform = std::nullopt,
+      uint64_t freshness = 100) {
     AssociationConfig config;
     config.identity = address;
     config.broadcast = broadcast;
     config.teardown_reason = reason;
     config.sequence_zero = sequence_zero;
     config.cross_platform = cross_platform;
-    config.freshness_time = [] { return uint64_t(100); };
+    config.freshness_time = [freshness] { return freshness; };
     config.metadata = MakeMetadata(0x10203040, 0x01020304, 2, 0, 1234, 1);
     config.credential = [&keys](const KeyId& id) -> std::optional<Key> {
       auto found = keys.find(id);
@@ -86,6 +87,13 @@ struct Pair {
     }
   }
 };
+
+Address WithIp(Address address, uint32_t ip) {
+  for (size_t i = 0; i < 4; ++i) {
+    address[i] = uint8_t(ip >> (24 - 8 * i));
+  }
+  return address;
+}
 
 // |frame| carrying |exchange| in place of its payload.
 Frame WithExchange(Frame frame, const RegistrationKeys& keys,
@@ -537,13 +545,7 @@ TEST_CASE(
   pair.b[id] = pair.key;
   constexpr uint32_t kLeftIp = 0xC0A8010A, kRightIp = 0xC0A80114,
                      kMask = 0xFFFFFF00;
-  auto at = [](Address address, uint32_t ip) {
-    for (size_t i = 0; i < 4; ++i) {
-      address[i] = uint8_t(ip >> (24 - 8 * i));
-    }
-    return address;
-  };
-  auto aa = at(pair.aa, kLeftIp), ba = at(pair.ba, kRightIp);
+  auto aa = WithIp(pair.aa, kLeftIp), ba = WithIp(pair.ba, kRightIp);
   auto left = pair.Make(pair.a, aa, {}, false, CrossPlatform{kLeftIp, kMask});
   auto right = pair.Make(pair.b, ba, {}, false, CrossPlatform{kRightIp, kMask});
   REQUIRE(left->Connect(ba, id, 100));
@@ -575,6 +577,11 @@ TEST_CASE(
   left->Receive(WithExchange(answer[0], registration, *response), 100);
   CHECK(left->Status(ba, id) == AssociationStatus::Pending);
   response->responder_address = ba;
+  response->initiator_address[3] = 30;
+  left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(left->Status(ba, id) == AssociationStatus::Pending);
+  response->initiator_address = aa;
+  response->initiator_address[4] = 1;
   response->responder_address[4] = 1;
   left->Receive(WithExchange(answer[0], registration, *response), 100);
   CHECK(left->Status(ba, id) == AssociationStatus::Established);
@@ -628,6 +635,71 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "A secure response completes a request when it names this console by "
+    "another of its XNADDRs",
+    "[net][secure][association]") {
+  Pair pair;
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 100));
+  pair.Transfer(*pair.left, *pair.right, 100);
+  auto answer = pair.right->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  auto response = DecodeExchange(registration, pair.id, answer[0].payload);
+  REQUIRE(response);
+  response->initiator_address = Identity(3);
+  pair.left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
+  // Consoles name the initiator by the XNADDR their title gave them.
+  response->initiator_address = pair.aa;
+  std::copy_n("127.0.0.", 8, response->initiator_address.begin());
+  pair.left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Established);
+}
+
+TEST_CASE("Crossed secure connects keep the association a garbled XNADDR named",
+          "[net][secure][association]") {
+  for (bool reverse : {false, true}) {
+    Pair pair;
+    auto& namer = reverse ? *pair.right : *pair.left;
+    auto& named = reverse ? *pair.left : *pair.right;
+    const auto self = reverse ? pair.ba : pair.aa;
+    auto target = reverse ? pair.aa : pair.ba;
+    std::copy_n("127.0.0.", 8, target.begin());
+    REQUIRE(namer.Connect(target, pair.id, 100));
+    REQUIRE(named.Connect(self, pair.id, 100));
+    auto from_namer = namer.TakeOutbound();
+    auto from_named = named.TakeOutbound();
+    for (auto& frame : from_named) {
+      namer.Receive(frame, 100);
+    }
+    if (!reverse) {
+      // The smaller MAC answers and names the peer as its title did.
+      auto answer = namer.TakeOutbound();
+      REQUIRE(answer.size() == 1);
+      auto registration =
+          DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+      auto response = DecodeExchange(registration, pair.id, answer[0].payload);
+      REQUIRE(response);
+      CHECK(response->response);
+      CHECK(response->initiator_address == target);
+      CHECK(response->responder_address == self);
+      named.Receive(answer[0], 100);
+    }
+    for (auto& frame : from_namer) {
+      named.Receive(frame, 100);
+    }
+    pair.Pump();
+    CHECK(namer.Status(target, pair.id) == AssociationStatus::Established);
+    CHECK(named.Status(self, pair.id) == AssociationStatus::Established);
+    auto events = namer.TakeEvents();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.back().type == AssociationEvent::Type::Connected);
+    CHECK(events.back().peer == target);
+  }
+}
+
+TEST_CASE(
     "Secure pending datagrams honor exact physical MTU without blocking later "
     "traffic",
     "[net][secure][association]") {
@@ -650,6 +722,154 @@ TEST_CASE(
   CHECK(events.back().packet.encrypted == Data().encrypted);
 }
 
+TEST_CASE(
+    "A secure request with a new challenge from an associated peer replaces "
+    "its association",
+    "[net][secure][association]") {
+  Pair pair;
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 100));
+  pair.Pump();
+  REQUIRE(pair.left->Status(pair.ba, pair.id) ==
+          AssociationStatus::Established);
+  // A full table still has room for the association that replaces another.
+  for (uint8_t machine = 3; machine < 34; ++machine) {
+    REQUIRE(pair.left->Connect(Identity(machine), pair.id, 100));
+  }
+  CHECK_FALSE(pair.left->Connect(Identity(34), pair.id, 100));
+  pair.left->TakeOutbound();
+  pair.left->TakeEvents();
+  // A request no newer than the peer's last exchange changes nothing.
+  auto stale = pair.Make(pair.b, pair.ba);
+  REQUIRE(stale->Connect(pair.aa, pair.id, 150));
+  pair.Transfer(*stale, *pair.left, 150);
+  CHECK(pair.left->TakeOutbound().empty());
+  CHECK(pair.left->TakeEvents().empty());
+  // The peer started over.
+  pair.right = pair.Make(pair.b, pair.ba, {}, false, std::nullopt, 200);
+  REQUIRE(pair.right->Connect(pair.aa, pair.id, 200));
+  pair.Transfer(*pair.right, *pair.left, 200);
+  // xam drops the old association without a teardown.
+  auto answer = pair.left->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  auto response = DecodeExchange(registration, pair.id, answer[0].payload);
+  REQUIRE(response);
+  CHECK(response->response);
+  pair.right->Receive(answer[0], 200);
+  pair.Pump(200);
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Established);
+  auto events = pair.left->TakeEvents();
+  REQUIRE(events.size() == 2);
+  CHECK(events[0].type == AssociationEvent::Type::Retired);
+  CHECK(events[1].type == AssociationEvent::Type::Connected);
+}
+
+TEST_CASE(
+    "A cross-platform peer that rejoins from another IP replaces its "
+    "association",
+    "[net][secure][association]") {
+  Pair pair;
+  auto id = pair.id;
+  id[0] |= SystemLinkKeyType(true);
+  pair.a[id] = pair.key;
+  pair.b[id] = pair.key;
+  constexpr uint32_t kLeftIp = 0xC0A8010A, kRightIp = 0xC0A80114,
+                     kMovedIp = 0xC0A8011E, kMask = 0xFFFFFF00;
+  auto aa = WithIp(pair.aa, kLeftIp), ba = WithIp(pair.ba, kRightIp),
+       moved = WithIp(pair.ba, kMovedIp);
+  pair.left = pair.Make(pair.a, aa, {}, false, CrossPlatform{kLeftIp, kMask});
+  pair.right = pair.Make(pair.b, ba, {}, false, CrossPlatform{kRightIp, kMask});
+  REQUIRE(pair.left->Connect(ba, id, 100));
+  pair.Pump();
+  REQUIRE(pair.left->Status(ba, id) == AssociationStatus::Established);
+  pair.left->TakeEvents();
+  pair.right =
+      pair.Make(pair.b, moved, {}, false, CrossPlatform{kMovedIp, kMask}, 200);
+  REQUIRE(pair.right->Connect(aa, id, 200));
+  pair.Transfer(*pair.right, *pair.left, 200);
+  // Only the answer leaves, no teardown to the old IP.
+  auto answer = pair.left->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  CHECK(answer[0].destination == Machine(moved, true));
+  pair.right->Receive(answer[0], 200);
+  pair.Pump(200);
+  CHECK(pair.right->Status(aa, id) == AssociationStatus::Established);
+  auto events = pair.left->TakeEvents();
+  REQUIRE(events.size() == 2);
+  CHECK(events[0].type == AssociationEvent::Type::Retired);
+  CHECK(events[0].peer == ba);
+  CHECK(events[1].type == AssociationEvent::Type::Connected);
+  CHECK(events[1].peer == moved);
+}
+
+TEST_CASE(
+    "A crossed secure connect answers a cross-platform peer at the IP it came "
+    "from",
+    "[net][secure][association]") {
+  Pair pair;
+  auto id = pair.id;
+  id[0] |= SystemLinkKeyType(true);
+  pair.a[id] = pair.key;
+  pair.b[id] = pair.key;
+  constexpr uint32_t kLeftIp = 0xC0A8010A, kRightIp = 0xC0A80114,
+                     kStaleIp = 0xC0A8011E, kMask = 0xFFFFFF00;
+  auto aa = WithIp(pair.aa, kLeftIp), ba = WithIp(pair.ba, kRightIp),
+       stale = WithIp(pair.ba, kStaleIp);
+  pair.left = pair.Make(pair.a, aa, {}, false, CrossPlatform{kLeftIp, kMask});
+  pair.right = pair.Make(pair.b, ba, {}, false, CrossPlatform{kRightIp, kMask});
+  REQUIRE(pair.left->Connect(stale, id, 100));
+  REQUIRE(pair.right->Connect(aa, id, 100));
+  pair.left->TakeOutbound();
+  pair.Transfer(*pair.right, *pair.left, 100);
+  auto answer = pair.left->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  CHECK(answer[0].destination == Machine(ba, true));
+  pair.right->Receive(answer[0], 100);
+  pair.Pump();
+  CHECK(pair.right->Status(aa, id) == AssociationStatus::Established);
+  CHECK(pair.left->Status(stale, id) == AssociationStatus::Established);
+}
+
+TEST_CASE("A crossed secure connect keeps what the yielding side queued",
+          "[net][secure][association]") {
+  Pair pair;
+  REQUIRE(pair.left->Send(pair.ba, pair.id, Data(), 100));
+  REQUIRE(pair.right->Connect(pair.aa, pair.id, 100));
+  auto from_left = pair.left->TakeOutbound();
+  pair.Transfer(*pair.right, *pair.left, 100);
+  for (auto& frame : from_left) {
+    pair.right->Receive(frame, 100);
+  }
+  pair.Pump();
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+  auto events = pair.right->TakeEvents();
+  REQUIRE(events.size() == 2);
+  CHECK(events[1].type == AssociationEvent::Type::Datagram);
+  CHECK(events[1].packet.encrypted == Data().encrypted);
+}
+
+TEST_CASE("A retried secure request gets no answer once associated",
+          "[net][secure][association]") {
+  Pair pair;
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 100));
+  auto request = pair.left->TakeOutbound().at(0);
+  pair.right->Receive(request, 100);
+  pair.Transfer(*pair.right, *pair.left, 100);
+  pair.Pump();
+  REQUIRE(pair.right->Status(pair.aa, pair.id) ==
+          AssociationStatus::Established);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  auto retry = DecodeExchange(registration, pair.id, request.payload);
+  REQUIRE(retry);
+  retry->freshness = 1000;
+  pair.right->Receive(WithExchange(request, registration, *retry), 1000);
+  CHECK(pair.right->TakeOutbound().empty());
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+}
+
 TEST_CASE("Authenticated teardown preserves configurable opaque reason bytes",
           "[net][secure][association]") {
   Pair pair;
@@ -663,6 +883,14 @@ TEST_CASE("Authenticated teardown preserves configurable opaque reason bytes",
   REQUIRE(events.size() == 1);
   CHECK(events[0].type == AssociationEvent::Type::Retired);
   CHECK(events[0].packet.encrypted == std::vector<uint8_t>{1, 2, 3, 4});
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 200));
+  pair.Pump(200);
+  pair.right->TakeEvents();
+  pair.left->Close(pair.ba, pair.id, 201, std::array<uint8_t, 4>{11, 0, 0, 0});
+  pair.Transfer(*pair.left, *pair.right, 201);
+  events = pair.right->TakeEvents();
+  REQUIRE(events.size() == 1);
+  CHECK(events[0].packet.encrypted == std::vector<uint8_t>{11, 0, 0, 0});
 }
 
 }  // namespace xe::net::secure::test

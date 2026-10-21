@@ -864,6 +864,118 @@ TEST_CASE("System Link keeps a peer through a simultaneous connect",
   CHECK(peer == pair.a->identity());
 }
 
+TEST_CASE("System Link maps the XNADDRs of one machine to one address",
+          "[net][system_link]") {
+  Pair pair;
+  uint32_t address, again;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, address) == 0);
+  auto garbled = pair.b->identity();
+  std::copy_n("192.0.2.", 8, garbled.begin());
+  REQUIRE(pair.a->Map(garbled, pair.id, again) == 0);
+  CHECK(again == address);
+  Address peer;
+  KeyId id;
+  REQUIRE(pair.a->Reverse(again, peer, id) == 0);
+  CHECK(peer == pair.b->identity());
+  auto other = pair.b->identity();
+  other[15] ^= 1;
+  REQUIRE(pair.a->Map(other, pair.id, again) == 0);
+  CHECK(again != address);
+  // xam refuses an XNADDR without a MAC.
+  auto unnamed = pair.b->identity();
+  std::fill_n(unnamed.begin() + kEnetOffset, 6, 0);
+  CHECK(pair.a->Map(unnamed, pair.id, again) == kWsaInvalid);
+}
+
+TEST_CASE("System Link maps an online peer whose XNADDR changed anew",
+          "[net][system_link]") {
+  Pair pair;
+  KeyId online = pair.id;
+  online[0] |= 0x80;
+  REQUIRE(pair.a->RegisterKey(online, pair.key) == 0);
+  uint32_t address, again;
+  REQUIRE(pair.a->Map(pair.b->identity(), online, address) == 0);
+  REQUIRE(pair.a->Map(pair.b->identity(), online, again) == 0);
+  CHECK(again == address);
+  auto changed = pair.b->identity();
+  changed[4] ^= 1;
+  REQUIRE(pair.a->Map(changed, online, again) == 0);
+  CHECK(again != address);
+  Address peer;
+  KeyId id;
+  CHECK(pair.a->Reverse(address, peer, id) == kWsaInvalid);
+  REQUIRE(pair.a->Reverse(again, peer, id) == 0);
+  CHECK(peer == changed);
+  CHECK(pair.a->peers().size() == 1);
+}
+
+TEST_CASE("System Link maps a peer that started over anew",
+          "[net][system_link]") {
+  Pair pair;
+  uint32_t to_b, to_a;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, to_b) == 0);
+  REQUIRE(pair.a->Connect(to_b) == 0);
+  REQUIRE(WaitFor([&] { return pair.a->ConnectStatus(to_b) == 2; }));
+  pair.b.reset();
+  pair.b = pair.Make(1, pair.broadcast);
+  REQUIRE(pair.b->RegisterKey(pair.id, pair.key) == 0);
+  REQUIRE(pair.b->Map(pair.a->identity(), pair.id, to_a) == 0);
+  REQUIRE(pair.b->Connect(to_a) == 0);
+  REQUIRE(WaitFor([&] { return pair.b->ConnectStatus(to_a) == 2; }));
+  CHECK(WaitFor([&] { return pair.a->ConnectStatus(to_b) == 3; }));
+  // The new association maps once it carries the peer's first packet.
+  std::vector<Peer> peers;
+  CHECK(WaitFor([&] {
+    peers = pair.a->peers();
+    return !peers.empty();
+  }));
+  REQUIRE(peers.size() == 1);
+  CHECK(peers[0].secure_address != to_b);
+  CHECK(pair.a->ConnectStatus(peers[0].secure_address) == 2);
+}
+
+TEST_CASE(
+    "System Link keeps a peer named by a garbled XNADDR through a "
+    "simultaneous connect",
+    "[net][system_link]") {
+  for (bool reverse : {false, true}) {
+    Pair pair;
+    auto& namer = reverse ? *pair.b : *pair.a;
+    auto& named = reverse ? *pair.a : *pair.b;
+    auto garbled = named.identity();
+    std::copy_n("192.0.2.", 8, garbled.begin());
+    uint32_t to_named, to_namer;
+    REQUIRE(namer.Map(garbled, pair.id, to_named) == 0);
+    REQUIRE(named.Map(namer.identity(), pair.id, to_namer) == 0);
+    pair.transports[0]->Hold();
+    pair.transports[1]->Hold();
+    CHECK(namer.Connect(to_named) == 0);
+    CHECK(named.Connect(to_namer) == 0);
+    CHECK(WaitFor([&] {
+      return pair.transports[0]->held() > 0 && pair.transports[1]->held() > 0;
+    }));
+    pair.transports[0]->Release();
+    pair.transports[1]->Release();
+    CHECK(WaitFor([&] {
+      return namer.ConnectStatus(to_named) == 2 &&
+             named.ConnectStatus(to_namer) == 2;
+    }));
+    auto namer_port = Bind(namer, 1001, false);
+    auto named_port = Bind(named, 1001, false);
+    REQUIRE(namer_port);
+    REQUIRE(named_port);
+    const std::vector<uint8_t> data{1, 2, 3};
+    uint32_t error = 0;
+    REQUIRE(named_port->Send({to_namer, 1001}, data, error) == 3);
+    REQUIRE(Ready(*namer_port));
+    std::array<uint8_t, 8> buffer;
+    Endpoint source;
+    REQUIRE(namer_port->Receive(buffer, false, source, 0, error) == 3);
+    CHECK(source == Endpoint{to_named, 1001});
+    CHECK(namer.peers().size() == 1);
+  }
+}
+
 TEST_CASE("System Link loops datagrams to its own address back",
           "[net][system_link]") {
   Pair pair;
@@ -1342,6 +1454,35 @@ TEST_CASE("System Link streams end when the peer goes away",
   CHECK(error == kWsaConnectionReset);
 }
 
+TEST_CASE(
+    "System Link streams reach a peer mapped by a garbled XNADDR that "
+    "connected first",
+    "[net][system_link][tcp]") {
+  Pair pair;
+  auto garbled = pair.b->identity();
+  std::copy_n("192.0.2.", 8, garbled.begin());
+  uint32_t host, to_a;
+  REQUIRE(pair.a->Map(garbled, pair.id, host) == 0);
+  REQUIRE(pair.b->Map(pair.a->identity(), pair.id, to_a) == 0);
+  REQUIRE(pair.b->Connect(to_a) == 0);
+  REQUIRE(WaitFor([&] { return pair.a->ConnectStatus(host) == 2; }));
+  auto listener = Listen(*pair.b, 1003);
+  auto client = Stream(*pair.a);
+  REQUIRE(client->Connect({host, 1003}, kWait) == 0);
+  Endpoint source;
+  uint32_t error = 0;
+  auto accepted = listener->Accept(source, kWait, error);
+  REQUIRE(accepted);
+  const auto reply = Pattern(7, 3);
+  REQUIRE(SendAll(*accepted, reply));
+  CHECK(ReceiveAll(*client, reply.size()) == reply);
+  std::atomic<uint32_t> events{0};
+  client->SetReadyCallback([&](uint32_t happened) { events |= happened; });
+  REQUIRE(pair.b->Unmap(to_a) == 0);
+  CHECK(WaitFor([&] { return pair.a->peers().empty(); }));
+  CHECK(WaitFor([&] { return events.load() & kStreamClose; }));
+}
+
 // A connected stream on each side, the client on a and the host on b.
 struct StreamPair {
   Pair pair;
@@ -1671,6 +1812,91 @@ TEST_CASE("Cross-platform System Links talk over their subnet's addresses",
                                                  kSystemLinkPort,
                                                  kSystemLinkPort});
   }
+}
+
+TEST_CASE(
+    "Cross-platform System Link maps a peer that moved to another IP anew",
+    "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  uint32_t address, to_a, moved_address;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, address) == 0);
+  REQUIRE(pair.a->Connect(address) == 0);
+  REQUIRE(WaitFor([&] { return pair.a->ConnectStatus(address) == 2; }));
+  REQUIRE(pair.b->Map(pair.a->identity(), pair.id, to_a) == 0);
+  REQUIRE(WaitFor([&] { return pair.b->ConnectStatus(to_a) == 2; }));
+  auto rx = Bind(*pair.a, 1001, false);
+  auto tx = Bind(*pair.b, 1001, false);
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({to_a, 1001}, data, error) == 3);
+  REQUIRE(Ready(*rx));
+  auto moved = pair.b->identity();
+  moved[3] += 10;
+  REQUIRE(pair.a->Map(moved, pair.id, moved_address) == 0);
+  CHECK(moved_address != address);
+  // What arrived from the old address goes with it.
+  CHECK_FALSE(rx->Readable());
+  Address peer;
+  KeyId id;
+  CHECK(pair.a->Reverse(address, peer, id) == kWsaInvalid);
+  CHECK(pair.a->peers().size() == 1);
+  // The old association ends with a teardown.
+  CHECK(WaitFor([&] { return pair.b->ConnectStatus(to_a) == 3; }));
+  CHECK(pair.a->Reverse(moved_address, peer, id) == 0);
+}
+
+TEST_CASE(
+    "Cross-platform System Link keeps the address its title mapped for a peer "
+    "that connects from another IP",
+    "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  auto stale = pair.b->identity();
+  stale[3] += 10;
+  uint32_t to_b, to_a;
+  REQUIRE(pair.a->Map(stale, pair.id, to_b) == 0);
+  REQUIRE(pair.b->Map(pair.a->identity(), pair.id, to_a) == 0);
+  REQUIRE(pair.b->Connect(to_a) == 0);
+  CHECK(WaitFor([&] { return pair.a->ConnectStatus(to_b) == 2; }));
+  auto rx = Bind(*pair.b, 1001, false);
+  auto tx = Bind(*pair.a, 1001, false);
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({to_b, 1001}, data, error) == 3);
+  REQUIRE(Ready(*rx));
+  std::array<uint8_t, 8> buffer;
+  Endpoint source;
+  REQUIRE(rx->Receive(buffer, false, source, 0, error) == 3);
+  CHECK(source == Endpoint{to_a, 1001});
+  CHECK(pair.b->ConnectStatus(to_a) == 2);
+  CHECK(pair.a->peers().size() == 1);
+  auto listener = Listen(*pair.b, 1003);
+  auto client = Stream(*pair.a);
+  REQUIRE(client->Connect({to_b, 1003}, kWait) == 0);
+  auto accepted = listener->Accept(source, kWait, error);
+  REQUIRE(accepted);
+  std::atomic<uint32_t> events{0};
+  client->SetReadyCallback([&](uint32_t happened) { events |= happened; });
+  // The peer's teardown ends what the title mapped.
+  REQUIRE(pair.b->Unmap(to_a) == 0);
+  CHECK(WaitFor([&] { return pair.a->peers().empty(); }));
+  CHECK(WaitFor([&] { return events.load() & kStreamClose; }));
+}
+
+TEST_CASE(
+    "Cross-platform System Link maps a peer anew each time its IP changes back",
+    "[net][system_link][cross_platform]") {
+  CrossPlatformPair pair;
+  uint32_t address, stale_address, again;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, address) == 0);
+  REQUIRE(pair.a->Connect(address) == 0);
+  REQUIRE(WaitFor([&] { return pair.a->ConnectStatus(address) == 2; }));
+  auto stale = pair.b->identity();
+  stale[3] += 10;
+  REQUIRE(pair.a->Map(stale, pair.id, stale_address) == 0);
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, again) == 0);
+  CHECK(again != address);
+  REQUIRE(pair.a->Connect(again) == 0);
+  CHECK(WaitFor([&] { return pair.a->ConnectStatus(again) == 2; }));
 }
 
 TEST_CASE("Cross-platform System Link only reaches peers of its subnet",

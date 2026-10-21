@@ -99,7 +99,7 @@ struct QosResult {
 };
 
 struct Peer {
-  // The peer's XNADDR as the guest passed it.
+  // The XNADDR the peer was first mapped by.
   secure::Address address{};
   KeyId key_id{};
   uint32_t secure_address = 0;

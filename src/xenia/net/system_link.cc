@@ -56,6 +56,8 @@ constexpr uint16_t kLastReservedPort = 1257;
 constexpr uint32_t kBroadcast = 0xFFFFFFFF;
 // What this console's own XNADDR maps to.
 constexpr uint32_t kLoopback = 0x7F000001;
+// The teardown reason xam sends when a peer's address changed.
+constexpr std::array<uint8_t, 4> kAddressChanged{0x0B, 0, 0, 0};
 // A QoS lookup asks a host this often for its data before giving up.
 constexpr unsigned kQosAttempts = 4;
 constexpr uint64_t kQosRetryMs = 400;
@@ -462,6 +464,10 @@ struct SystemLink::State {
     return secure::Machine(address, cross_platform.has_value());
   }
 
+  bool SameMachine(const Address& a, const Address& b) const {
+    return secure::SameMachine(a, b, cross_platform.has_value());
+  }
+
   // QoS records travel outside any association.
   bool ReceiveQos(const secure::Frame& frame) {
     const auto header = secure::PeekQos(frame.payload);
@@ -643,7 +649,16 @@ struct SystemLink::State {
     return result;
   }
 
-  uint32_t Map(const Address& address, const KeyId& id, uint32_t& secure) {
+  // Peers are one per MAC and key like xam's associations.
+  static bool SamePeer(const Address& a, const KeyId& a_id, const Address& b,
+                       const KeyId& b_id) {
+    return a_id == b_id && Enet(a) == Enet(b);
+  }
+
+  // |inbound| maps a peer that reached this console, which xam answers in the
+  // association its title mapped whatever XNADDR it named the peer by.
+  uint32_t Map(const Address& address, const KeyId& id, uint32_t& secure,
+               bool inbound = false) {
     secure = 0;
     // This console's own XNADDR maps to loopback with any key.
     if (Enet(address) == Enet(identity)) {
@@ -651,14 +666,29 @@ struct SystemLink::State {
       return 0;
     }
     const uint32_t ina = Ina(address);
-    if (!keys.contains(id) || !ina || ina == kBroadcast) {
+    // xam also refuses an XNADDR without a MAC.
+    if (!keys.contains(id) || Enet(address) == secure::Mac{} || !ina ||
+        ina == kBroadcast) {
       return kWsaInvalid;
     }
-    for (const auto& [token, peer] : peers) {
-      if (peer.key_id == id && peer.address == address) {
-        secure = token;
+    auto found =
+        std::find_if(peers.begin(), peers.end(), [&](const auto& entry) {
+          return SamePeer(entry.second.address, entry.second.key_id, address,
+                          id);
+        });
+    if (found != peers.end()) {
+      const auto& peer = found->second;
+      // A title naming a cross-platform peer by another IP or an online peer
+      // by another XNADDR replaces its association.
+      if (inbound || (secure::SystemLinkKeyId(id, cross_platform.has_value())
+                          ? SameMachine(peer.address, address)
+                          : peer.address == address)) {
+        secure = found->first;
         return 0;
       }
+      const Address old = peer.address;
+      associations.Close(old, id, Now(), kAddressChanged, false);
+      Retire(old, id);
     }
     if (peers.size() >= kPeerLimit) {
       return kWsaNoBuffers;
@@ -675,14 +705,8 @@ struct SystemLink::State {
   }
 
   void Retire(const Address& address, const KeyId& id) {
-    // A simultaneous connect retires one association and keeps another to the
-    // peer.
-    if (associations.Status(address, id) !=
-        secure::AssociationStatus::Missing) {
-      return;
-    }
     std::erase_if(peers, [&](const auto& entry) {
-      if (entry.second.key_id != id || entry.second.address != address) {
+      if (!SamePeer(entry.second.address, entry.second.key_id, address, id)) {
         return false;
       }
       for (auto& [port, weak] : ports) {
@@ -694,10 +718,12 @@ struct SystemLink::State {
     });
     // Connections end with the association and nothing reaches the peer any
     // more to tell it.
-    const Route route{address, id, false};
     for (auto& stream : streams) {
       auto& connection = stream->connection;
-      if (!connection || stream->route != route || connection->closed()) {
+      const auto& route = stream->route;
+      if (!connection || route.loopback ||
+          !SamePeer(route.address, route.id, address, id) ||
+          connection->closed()) {
         continue;
       }
       if (!connection->connected()) {
@@ -725,13 +751,18 @@ struct SystemLink::State {
       } else if (event.type == AssociationEvent::Type::Retired) {
         Retire(event.peer, event.id);
         continue;
-      } else if (Map(event.peer, event.id, source) ||
+      } else if (Map(event.peer, event.id, source, true) ||
                  event.type == AssociationEvent::Type::Connected) {
         // Mapping on Connected shows the peer to the side that accepted.
         continue;
       }
       if (event.packet.kind == Kind::Tcp) {
-        TcpInput({event.peer, event.id, false}, source, event.packet, Now());
+        // Streams route by the XNADDR the peer was mapped by.
+        auto mapped = peers.find(source);
+        if (mapped != peers.end()) {
+          TcpInput({mapped->second.address, event.id, false}, source,
+                   event.packet, Now());
+        }
         continue;
       }
       if (!discovery) {

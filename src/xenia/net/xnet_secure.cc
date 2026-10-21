@@ -638,8 +638,7 @@ bool ResponseMatches(const Exchange& request, const Exchange& response) {
   return !request.response && response.response && ValidExchange(request) &&
          ValidExchange(response) && request.id == response.id &&
          request.initiator_spi == response.initiator_spi &&
-         request.initiator_challenge == response.initiator_challenge &&
-         request.initiator_address == response.initiator_address;
+         request.initiator_challenge == response.initiator_challenge;
 }
 
 bool ReplayWindow::Permitted(uint32_t sequence) const {

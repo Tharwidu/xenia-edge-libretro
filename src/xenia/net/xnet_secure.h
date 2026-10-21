@@ -125,6 +125,10 @@ constexpr bool SystemLinkKeyId(const KeyId& id, bool cross_platform) {
 Mac IpMachine(uint32_t address);
 // The machine an XNADDR names.
 Mac Machine(const Address& address, bool cross_platform);
+// Whether |a| and |b| name one machine by its MAC and for cross-platform
+// System Link also by its IP. xam ignores the other fields, which titles may
+// garble.
+bool SameMachine(const Address& a, const Address& b, bool cross_platform);
 // Whether the IP of |address| belongs to a peer of the subnet, which isn't
 // this machine, the subnet's broadcast address or a loopback address.
 bool SubnetPeer(const Address& address, const CrossPlatform& cross_platform);
@@ -202,8 +206,8 @@ std::optional<std::array<uint8_t, 256>> EncodeExchange(
 std::optional<Exchange> DecodeExchange(const RegistrationKeys& keys,
                                        const KeyId& id,
                                        std::span<const uint8_t> wire);
-// The responder answers with its own XNADDR, which the caller matches by
-// machine against the one the request named.
+// The responder names itself by its own XNADDR and the initiator by the one it
+// keeps for it, which the caller matches by machine.
 bool ResponseMatches(const Exchange& request, const Exchange& response);
 
 // QoS records follow a zero SPI like exchanges and use the registration keys

@@ -64,7 +64,11 @@ class Associations {
   void Receive(const Frame& frame, uint64_t now_ms);
   void Tick(uint64_t now_ms);
   void Unregister(const KeyId& id, uint64_t now_ms);
-  void Close(const Address& peer, const KeyId& id, uint64_t now_ms);
+  // Sends |reason| in place of the configured teardown reason when set.
+  // |report| queues a Retired event.
+  void Close(const Address& peer, const KeyId& id, uint64_t now_ms,
+             std::optional<std::array<uint8_t, 4>> reason = std::nullopt,
+             bool report = true);
   void Reset();
   AssociationStatus Status(const Address& peer, const KeyId& id) const;
   std::vector<Frame> TakeOutbound();
@@ -79,9 +83,10 @@ class Associations {
 
   Mac MachineOf(const Address& address) const;
   bool SystemLinkKey(const KeyId& id) const;
-  // Whether |a| and |b| name one machine by its MAC and for cross-platform
-  // System Link also by its IP.
   bool SameMachine(const Address& a, const Address& b) const;
+  // The state of the MAC |peer| names, keyed by the XNADDR it was first named
+  // by.
+  State* Find(const Address& peer, const KeyId& id) const;
   uint32_t NewSpi();
   uint64_t NewFreshness();
   bool Emit(Mac destination, std::vector<uint8_t> payload,
@@ -89,7 +94,9 @@ class Associations {
   bool ExchangePacket(State& state, uint64_t now_ms);
   bool Protected(State& state, const Packet& packet, uint64_t now_ms);
   void Established(State& state, uint64_t now_ms);
-  void Retired(PeerKey key);
+  // Drops |key| and the output it queued. |report| also drops its events and
+  // tells the owner it retired.
+  void Retired(PeerKey key, bool report = true);
 
   AssociationConfig config_;
   Mac local_{};

@@ -97,6 +97,11 @@ Mac Machine(const Address& address, bool cross_platform) {
   return mac;
 }
 
+bool SameMachine(const Address& a, const Address& b, bool cross_platform) {
+  return Machine(a, false) == Machine(b, false) &&
+         (!cross_platform || Ipv4(a) == Ipv4(b));
+}
+
 bool BroadcastPayload(std::span<const uint8_t> payload) {
   return payload.size() >= 4 && payload[0] && !payload[1] && !payload[2] &&
          !payload[3];

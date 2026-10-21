@@ -24,14 +24,6 @@ namespace {
 // limit so a window's worth of them leaves room for everything else.
 constexpr size_t kOutboundLimit = 512, kTcpOutboundLimit = 384;
 
-bool SameRequest(const Exchange& a, const Exchange& b) {
-  return a.id == b.id && a.initiator_spi == b.initiator_spi &&
-         a.initiator_challenge == b.initiator_challenge &&
-         a.public_value == b.public_value &&
-         a.initiator_address == b.initiator_address &&
-         a.responder_address == b.responder_address;
-}
-
 uint32_t Spi(std::span<const uint8_t> payload) {
   return (uint32_t(payload[1]) << 16) | (uint32_t(payload[2]) << 8) |
          payload[3];
@@ -82,10 +74,18 @@ bool Associations::SystemLinkKey(const KeyId& id) const {
 }
 
 bool Associations::SameMachine(const Address& a, const Address& b) const {
-  // xam ignores the other fields, which titles may garble.
-  return Machine(a, false) == Machine(b, false) &&
-         (!config_.cross_platform ||
-          std::equal(a.begin(), a.begin() + 4, b.begin()));
+  return secure::SameMachine(a, b, config_.cross_platform.has_value());
+}
+
+Associations::State* Associations::Find(const Address& peer,
+                                        const KeyId& id) const {
+  // xam keeps one association per MAC and key.
+  for (const auto& [key, state] : states_) {
+    if (key.second == id && Machine(key.first, false) == Machine(peer, false)) {
+      return state.get();
+    }
+  }
+  return nullptr;
 }
 
 uint32_t Associations::NewSpi() {
@@ -141,7 +141,7 @@ bool Associations::ExchangePacket(State& state, uint64_t now) {
 }
 
 bool Associations::Connect(const Address& peer, const KeyId& id, uint64_t now) {
-  if (states_.contains({peer, id})) {
+  if (Find(peer, id)) {
     return true;
   }
   if (peer == config_.identity || MachineOf(peer) == local_ ||
@@ -207,7 +207,7 @@ bool Associations::Send(const Address& peer, const KeyId& id, Packet packet,
       !Connect(peer, id, now)) {
     return false;
   }
-  auto& state = *states_.at({peer, id});
+  auto& state = *Find(peer, id);
   if (state.status == AssociationStatus::Established) {
     return Protected(state, packet, now);
   }
@@ -266,7 +266,7 @@ void Associations::Established(State& state, uint64_t now) {
   }
 }
 
-void Associations::Retired(PeerKey key) {
+void Associations::Retired(PeerKey key, bool report) {
   auto found = states_.find(key);
   if (found == states_.end()) {
     return;
@@ -288,6 +288,9 @@ void Associations::Retired(PeerKey key) {
     return std::equal(key.second.begin(), key.second.end(),
                       frame.payload.begin() + 12);
   });
+  if (!report) {
+    return;
+  }
   std::erase_if(events_, [&](const AssociationEvent& event) {
     return event.peer == key.first && event.id == key.second;
   });
@@ -342,7 +345,8 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
       return;
     }
     if (exchange->response) {
-      // The responder names itself, not the XNADDR the request named.
+      // The responder may name both machines by XNADDRs other than the
+      // request's.
       auto found =
           std::find_if(states_.begin(), states_.end(), [&](const auto& item) {
             return item.first.second == id &&
@@ -353,19 +357,21 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
         return;
       }
       auto& state = *found->second;
-      const bool same_machine = SameMachine(state.request.responder_address,
-                                            exchange->responder_address);
+      const bool machines =
+          SameMachine(exchange->initiator_address, config_.identity) &&
+          SameMachine(state.request.responder_address,
+                      exchange->responder_address);
       const bool source_matches = frame.source == MachineOf(state.key.first);
       if (!state.initiator || !ResponseMatches(state.request, *exchange) ||
-          !same_machine || !source_matches ||
+          !machines || !source_matches ||
           (state.have_freshness &&
            !FreshnessNewer(exchange->freshness, state.remote_freshness,
                            true))) {
         XELOGD(
             "XNet exchange rejected: initiator={}, request matches={}, "
-            "same machine={}, source matches={}",
+            "machines match={}, source matches={}",
             state.initiator, ResponseMatches(state.request, *exchange),
-            same_machine, source_matches);
+            machines, source_matches);
         return;
       }
       // A retried response may confirm an established association but never
@@ -408,29 +414,43 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
         frame.source != MachineOf(exchange->initiator_address)) {
       return;
     }
-    PeerKey key{exchange->initiator_address, id};
-    auto found = states_.find(key);
-    if (found != states_.end()) {
-      auto& state = *found->second;
-      if (!state.initiator && SameRequest(state.request, *exchange)) {
-        if (state.have_freshness &&
-            !FreshnessNewer(exchange->freshness, state.remote_freshness,
-                            false)) {
-          return;
-        }
-        state.have_freshness = true;
-        state.remote_freshness = exchange->freshness;
-        ExchangePacket(state, now);
+    State* existing = Find(exchange->initiator_address, id);
+    // A simultaneous connect is answered in the association the title asked
+    // for. Any other new challenge means the peer started over, which xam
+    // answers in a new association.
+    bool crossed = false;
+    if (existing) {
+      auto& state = *existing;
+      if (state.have_freshness &&
+          !FreshnessNewer(exchange->freshness, state.remote_freshness, false)) {
         return;
       }
-      // On a simultaneous connect the larger XNADDR MAC stays the initiator.
-      if (!(state.initiator && state.status == AssociationStatus::Pending &&
-            Machine(config_.identity, false) <
-                Machine(exchange->initiator_address, false))) {
+      if (state.initiator && state.status == AssociationStatus::Pending) {
+        // On a simultaneous connect the larger XNADDR MAC stays the initiator.
+        if (!(Machine(config_.identity, false) <
+              Machine(exchange->initiator_address, false))) {
+          return;
+        }
+        crossed = true;
+      } else if (state.request.initiator_challenge ==
+                 exchange->initiator_challenge) {
+        // A retry only gets the answer again while it is pending.
+        state.have_freshness = true;
+        state.remote_freshness = exchange->freshness;
+        if (state.status == AssociationStatus::Pending) {
+          ExchangePacket(state, now);
+        }
         return;
       }
     }
-    if (states_.size() >= config_.peer_limit || events_.size() >= 96) {
+    // A cross-platform peer is answered at the IP it came from.
+    const PeerKey key =
+        crossed && MachineOf(existing->key.first) == frame.source
+            ? existing->key
+            : PeerKey{exchange->initiator_address, id};
+    // xam frees the association it replaces first.
+    if (states_.size() - (existing ? 1 : 0) >= config_.peer_limit ||
+        events_.size() >= 96) {
       return;
     }
     auto state = std::make_unique<State>(config_.sequence_zero);
@@ -448,6 +468,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
     state->request = *exchange;
     state->exchange = *exchange;
     state->exchange.response = true;
+    state->exchange.initiator_address = key.first;
     state->exchange.responder_address = config_.identity;
     state->exchange.responder_spi = state->local_spi;
     Random(state->exchange.responder_challenge);
@@ -461,8 +482,12 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
     state->received = now;
     state->have_freshness = true;
     state->remote_freshness = exchange->freshness;
-    if (found != states_.end()) {
-      Retired(key);
+    if (existing) {
+      if (crossed) {
+        state->pending = std::move(existing->pending);
+      }
+      // xam sends no teardown for the association it drops.
+      Retired(existing->key, !crossed);
     }
     if (!ExchangePacket(*state, now)) {
       return;
@@ -544,24 +569,26 @@ void Associations::Tick(uint64_t now) {
   }
 }
 
-void Associations::Close(const Address& peer, const KeyId& id, uint64_t now) {
-  auto found = states_.find({peer, id});
-  if (found == states_.end()) {
+void Associations::Close(const Address& peer, const KeyId& id, uint64_t now,
+                         std::optional<std::array<uint8_t, 4>> reason,
+                         bool report) {
+  State* state = Find(peer, id);
+  if (!state) {
     return;
   }
   Packet teardown;
   teardown.kind = Kind::Control;
   teardown.control_type = 0x0053;
-  teardown.encrypted.assign(config_.teardown_reason.begin(),
-                            config_.teardown_reason.end());
-  bool sent = Protected(*found->second, teardown, now);
+  const auto& bytes = reason ? *reason : config_.teardown_reason;
+  teardown.encrypted.assign(bytes.begin(), bytes.end());
+  bool sent = Protected(*state, teardown, now);
   // Retired() drops queued output for this peer so set the teardown aside.
   std::optional<Frame> final;
   if (sent) {
     final = std::move(outbound_.back());
     outbound_.pop_back();
   }
-  Retired({peer, id});
+  Retired(state->key, report);
   if (final) {
     outbound_.push_back(std::move(*final));
   }
@@ -596,9 +623,8 @@ uint32_t Associations::BroadcastVersionStatus(bool reset) {
 
 AssociationStatus Associations::Status(const Address& peer,
                                        const KeyId& id) const {
-  auto found = states_.find({peer, id});
-  return found == states_.end() ? AssociationStatus::Missing
-                                : found->second->status;
+  const State* state = Find(peer, id);
+  return state ? state->status : AssociationStatus::Missing;
 }
 
 std::vector<Frame> Associations::TakeOutbound() {
