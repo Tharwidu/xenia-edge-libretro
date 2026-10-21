@@ -26,6 +26,7 @@ struct xenia_core_state;
 #define XENIA_OPT_GPU_BACKEND           "xenia_gpu_backend"
 #define XENIA_OPT_AUTO_PROFILE          "xenia_auto_profile"
 #define XENIA_OPT_AUTO_DISC_SWAP        "xenia_auto_disc_swap"
+#define XENIA_OPT_INSTALL_DISC_CONTENT  "xenia_install_disc_content"
 #define XENIA_OPT_KEYBOARD_PROMPTS      "xenia_keyboard_prompts"
 #define XENIA_OPT_MESSAGE_BOXES         "xenia_message_boxes"
 #define XENIA_OPT_MSGBOX_BUTTON         "xenia_messagebox_button"
@@ -740,10 +741,28 @@ static struct retro_core_option_v2_definition xenia_core_options_v2_defs[] = {
         "When a multi-disc game asks for another disc, insert it without "
         "asking. Discs loaded from an .m3u playlist are always swapped "
         "automatically; this also finds the other discs next to the loaded "
-        "one when their names differ only by \"(Disc N)\", checking each "
-        "package's disc number before using it.\n"
+        "one - named alike up to \"(Disc N)\", ISO or GOD in any mix - "
+        "checking each package's disc number before using it.\n"
         "Disabled, or when no disc is found: eject, choose the disc and "
         "close the tray with the frontend's disc control.",
+        NULL,
+        "Emulation",
+        {
+            { "enabled",  "Enabled" },
+            { "disabled", "Disabled" },
+            { NULL, NULL }
+        },
+        "enabled"
+    },
+    {
+        XENIA_OPT_INSTALL_DISC_CONTENT,
+        "Install Content From Other Discs",
+        "Install Disc Content",
+        "Before a game starts, copy the content packages it keeps on its "
+        "other discs into the content store, once - what a console's "
+        "install step does. Grand Theft Auto V needs this: its play disc "
+        "will not run until the install disc's data is on the hard drive. "
+        "Uses the disc's size in disk space (about 8 GB for GTA V).",
         NULL,
         "Emulation",
         {

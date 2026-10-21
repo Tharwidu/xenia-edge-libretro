@@ -362,13 +362,22 @@ std::string LabelFor(const std::filesystem::path& path) {
   return utf8(path.filename());
 }
 
-// States the "(Disc N)" siblings of single loaded content, so the set is
-// known at load time rather than at the first swap. Nothing is added to
-// images: the search runs again, with the title's own id, when a disc is
-// requested. Caller holds the mutex.
-void LogDiscSetLocked() {
+// The loaded title's other discs, by disc number: the rest of the playlist,
+// or the siblings found beside single content. Nothing is added to images.
+// Caller holds the mutex.
+std::vector<std::pair<uint32_t, std::filesystem::path>> OtherDiscsLocked() {
+  std::vector<std::pair<uint32_t, std::filesystem::path>> found;
+  if (images.empty()) return found;
+  if (from_m3u) {
+    for (size_t i = 0; i < images.size(); ++i) {
+      if (i == current_index) continue;
+      const Probe probe = ProbeDisc(images[i]);
+      found.emplace_back(probe.known ? probe.disc_number : uint32_t(i + 1),
+                         images[i]);
+    }
+    return found;
+  }
   const Probe base = ProbeDisc(images[0]);
-  std::string found;
   for (uint32_t disc = 1; disc <= 9; ++disc) {
     if (base.known && base.disc_number == disc) continue;
     for (const auto& candidate : SiblingCandidates(images[0], disc)) {
@@ -378,10 +387,22 @@ void LogDiscSetLocked() {
                       : !IsExtension(candidate, ".iso")) {
         continue;
       }
-      found += (found.empty() ? " disc " : "; disc ") +
-               std::to_string(disc) + " = " + utf8(candidate);
+      found.emplace_back(disc, candidate);
       break;
     }
+  }
+  return found;
+}
+
+// States the "(Disc N)" siblings of single loaded content, so the set is
+// known at load time rather than at the first swap. Nothing is added to
+// images: the search runs again, with the title's own id, when a disc is
+// requested. Caller holds the mutex.
+void LogDiscSetLocked() {
+  std::string found;
+  for (const auto& [disc, path] : OtherDiscsLocked()) {
+    found += (found.empty() ? " disc " : "; disc ") + std::to_string(disc) +
+             " = " + utf8(path);
   }
   if (found.empty()) return;
   DISC_LOG(RETRO_LOG_INFO, "Sibling discs of %s:%s\n",
@@ -648,6 +669,20 @@ std::filesystem::path Resolve(uint32_t disc_number, bool retry,
       return images[current_index];
     }
   }
+}
+
+std::vector<std::filesystem::path> OtherDiscs(uint32_t* title_id) {
+  std::lock_guard<std::mutex> lock(mutex);
+  std::vector<std::filesystem::path> out;
+  if (title_id) {
+    *title_id = 0;
+    if (current_index < images.size()) {
+      const Probe probe = ProbeDisc(images[current_index]);
+      if (probe.known) *title_id = probe.title_id;
+    }
+  }
+  for (auto& [disc, path] : OtherDiscsLocked()) out.push_back(path);
+  return out;
 }
 
 std::string TakeNotice() {

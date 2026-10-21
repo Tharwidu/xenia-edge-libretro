@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "libretro.h"
 
@@ -55,6 +56,11 @@ void SetAutomatic(bool enabled);
 // retry is set when the disc returned last time was rejected.
 std::filesystem::path Resolve(uint32_t disc_number, bool retry,
                               uint32_t title_id);
+
+// The loaded title's other discs - the rest of the playlist, or the siblings
+// found beside single content - and the booted disc's title id (0 when it
+// cannot be read). Call after LoadContent.
+std::vector<std::filesystem::path> OtherDiscs(uint32_t* title_id);
 
 // While a request is parked on the frontend, a line for the on-screen
 // message every ten seconds, empty otherwise - without it the title just sits

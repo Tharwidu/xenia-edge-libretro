@@ -136,6 +136,7 @@ DECLARE_bool(disable_context_promotion);
 #include "pl_mpeg.h"
 #include "libretro_audio_driver.h"
 #include "libretro_disc.h"
+#include "libretro_disc_install.h"
 #include "libretro_hid.h"
 #include "libretro_keyboard.h"
 
@@ -2520,6 +2521,19 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
                  xe::path_to_utf8(boot_path).c_str());
     }
 
+    // Content a title keeps on its other discs (GTA V's install disc) is
+    // copied into the store on a worker before launch; retro_run holds the
+    // launch and shows progress until it is done.
+    bool installing = false;
+    {
+        const char* iv = opt_get(XENIA_OPT_INSTALL_DISC_CONTENT);
+        if (!iv || strcmp(iv, "disabled") != 0) {
+            installing = xe::libretro_disc_install::Start(
+                std::filesystem::path(core_state.system_dir) / "xenia",
+                xenia_log);
+        }
+    }
+
     // Load xenia's own config file, if the user has one, BEFORE core options.
     // Only a few dozen of xenia's cvars are exposed as core options; everything
     // else - the targeted EDRAM/accuracy knobs, per-title workarounds, the
@@ -2825,7 +2839,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     splash_try_start();
     const char* sv = opt_get(XENIA_OPT_BOOT_SPLASH);
     bool splash_before = !sv || strcmp(sv, "loadmask") != 0;
-    if (splash_plm && splash_before) {
+    if ((splash_plm && splash_before) || installing) {
         launch_pending = true;
         return true;
     }
@@ -2840,6 +2854,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
 }
 
 RETRO_API void retro_unload_game(void) {
+    xe::libretro_disc_install::Cancel();
     splash_stop();
     launch_pending = false;
     xenia_shutdown();
@@ -3015,6 +3030,18 @@ RETRO_API void retro_run(void) {
         // skipped/invalid); boot the game now. This retro_run blocks like a
         // normal content load; the frontend keeps showing the last frame.
         if (launch_pending) {
+            if (xe::libretro_disc_install::Running()) {
+                static uint32_t install_frames = 0;
+                if (install_frames++ % 30 == 0) {
+                    const std::string line =
+                        xe::libretro_disc_install::Progress();
+                    retro_message msg = {line.c_str(), 45};
+                    core_state.environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+                }
+                static std::vector<uint32_t> black(640 * 360);
+                core_state.video_cb(black.data(), 640, 360, 640 * 4);
+                return;
+            }
             launch_pending = false;
             if (!xenia_setup_and_launch(core_state.game_path)) {
                 xenia_log(RETRO_LOG_ERROR, "Deferred game launch failed\n");
