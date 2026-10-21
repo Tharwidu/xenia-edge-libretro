@@ -9,6 +9,7 @@
 
 #include "xenia/vfs/entry.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "xenia/base/filesystem.h"
