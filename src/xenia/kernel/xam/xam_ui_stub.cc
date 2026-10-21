@@ -264,8 +264,8 @@ static dword_result_t ShowMessageBoxUi(
     if (RunHostPrompt(
             [&](std::function<void(HostFinish)> complete) {
               return headless_message_box_handler(
-                  request, [complete, result_ptr](bool accepted,
-                                                  uint32_t button) {
+                  request,
+                  [complete, result_ptr](bool accepted, uint32_t button) {
                     complete([=]() -> X_RESULT {
                       if (!accepted) {
                         return X_ERROR_CANCELLED;
@@ -379,8 +379,8 @@ static bool RunHostPrompt(
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
   if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
-    auto ev = kernel_state()->object_table()->LookupObject<XObject>(
-        event_handle);
+    auto ev =
+        kernel_state()->object_table()->LookupObject<XObject>(event_handle);
     if (ev && ev->type() == XObject::Type::Event) {
       ev.get<XEvent>()->Reset();
     }
@@ -471,8 +471,8 @@ dword_result_t XamShowKeyboardUI_entry(
   request.max_length = buffer_length ? uint32_t(buffer_length) - 1 : 0;
   request.flags = flags;
   X_RESULT host_result = X_ERROR_SUCCESS;
-  if (ShowHostKeyboard(request, buffer, buffer_length, overlapped.guest_address(),
-                       &host_result)) {
+  if (ShowHostKeyboard(request, buffer, buffer_length,
+                       overlapped.guest_address(), &host_result)) {
     return host_result;
   }
 

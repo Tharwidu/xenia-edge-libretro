@@ -432,8 +432,8 @@ class Emulator {
   // host (the libretro core) answers disc requests itself. Called on the
   // requesting guest thread with the 1-based disc XamSwapDisc asked for, and
   // retry set once a disc it returned was rejected. Empty means none.
-  using HeadlessDiscResolver = std::function<std::filesystem::path(
-      uint32_t disc_number, bool retry)>;
+  using HeadlessDiscResolver =
+      std::function<std::filesystem::path(uint32_t disc_number, bool retry)>;
   void set_headless_disc_resolver(HeadlessDiscResolver resolver) {
     headless_disc_resolver_ = std::move(resolver);
   }
