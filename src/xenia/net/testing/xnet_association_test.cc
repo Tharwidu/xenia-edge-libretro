@@ -87,6 +87,15 @@ struct Pair {
   }
 };
 
+// |frame| carrying |exchange| in place of its payload.
+Frame WithExchange(Frame frame, const RegistrationKeys& keys,
+                   const Exchange& exchange) {
+  auto payload = EncodeExchange(keys, exchange);
+  REQUIRE(payload);
+  frame.payload.assign(payload->begin(), payload->end());
+  return frame;
+}
+
 Packet Data() {
   Packet packet;
   packet.source_port = 500;
@@ -228,11 +237,7 @@ TEST_CASE(
   CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
   auto bad = *second;
   bad.initiator_challenge[0] ^= 1;
-  mutation = second_response;
-  auto payload = EncodeExchange(registration, bad);
-  REQUIRE(payload);
-  mutation.payload.assign(payload->begin(), payload->end());
-  pair.left->Receive(mutation, 1101);
+  pair.left->Receive(WithExchange(second_response, registration, bad), 1101);
   CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
   pair.left->Receive(second_response, 1101);
   pair.Pump(1101);
@@ -455,11 +460,7 @@ TEST_CASE(
   auto exchange = DecodeExchange(registration, pair.id, right_request.payload);
   REQUIRE(exchange);
   exchange->public_value.fill(0);
-  auto encoded = EncodeExchange(registration, *exchange);
-  REQUIRE(encoded);
-  auto bad = right_request;
-  bad.payload.assign(encoded->begin(), encoded->end());
-  pair.left->Receive(bad, 101);
+  pair.left->Receive(WithExchange(right_request, registration, *exchange), 101);
   CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
   CHECK(pair.left->TakeEvents().empty());
   CHECK(pair.left->TakeOutbound().empty());
@@ -527,8 +528,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "A cross-platform secure request is answered when the IP and MAC of the "
-    "XNADDR it targets are this console's",
+    "Cross-platform secure exchanges match the XNADDRs they name by IP and MAC",
     "[net][secure][association]") {
   Pair pair;
   auto id = pair.id;
@@ -554,22 +554,77 @@ TEST_CASE(
   REQUIRE(exchange);
   auto deliver = [&](const Address& target) {
     exchange->responder_address = target;
-    auto payload = EncodeExchange(registration, *exchange);
-    REQUIRE(payload);
-    auto frame = request;
-    frame.payload.assign(payload->begin(), payload->end());
-    right->Receive(frame, 100);
-    return right->TakeOutbound().size();
+    right->Receive(WithExchange(request, registration, *exchange), 100);
+    return right->TakeOutbound();
   };
   auto target = ba;
   target[3] = 30;
-  CHECK(deliver(target) == 0);
+  CHECK(deliver(target).empty());
   target = ba;
   target[10] ^= 1;
-  CHECK(deliver(target) == 0);
+  CHECK(deliver(target).empty());
   target = ba;
   target[4] = 1;
-  CHECK(deliver(target) == 1);
+  auto answer = deliver(target);
+  REQUIRE(answer.size() == 1);
+
+  auto response = DecodeExchange(registration, id, answer[0].payload);
+  REQUIRE(response);
+  CHECK(response->responder_address == ba);
+  response->responder_address[3] = 30;
+  left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(left->Status(ba, id) == AssociationStatus::Pending);
+  response->responder_address = ba;
+  response->responder_address[4] = 1;
+  left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(left->Status(ba, id) == AssociationStatus::Established);
+}
+
+TEST_CASE(
+    "A secure response completes a request when it names an XNADDR of the "
+    "machine the request targeted",
+    "[net][secure][association]") {
+  Pair pair;
+  auto target = pair.ba;
+  std::copy_n("127.0.0.", 8, target.begin());
+  REQUIRE(pair.left->Connect(target, pair.id, 100));
+  pair.Transfer(*pair.left, *pair.right, 100);
+  auto answer = pair.right->TakeOutbound();
+  REQUIRE(answer.size() == 1);
+  auto registration =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  auto response = DecodeExchange(registration, pair.id, answer[0].payload);
+  REQUIRE(response);
+  // Consoles answer with their own XNADDR whatever the request named.
+  CHECK(response->responder_address == pair.ba);
+  response->responder_address = Identity(3);
+  pair.left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(pair.left->Status(target, pair.id) == AssociationStatus::Pending);
+  response->responder_address = pair.ba;
+  pair.left->Receive(WithExchange(answer[0], registration, *response), 100);
+  CHECK(pair.left->Status(target, pair.id) == AssociationStatus::Established);
+  pair.Pump(101);
+  CHECK(pair.right->Status(pair.aa, pair.id) == AssociationStatus::Established);
+}
+
+TEST_CASE(
+    "A secure response completes the request it answers when several are "
+    "pending under one key",
+    "[net][secure][association]") {
+  Pair pair;
+  auto third = pair.Make(pair.b, Identity(3));
+  REQUIRE(pair.left->Connect(pair.ba, pair.id, 100));
+  REQUIRE(pair.left->Connect(Identity(3), pair.id, 100));
+  for (auto& frame : pair.left->TakeOutbound()) {
+    pair.right->Receive(frame, 100);
+    third->Receive(frame, 100);
+  }
+  pair.Transfer(*third, *pair.left, 100);
+  CHECK(pair.left->Status(Identity(3), pair.id) ==
+        AssociationStatus::Established);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Pending);
+  pair.Transfer(*pair.right, *pair.left, 100);
+  CHECK(pair.left->Status(pair.ba, pair.id) == AssociationStatus::Established);
 }
 
 TEST_CASE(

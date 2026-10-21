@@ -202,6 +202,8 @@ std::optional<std::array<uint8_t, 256>> EncodeExchange(
 std::optional<Exchange> DecodeExchange(const RegistrationKeys& keys,
                                        const KeyId& id,
                                        std::span<const uint8_t> wire);
+// The responder answers with its own XNADDR, which the caller matches by
+// machine against the one the request named.
 bool ResponseMatches(const Exchange& request, const Exchange& response);
 
 // QoS records follow a zero SPI like exchanges and use the registration keys

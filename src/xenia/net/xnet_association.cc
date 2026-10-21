@@ -81,12 +81,11 @@ bool Associations::SystemLinkKey(const KeyId& id) const {
   return SystemLinkKeyId(id, config_.cross_platform.has_value());
 }
 
-bool Associations::Ours(const Address& address) const {
+bool Associations::SameMachine(const Address& a, const Address& b) const {
   // xam ignores the other fields, which titles may garble.
-  return Machine(address, false) == Machine(config_.identity, false) &&
+  return Machine(a, false) == Machine(b, false) &&
          (!config_.cross_platform ||
-          std::equal(address.begin(), address.begin() + 4,
-                     config_.identity.begin()));
+          std::equal(a.begin(), a.begin() + 4, b.begin()));
 }
 
 uint32_t Associations::NewSpi() {
@@ -343,23 +342,30 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
       return;
     }
     if (exchange->response) {
-      PeerKey key{exchange->responder_address, id};
-      auto found = states_.find(key);
+      // The responder names itself, not the XNADDR the request named.
+      auto found =
+          std::find_if(states_.begin(), states_.end(), [&](const auto& item) {
+            return item.first.second == id &&
+                   item.second->local_spi == exchange->initiator_spi;
+          });
       if (found == states_.end()) {
         XELOGD("XNet exchange rejected: response peer unavailable");
         return;
       }
       auto& state = *found->second;
+      const bool same_machine = SameMachine(state.request.responder_address,
+                                            exchange->responder_address);
+      const bool source_matches = frame.source == MachineOf(state.key.first);
       if (!state.initiator || !ResponseMatches(state.request, *exchange) ||
-          frame.source != MachineOf(key.first) ||
+          !same_machine || !source_matches ||
           (state.have_freshness &&
            !FreshnessNewer(exchange->freshness, state.remote_freshness,
                            true))) {
         XELOGD(
             "XNet exchange rejected: initiator={}, request matches={}, "
-            "source matches={}",
+            "same machine={}, source matches={}",
             state.initiator, ResponseMatches(state.request, *exchange),
-            frame.source == MachineOf(key.first));
+            same_machine, source_matches);
         return;
       }
       // A retried response may confirm an established association but never
@@ -397,7 +403,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
       }
       return;
     }
-    if (!Ours(exchange->responder_address) ||
+    if (!SameMachine(exchange->responder_address, config_.identity) ||
         exchange->initiator_address == config_.identity ||
         frame.source != MachineOf(exchange->initiator_address)) {
       return;
@@ -442,6 +448,7 @@ void Associations::Receive(const Frame& frame, uint64_t now) {
     state->request = *exchange;
     state->exchange = *exchange;
     state->exchange.response = true;
+    state->exchange.responder_address = config_.identity;
     state->exchange.responder_spi = state->local_spi;
     Random(state->exchange.responder_challenge);
     state->exchange.public_value = state->dh->public_value();
